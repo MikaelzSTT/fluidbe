@@ -1,0 +1,105 @@
+const mongoose = require('mongoose');
+
+const projectSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    description: {
+      type: String,
+      default: '',
+    },
+
+    type: {
+      type: String,
+      default: 'web-app',
+    },
+
+    status: {
+      type: String,
+      enum: ['draft', 'building', 'published', 'archived'],
+      default: 'draft',
+    },
+
+    prompt: {
+      type: String,
+      default: '',
+    },
+
+    pages: {
+      type: Array,
+      default: [],
+    },
+
+    components: {
+      type: Array,
+      default: [],
+    },
+
+    files: {
+      type: Array,
+      default: [],
+    },
+
+    settings: {
+      theme: {
+        type: String,
+        default: 'light',
+      },
+      primaryColor: {
+        type: String,
+        default: '#2563eb',
+      },
+      language: {
+        type: String,
+        default: 'pt-BR',
+      },
+    },
+
+    deploy: {
+      isPublished: {
+        type: Boolean,
+        default: false,
+      },
+      url: {
+        type: String,
+        default: '',
+      },
+      provider: {
+        type: String,
+        default: '',
+      },
+      publishedAt: {
+        type: Date,
+        default: null,
+      },
+    },
+
+    metadata: {
+      lastPromptAt: {
+        type: Date,
+        default: null,
+      },
+      lastBuildAt: {
+        type: Date,
+        default: null,
+      },
+      buildCount: {
+        type: Number,
+        default: 0,
+      },
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Project', projectSchema);
