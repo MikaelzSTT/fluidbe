@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const authRoutes = require('./routes/authRoutes');
 const projectRoutes = require('./routes/projectRoutes');
+const chatRoutes = require('./routes/chatRoutes');
 
 
 dotenv.config();
@@ -21,6 +22,7 @@ app.use(cors({
 app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
+app.use('/api/chat', chatRoutes);
 
 mongoose
   .connect(process.env.MONGODB_URI)
