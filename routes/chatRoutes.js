@@ -116,7 +116,6 @@ async function getAiReply({ message, history, project }) {
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || 'gpt-5.5',
       messages,
-      temperature: 0.4,
       response_format: { type: 'json_object' },
     }),
   });
