@@ -114,7 +114,7 @@ async function getAiReply({ message, history, project }) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      model: process.env.OPENAI_MODEL || 'gpt-5.5',
       messages,
       temperature: 0.4,
       response_format: { type: 'json_object' },
