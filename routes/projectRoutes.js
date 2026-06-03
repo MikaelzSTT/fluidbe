@@ -1,8 +1,13 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
+
+function getProjectStatus(project) {
+  return project.generation_status || project.status || 'pending';
+}
 
 router.get('/', authMiddleware, async (req, res) => {
   try {
@@ -43,6 +48,49 @@ router.post('/', authMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao criar projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/:id/build', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: 'ID de projeto inválido.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.id,
+      userId: req.userId,
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const status = getProjectStatus(project);
+
+    if (status !== 'done') {
+      return res.json({
+        success: true,
+        status,
+        project,
+      });
+    }
+
+    return res.json({
+      success: true,
+      status,
+      html: project.html || '',
+      css: project.css || '',
+      js: project.js || '',
+      response: project.response || '',
+      summary: project.summary || '',
+      project,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar build do projeto.',
       error: error.message,
     });
   }
