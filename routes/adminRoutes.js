@@ -12,6 +12,11 @@ function applyWizardStatus(update, value) {
   update.status = value;
 }
 
+function applyLoadingStatus(update) {
+  applyWizardStatus(update, 'in_progress');
+  update.publish = false;
+}
+
 function requireAdmin(req, res, next) {
   const adminToken = process.env.ADMIN_TOKEN;
 
@@ -145,7 +150,11 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
         });
       }
 
-      applyWizardStatus(update, requestedStatus);
+      if (requestedStatus === 'in_progress') {
+        applyLoadingStatus(update);
+      } else {
+        applyWizardStatus(update, requestedStatus);
+      }
     }
 
     if (publish !== undefined) {
@@ -198,7 +207,12 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
     }
 
     const update = {};
-    applyWizardStatus(update, requestedStatus);
+
+    if (requestedStatus === 'in_progress') {
+      applyLoadingStatus(update);
+    } else {
+      applyWizardStatus(update, requestedStatus);
+    }
 
     const project = await Project.findByIdAndUpdate(
       req.params.id,
