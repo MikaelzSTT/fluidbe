@@ -14,6 +14,12 @@ const projectSchema = new mongoose.Schema(
       trim: true,
     },
 
+    title: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+
     description: {
       type: String,
       default: '',
@@ -26,8 +32,44 @@ const projectSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ['draft', 'building', 'published', 'archived'],
+      enum: ['draft', 'building', 'published', 'archived', 'pending', 'in_progress', 'done'],
       default: 'draft',
+    },
+
+    generation_status: {
+      type: String,
+      enum: ['pending', 'in_progress', 'done'],
+      default: 'pending',
+    },
+
+    response: {
+      type: String,
+      default: '',
+    },
+
+    html: {
+      type: String,
+      default: '',
+    },
+
+    css: {
+      type: String,
+      default: '',
+    },
+
+    js: {
+      type: String,
+      default: '',
+    },
+
+    summary: {
+      type: String,
+      default: '',
+    },
+
+    publish: {
+      type: Boolean,
+      default: false,
     },
 
     prompt: {
