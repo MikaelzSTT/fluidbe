@@ -6,6 +6,12 @@ const router = express.Router();
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 
+function applyWizardStatus(update, value) {
+  update.generationStatus = value;
+  update.generation_status = value;
+  update.status = value;
+}
+
 function requireAdmin(req, res, next) {
   const adminToken = process.env.ADMIN_TOKEN;
 
@@ -87,6 +93,8 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       fullHtml,
       latestFullHtml,
       summary,
+      generationStatus,
+      generation_status: generationStatusSnake,
       status,
       publish,
       distUrl,
@@ -122,24 +130,29 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
     setIfDefined('reactVite', reactVite);
     setIfDefined('build', build);
 
-    if (status !== undefined) {
-      if (!WIZARD_STATUSES.includes(status)) {
+    const requestedStatus =
+      generationStatus !== undefined
+        ? generationStatus
+        : generationStatusSnake !== undefined
+          ? generationStatusSnake
+          : status;
+
+    if (requestedStatus !== undefined) {
+      if (!WIZARD_STATUSES.includes(requestedStatus)) {
         return res.status(400).json({
           message: 'Status inválido.',
           allowedStatuses: WIZARD_STATUSES,
         });
       }
 
-      update.status = status;
-      update.generation_status = status;
+      applyWizardStatus(update, requestedStatus);
     }
 
     if (publish !== undefined) {
       update.publish = publish === true;
 
       if (publish === true) {
-        update.status = 'done';
-        update.generation_status = 'done';
+        applyWizardStatus(update, 'done');
         update['deploy.isPublished'] = true;
         update['deploy.publishedAt'] = new Date();
         update['metadata.lastBuildAt'] = new Date();
@@ -169,21 +182,27 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
 
 router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const { status } = req.body;
+    const { generationStatus, generation_status: generationStatusSnake, status } = req.body;
+    const requestedStatus =
+      generationStatus !== undefined
+        ? generationStatus
+        : generationStatusSnake !== undefined
+          ? generationStatusSnake
+          : status;
 
-    if (!WIZARD_STATUSES.includes(status)) {
+    if (!WIZARD_STATUSES.includes(requestedStatus)) {
       return res.status(400).json({
         message: 'Status inválido.',
         allowedStatuses: WIZARD_STATUSES,
       });
     }
 
+    const update = {};
+    applyWizardStatus(update, requestedStatus);
+
     const project = await Project.findByIdAndUpdate(
       req.params.id,
-      {
-        status,
-        generation_status: status,
-      },
+      update,
       {
         new: true,
         runValidators: true,

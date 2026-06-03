@@ -5,29 +5,8 @@ const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-const BUILD_STATUSES = ['pending', 'in_progress', 'done'];
-
-function normalizeBuildStatus(project) {
-  const statusSignals = [
-    project.generation_status,
-    project.status,
-    project.publish === true ? 'done' : '',
-    project.deploy?.isPublished === true ? 'done' : '',
-  ];
-
-  if (statusSignals.includes('done') || statusSignals.includes('published')) {
-    return 'done';
-  }
-
-  if (statusSignals.includes('in_progress') || statusSignals.includes('building')) {
-    return 'in_progress';
-  }
-
-  if (statusSignals.includes('pending') || statusSignals.includes('draft')) {
-    return 'pending';
-  }
-
-  return BUILD_STATUSES.includes(project.status) ? project.status : 'pending';
+function getEffectiveBuildStatus(project) {
+  return project.generationStatus || project.generation_status || project.status || 'pending';
 }
 
 function buildProjectPayload(projectDocument) {
@@ -35,14 +14,23 @@ function buildProjectPayload(projectDocument) {
     typeof projectDocument.toObject === 'function'
       ? projectDocument.toObject({ getters: true, virtuals: true })
       : projectDocument;
-  const status = normalizeBuildStatus(project);
+  const effectiveStatus = getEffectiveBuildStatus(project);
   const fullHtml = project.fullHtml || project.latestFullHtml || '';
   const build = project.build && typeof project.build === 'object' ? project.build : {};
+  const payload = {
+    success: true,
+    status: effectiveStatus,
+    generationStatus: effectiveStatus,
+    generation_status: effectiveStatus,
+    project,
+  };
+
+  if (effectiveStatus !== 'done') {
+    return payload;
+  }
 
   return {
-    success: true,
-    status,
-    generation_status: status,
+    ...payload,
     response: project.response || '',
     summary: project.summary || '',
     html: project.html || '',
@@ -56,7 +44,6 @@ function buildProjectPayload(projectDocument) {
     deploy: project.deploy || {},
     reactVite: project.reactVite === true || build.reactVite === true,
     build,
-    project,
   };
 }
 
