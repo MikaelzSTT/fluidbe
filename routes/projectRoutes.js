@@ -5,8 +5,59 @@ const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-function getProjectStatus(project) {
-  return project.generation_status || project.status || 'pending';
+const BUILD_STATUSES = ['pending', 'in_progress', 'done'];
+
+function normalizeBuildStatus(project) {
+  const statusSignals = [
+    project.generation_status,
+    project.status,
+    project.publish === true ? 'done' : '',
+    project.deploy?.isPublished === true ? 'done' : '',
+  ];
+
+  if (statusSignals.includes('done') || statusSignals.includes('published')) {
+    return 'done';
+  }
+
+  if (statusSignals.includes('in_progress') || statusSignals.includes('building')) {
+    return 'in_progress';
+  }
+
+  if (statusSignals.includes('pending') || statusSignals.includes('draft')) {
+    return 'pending';
+  }
+
+  return BUILD_STATUSES.includes(project.status) ? project.status : 'pending';
+}
+
+function buildProjectPayload(projectDocument) {
+  const project =
+    typeof projectDocument.toObject === 'function'
+      ? projectDocument.toObject({ getters: true, virtuals: true })
+      : projectDocument;
+  const status = normalizeBuildStatus(project);
+  const fullHtml = project.fullHtml || project.latestFullHtml || '';
+  const build = project.build && typeof project.build === 'object' ? project.build : {};
+
+  return {
+    success: true,
+    status,
+    generation_status: status,
+    response: project.response || '',
+    summary: project.summary || '',
+    html: project.html || '',
+    css: project.css || '',
+    js: project.js || '',
+    fullHtml,
+    latestFullHtml: project.latestFullHtml || fullHtml,
+    distUrl: project.distUrl || build.distUrl || '',
+    previewUrl: project.previewUrl || build.previewUrl || '',
+    buildUrl: project.buildUrl || build.buildUrl || '',
+    deploy: project.deploy || {},
+    reactVite: project.reactVite === true || build.reactVite === true,
+    build,
+    project,
+  };
 }
 
 router.get('/', authMiddleware, async (req, res) => {
@@ -68,27 +119,7 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    const status = getProjectStatus(project);
-    const buildStatus = {
-      success: true,
-      status,
-      generation_status: project.generation_status,
-      project,
-    };
-
-    if (status !== 'done') {
-      return res.json(buildStatus);
-    }
-
-    return res.json({
-      ...buildStatus,
-      html: project.html || '',
-      css: project.css || '',
-      js: project.js || '',
-      response: project.response || '',
-      summary: project.summary || '',
-      project,
-    });
+    return res.json(buildProjectPayload(project));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar build do projeto.',

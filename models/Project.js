@@ -62,6 +62,16 @@ const projectSchema = new mongoose.Schema(
       default: '',
     },
 
+    fullHtml: {
+      type: String,
+      default: '',
+    },
+
+    latestFullHtml: {
+      type: String,
+      default: '',
+    },
+
     summary: {
       type: String,
       default: '',
@@ -124,6 +134,31 @@ const projectSchema = new mongoose.Schema(
         type: Date,
         default: null,
       },
+    },
+
+    distUrl: {
+      type: String,
+      default: '',
+    },
+
+    previewUrl: {
+      type: String,
+      default: '',
+    },
+
+    buildUrl: {
+      type: String,
+      default: '',
+    },
+
+    reactVite: {
+      type: Boolean,
+      default: false,
+    },
+
+    build: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
 
     metadata: {

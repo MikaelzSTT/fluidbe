@@ -78,7 +78,24 @@ router.get('/projects/:id/versions', requireAdmin, validateProjectId, async (req
 
 router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const { title, response, html, css, js, summary, status, publish } = req.body;
+    const {
+      title,
+      response,
+      html,
+      css,
+      js,
+      fullHtml,
+      latestFullHtml,
+      summary,
+      status,
+      publish,
+      distUrl,
+      previewUrl,
+      buildUrl,
+      deploy,
+      reactVite,
+      build,
+    } = req.body;
     const update = {};
     const setIfDefined = (field, value) => {
       if (value !== undefined) {
@@ -95,7 +112,15 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
     setIfDefined('html', html);
     setIfDefined('css', css);
     setIfDefined('js', js);
+    setIfDefined('fullHtml', fullHtml);
+    setIfDefined('latestFullHtml', latestFullHtml !== undefined ? latestFullHtml : fullHtml);
     setIfDefined('summary', summary);
+    setIfDefined('distUrl', distUrl);
+    setIfDefined('previewUrl', previewUrl);
+    setIfDefined('buildUrl', buildUrl);
+    setIfDefined('deploy', deploy);
+    setIfDefined('reactVite', reactVite);
+    setIfDefined('build', build);
 
     if (status !== undefined) {
       if (!WIZARD_STATUSES.includes(status)) {
