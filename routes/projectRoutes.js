@@ -69,18 +69,19 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     }
 
     const status = getProjectStatus(project);
+    const buildStatus = {
+      success: true,
+      status,
+      generation_status: project.generation_status,
+      project,
+    };
 
     if (status !== 'done') {
-      return res.json({
-        success: true,
-        status,
-        project,
-      });
+      return res.json(buildStatus);
     }
 
     return res.json({
-      success: true,
-      status,
+      ...buildStatus,
       html: project.html || '',
       css: project.css || '',
       js: project.js || '',
