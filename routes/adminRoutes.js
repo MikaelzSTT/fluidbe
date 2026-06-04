@@ -349,6 +349,75 @@ async function applyTsconfigDeprecationFix(appRoot) {
   return fixed;
 }
 
+function applyRelativeViteBase(rawConfig) {
+  if (/base\s*:\s*(['"`])\.\/\1/.test(rawConfig)) {
+    return rawConfig;
+  }
+
+  if (/base\s*:\s*(['"`])[^'"`]*\1/.test(rawConfig)) {
+    return rawConfig.replace(/base\s*:\s*(['"`])[^'"`]*\1/, "base: './'");
+  }
+
+  if (/defineConfig\s*\(\s*\{/.test(rawConfig)) {
+    return rawConfig.replace(/defineConfig\s*\(\s*\{/, "defineConfig({\n  base: './',");
+  }
+
+  if (/export\s+default\s+\{/.test(rawConfig)) {
+    return rawConfig.replace(/export\s+default\s+\{/, "export default {\n  base: './',");
+  }
+
+  return rawConfig;
+}
+
+async function ensureViteRelativeBase(appRoot) {
+  const viteConfigFiles = ['vite.config.js', 'vite.config.mjs', 'vite.config.ts', 'vite.config.mts'];
+
+  for (const filename of viteConfigFiles) {
+    const configPath = path.join(appRoot, filename);
+
+    if (!(await pathExists(configPath))) {
+      continue;
+    }
+
+    const rawConfig = await fs.readFile(configPath, 'utf8');
+    const updatedConfig = applyRelativeViteBase(rawConfig);
+
+    if (updatedConfig !== rawConfig) {
+      await fs.writeFile(configPath, updatedConfig);
+      return filename;
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+async function fixDistIndexAssetPaths(distDir) {
+  const indexPath = path.join(distDir, 'index.html');
+
+  if (!(await pathExists(indexPath))) {
+    throw new Error('Build concluído sem gerar dist/index.html.');
+  }
+
+  const html = await fs.readFile(indexPath, 'utf8');
+  const fixedHtml = html
+    .replaceAll('src="/assets/', 'src="./assets/')
+    .replaceAll("src='/assets/", "src='./assets/")
+    .replaceAll('href="/assets/', 'href="./assets/')
+    .replaceAll("href='/assets/", "href='./assets/")
+    .replaceAll('url(/assets/', 'url(./assets/')
+    .replaceAll('url("/assets/', 'url("./assets/')
+    .replaceAll("url('/assets/", "url('./assets/");
+
+  if (fixedHtml !== html) {
+    await fs.writeFile(indexPath, fixedHtml);
+    return true;
+  }
+
+  return false;
+}
+
 function pickBuildPayload(body) {
   return BUILD_FIELDS.reduce((payload, field) => {
     if (body[field] !== undefined) {
@@ -442,12 +511,21 @@ router.post(
         logs += 'Auto-fix aplicado: ignoreDeprecations 6.0 no tsconfig.\n';
       }
 
+      const viteConfigFixed = await ensureViteRelativeBase(appRoot);
+      if (viteConfigFixed) {
+        logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
+      }
+
       logs += await runNpmCommand(['run', 'build'], appRoot);
 
       const distDir = path.join(appRoot, 'dist');
 
       if (!(await pathExists(distDir))) {
         throw new Error('Build concluído sem gerar a pasta dist.');
+      }
+
+      if (await fixDistIndexAssetPaths(distDir)) {
+        logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
       }
 
       const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
