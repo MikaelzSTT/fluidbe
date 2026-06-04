@@ -221,6 +221,134 @@ async function runNpmCommand(args, cwd) {
   }
 }
 
+function stripJsonComments(json) {
+  let stripped = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < json.length; index += 1) {
+    const char = json[index];
+    const nextChar = json[index + 1];
+
+    if (inString) {
+      stripped += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      stripped += char;
+      continue;
+    }
+
+    if (char === '/' && nextChar === '/') {
+      while (index < json.length && json[index] !== '\n') {
+        index += 1;
+      }
+      stripped += '\n';
+      continue;
+    }
+
+    if (char === '/' && nextChar === '*') {
+      index += 2;
+      while (index < json.length && !(json[index] === '*' && json[index + 1] === '/')) {
+        stripped += json[index] === '\n' ? '\n' : ' ';
+        index += 1;
+      }
+      index += 1;
+      continue;
+    }
+
+    stripped += char;
+  }
+
+  return stripped;
+}
+
+function stripJsonTrailingCommas(json) {
+  let stripped = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < json.length; index += 1) {
+    const char = json[index];
+
+    if (inString) {
+      stripped += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      stripped += char;
+      continue;
+    }
+
+    if (char === ',') {
+      let nextIndex = index + 1;
+
+      while (/\s/.test(json[nextIndex] || '')) {
+        nextIndex += 1;
+      }
+
+      if (json[nextIndex] === '}' || json[nextIndex] === ']') {
+        continue;
+      }
+    }
+
+    stripped += char;
+  }
+
+  return stripped;
+}
+
+function parseTsconfig(rawConfig) {
+  return JSON.parse(stripJsonTrailingCommas(stripJsonComments(rawConfig)));
+}
+
+async function applyTsconfigDeprecationFix(appRoot) {
+  const tsconfigFiles = ['tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json'];
+  let fixed = false;
+
+  for (const filename of tsconfigFiles) {
+    const tsconfigPath = path.join(appRoot, filename);
+
+    if (!(await pathExists(tsconfigPath))) {
+      continue;
+    }
+
+    const rawConfig = await fs.readFile(tsconfigPath, 'utf8');
+    const config = parseTsconfig(rawConfig);
+    const compilerOptions = config.compilerOptions;
+
+    if (
+      compilerOptions &&
+      typeof compilerOptions === 'object' &&
+      String(compilerOptions.moduleResolution).toLowerCase() === 'node10'
+    ) {
+      compilerOptions.ignoreDeprecations = '6.0';
+      await fs.writeFile(tsconfigPath, `${JSON.stringify(config, null, 2)}\n`);
+      fixed = true;
+    }
+  }
+
+  return fixed;
+}
+
 function pickBuildPayload(body) {
   return BUILD_FIELDS.reduce((payload, field) => {
     if (body[field] !== undefined) {
@@ -309,6 +437,11 @@ router.post(
 
       logs += await runNpmCommand(['install'], appRoot);
       logs += '\n';
+
+      if (await applyTsconfigDeprecationFix(appRoot)) {
+        logs += 'Auto-fix aplicado: ignoreDeprecations 6.0 no tsconfig.\n';
+      }
+
       logs += await runNpmCommand(['run', 'build'], appRoot);
 
       const distDir = path.join(appRoot, 'dist');
@@ -329,7 +462,7 @@ router.post(
         distUrl: previewUrl,
         previewUrl,
         sourceZipUrl: '',
-        logs: 'React/Vite build concluído com sucesso.',
+        logs: [logs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
       });
 
       await Project.findByIdAndUpdate(
