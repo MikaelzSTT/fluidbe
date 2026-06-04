@@ -57,6 +57,11 @@ const projectBuildSchema = new mongoose.Schema(
       default: '',
     },
 
+    buildUrl: {
+      type: String,
+      default: '',
+    },
+
     deployUrl: {
       type: String,
       default: '',

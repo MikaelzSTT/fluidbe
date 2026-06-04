@@ -26,6 +26,7 @@ const BUILD_FIELDS = [
   'fullHtml',
   'distUrl',
   'previewUrl',
+  'buildUrl',
   'deployUrl',
   'sourceZipUrl',
   'logs',
@@ -536,9 +537,11 @@ router.post(
       const build = await ProjectBuild.create({
         projectId: project._id,
         type: 'react_vite',
-        status: 'done',
+        status: 'draft',
         distUrl: previewUrl,
         previewUrl,
+        buildUrl: previewUrl,
+        deployUrl: previewUrl,
         sourceZipUrl: '',
         logs: [logs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
       });
@@ -546,14 +549,10 @@ router.post(
       await Project.findByIdAndUpdate(
         project._id,
         {
-          status: 'done',
-          generation_status: 'done',
-          generationStatus: 'done',
+          status: 'in_progress',
+          generation_status: 'in_progress',
+          generationStatus: 'in_progress',
           reactVite: true,
-          previewUrl,
-          distUrl: previewUrl,
-          buildUrl: previewUrl,
-          build,
           'metadata.lastBuildAt': new Date(),
         },
         {
@@ -644,6 +643,12 @@ router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, 
 
 router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req, res) => {
   try {
+    const existingProject = await Project.findById(req.params.id);
+
+    if (!existingProject) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
     const {
       title,
       response,
@@ -716,6 +721,38 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       update.publish = publish === true;
 
       if (publish === true) {
+        const latestPendingBuild = await ProjectBuild.findOne({
+          projectId: req.params.id,
+          status: { $in: ['draft', 'in_progress'] },
+        }).sort({
+          createdAt: -1,
+          updatedAt: -1,
+        });
+
+        if (latestPendingBuild) {
+          latestPendingBuild.status = 'done';
+          await latestPendingBuild.save();
+          const publishedBuild = latestPendingBuild.toObject({
+            getters: true,
+            virtuals: true,
+          });
+
+          update.reactVite = latestPendingBuild.type === 'react_vite';
+          update.build = publishedBuild;
+          update.distUrl = latestPendingBuild.distUrl || '';
+          update.previewUrl = latestPendingBuild.previewUrl || '';
+          update.buildUrl =
+            latestPendingBuild.buildUrl ||
+            latestPendingBuild.deployUrl ||
+            latestPendingBuild.previewUrl ||
+            latestPendingBuild.distUrl ||
+            '';
+
+          if (latestPendingBuild.deployUrl) {
+            update['deploy.url'] = latestPendingBuild.deployUrl;
+          }
+        }
+
         applyWizardStatus(update, 'done');
         update['deploy.isPublished'] = true;
         update['deploy.publishedAt'] = new Date();

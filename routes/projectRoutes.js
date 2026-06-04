@@ -68,6 +68,7 @@ function buildDoneProjectBuildPayload(project, buildDocument) {
     latestFullHtml: build.fullHtml || '',
     distUrl: build.distUrl || '',
     previewUrl: build.previewUrl || '',
+    buildUrl: build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '',
     deployUrl: build.deployUrl || '',
     sourceZipUrl: build.sourceZipUrl || '',
     logs: build.logs || '',
