@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
+const ProjectBuild = require('../models/ProjectBuild');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -44,6 +45,33 @@ function buildProjectPayload(projectDocument) {
     deploy: project.deploy || {},
     reactVite: project.reactVite === true || build.reactVite === true,
     build,
+  };
+}
+
+function buildDoneProjectBuildPayload(project, buildDocument) {
+  const build =
+    typeof buildDocument.toObject === 'function'
+      ? buildDocument.toObject({ getters: true, virtuals: true })
+      : buildDocument;
+
+  return {
+    success: true,
+    status: 'done',
+    generationStatus: 'done',
+    generation_status: 'done',
+    project,
+    build,
+    html: build.html || '',
+    css: build.css || '',
+    js: build.js || '',
+    fullHtml: build.fullHtml || '',
+    latestFullHtml: build.fullHtml || '',
+    distUrl: build.distUrl || '',
+    previewUrl: build.previewUrl || '',
+    deployUrl: build.deployUrl || '',
+    sourceZipUrl: build.sourceZipUrl || '',
+    logs: build.logs || '',
+    reactVite: build.type === 'react_vite',
   };
 }
 
@@ -104,6 +132,18 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const latestDoneBuild = await ProjectBuild.findOne({
+      projectId: project._id,
+      status: 'done',
+    }).sort({
+      createdAt: -1,
+      updatedAt: -1,
+    });
+
+    if (latestDoneBuild) {
+      return res.json(buildDoneProjectBuildPayload(project, latestDoneBuild));
     }
 
     return res.json(buildProjectPayload(project));

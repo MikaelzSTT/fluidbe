@@ -1,10 +1,24 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
+const ProjectBuild = require('../models/ProjectBuild');
 
 const router = express.Router();
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
+const BUILD_FIELDS = [
+  'type',
+  'status',
+  'html',
+  'css',
+  'js',
+  'fullHtml',
+  'distUrl',
+  'previewUrl',
+  'deployUrl',
+  'sourceZipUrl',
+  'logs',
+];
 
 function applyWizardStatus(update, value) {
   update.generationStatus = value;
@@ -33,6 +47,16 @@ function validateProjectId(req, res, next) {
   }
 
   return next();
+}
+
+function pickBuildPayload(body) {
+  return BUILD_FIELDS.reduce((payload, field) => {
+    if (body[field] !== undefined) {
+      payload[field] = body[field];
+    }
+
+    return payload;
+  }, {});
 }
 
 router.get('/projects', requireAdmin, async (req, res) => {
@@ -82,6 +106,63 @@ router.get('/projects/:id/versions', requireAdmin, validateProjectId, async (req
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar versões do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const build = await ProjectBuild.create({
+      projectId: project._id,
+      ...pickBuildPayload(req.body),
+    });
+
+    return res.status(201).json({
+      success: true,
+      build,
+    });
+  } catch (error) {
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({
+        message: 'Build inválido.',
+        error: error.message,
+      });
+    }
+
+    return res.status(500).json({
+      message: 'Erro ao criar build do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const builds = await ProjectBuild.find({ projectId: project._id }).sort({
+      createdAt: -1,
+      updatedAt: -1,
+    });
+
+    return res.json({
+      success: true,
+      builds,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar builds do projeto.',
       error: error.message,
     });
   }
