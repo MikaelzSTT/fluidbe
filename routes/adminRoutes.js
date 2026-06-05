@@ -318,36 +318,58 @@ function stripJsonTrailingCommas(json) {
 }
 
 function parseTsconfig(rawConfig) {
-  return JSON.parse(stripJsonTrailingCommas(stripJsonComments(rawConfig)));
+  try {
+    return JSON.parse(rawConfig);
+  } catch (error) {
+    return JSON.parse(stripJsonTrailingCommas(stripJsonComments(rawConfig)));
+  }
 }
 
-async function applyTsconfigDeprecationFix(appRoot) {
-  const tsconfigFiles = ['tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json'];
-  let fixed = false;
+async function findTsconfigFiles(rootDir) {
+  const matches = [];
+  const entries = await fs.readdir(rootDir, { withFileTypes: true });
 
-  for (const filename of tsconfigFiles) {
-    const tsconfigPath = path.join(appRoot, filename);
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
 
-    if (!(await pathExists(tsconfigPath))) {
+    if (entry.isDirectory()) {
+      matches.push(...(await findTsconfigFiles(entryPath)));
       continue;
     }
 
-    const rawConfig = await fs.readFile(tsconfigPath, 'utf8');
-    const config = parseTsconfig(rawConfig);
-    const compilerOptions = config.compilerOptions;
-
-    if (
-      compilerOptions &&
-      typeof compilerOptions === 'object' &&
-      String(compilerOptions.moduleResolution).toLowerCase() === 'node10'
-    ) {
-      compilerOptions.ignoreDeprecations = '6.0';
-      await fs.writeFile(tsconfigPath, `${JSON.stringify(config, null, 2)}\n`);
-      fixed = true;
+    if (entry.isFile() && /^tsconfig.*\.json$/i.test(entry.name)) {
+      matches.push(entryPath);
     }
   }
 
-  return fixed;
+  return matches;
+}
+
+async function applyTsconfigDeprecationFix(appRoot) {
+  const tsconfigFiles = await findTsconfigFiles(appRoot);
+  const fixedPaths = [];
+
+  for (const tsconfigPath of tsconfigFiles) {
+    const rawConfig = await fs.readFile(tsconfigPath, 'utf8');
+    const config = parseTsconfig(rawConfig);
+
+    if (!config.compilerOptions || typeof config.compilerOptions !== 'object') {
+      config.compilerOptions = {};
+    }
+
+    const compilerOptions = config.compilerOptions;
+
+    if (String(compilerOptions.moduleResolution).toLowerCase() === 'node10') {
+      compilerOptions.moduleResolution = 'bundler';
+    }
+
+    compilerOptions.ignoreDeprecations = '6.0';
+
+    await fs.writeFile(tsconfigPath, `${JSON.stringify(config, null, 2)}\n`);
+    fixedPaths.push(path.relative(appRoot, tsconfigPath));
+  }
+
+  return fixedPaths;
 }
 
 function applyRelativeViteBase(rawConfig) {
@@ -505,17 +527,18 @@ router.post(
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
 
-      logs += await runNpmCommand(['install'], appRoot);
-      logs += '\n';
-
-      if (await applyTsconfigDeprecationFix(appRoot)) {
-        logs += 'Auto-fix aplicado: ignoreDeprecations 6.0 no tsconfig.\n';
+      const fixedTsconfigPaths = await applyTsconfigDeprecationFix(appRoot);
+      for (const fixedTsconfigPath of fixedTsconfigPaths) {
+        logs += `Auto-fix TS5107 aplicado em: ${fixedTsconfigPath}\n`;
       }
 
       const viteConfigFixed = await ensureViteRelativeBase(appRoot);
       if (viteConfigFixed) {
         logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
       }
+
+      logs += await runNpmCommand(['install'], appRoot);
+      logs += '\n';
 
       logs += await runNpmCommand(['run', 'build'], appRoot);
 
