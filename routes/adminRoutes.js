@@ -222,6 +222,68 @@ async function runNpmCommand(args, cwd) {
   }
 }
 
+async function runNpxCommand(args, cwd) {
+  try {
+    const result = await execFileAsync('npx', args, {
+      cwd,
+      env: {
+        ...process.env,
+        CI: 'true',
+      },
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 15 * 60 * 1000,
+    });
+
+    return [result.stdout, result.stderr].filter(Boolean).join('\n');
+  } catch (error) {
+    const logs = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
+    throw new Error(logs || `npx ${args.join(' ')} falhou.`);
+  }
+}
+
+async function readPackageJson(appRoot) {
+  const packageJsonPath = path.join(appRoot, 'package.json');
+  const rawPackageJson = await fs.readFile(packageJsonPath, 'utf8');
+
+  return JSON.parse(rawPackageJson);
+}
+
+function buildScriptContainsTscBuild(packageJson) {
+  const buildScript = packageJson?.scripts?.build;
+
+  return typeof buildScript === 'string' && buildScript.includes('tsc -b');
+}
+
+async function runViteBuildWithoutTypecheck(appRoot) {
+  return runNpxCommand(['vite', 'build'], appRoot);
+}
+
+async function runFallbackViteBuild(appRoot, precedingLogs = '') {
+  const fallbackLog = [precedingLogs, 'Fallback aplicado: npx vite build sem typecheck.']
+    .filter(Boolean)
+    .join('\n');
+
+  try {
+    return [fallbackLog, await runViteBuildWithoutTypecheck(appRoot)].filter(Boolean).join('\n');
+  } catch (error) {
+    throw new Error([fallbackLog, error.message].filter(Boolean).join('\n'));
+  }
+}
+
+async function runReactViteBuild(appRoot) {
+  const packageJson = await readPackageJson(appRoot);
+
+  if (buildScriptContainsTscBuild(packageJson)) {
+    return runFallbackViteBuild(appRoot);
+  }
+
+  try {
+    return await runNpmCommand(['run', 'build'], appRoot);
+  } catch (error) {
+    return runFallbackViteBuild(appRoot, error.message);
+  }
+}
+
 function stripJsonComments(json) {
   let stripped = '';
   let inString = false;
@@ -540,7 +602,16 @@ router.post(
       logs += await runNpmCommand(['install'], appRoot);
       logs += '\n';
 
-      logs += await runNpmCommand(['run', 'build'], appRoot);
+      logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot);
+      logs += '\n';
+
+      logs += await runNpmCommand(
+        ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
+        appRoot
+      );
+      logs += '\n';
+
+      logs += await runReactViteBuild(appRoot);
 
       const distDir = path.join(appRoot, 'dist');
 
