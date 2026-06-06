@@ -61,6 +61,37 @@ function validateProjectId(req, res, next) {
   return next();
 }
 
+function resolvePublicBuildIndexPath(buildUrl) {
+  if (typeof buildUrl !== 'string' || !buildUrl.startsWith('/builds/')) {
+    return null;
+  }
+
+  let pathname;
+
+  try {
+    pathname = decodeURIComponent(new URL(buildUrl, 'http://localhost').pathname);
+  } catch (error) {
+    return null;
+  }
+
+  if (!pathname.startsWith('/builds/')) {
+    return null;
+  }
+
+  const relativeBuildPath = pathname.slice('/builds/'.length);
+  const requestedPath = path.basename(relativeBuildPath) === 'index.html'
+    ? relativeBuildPath
+    : path.join(relativeBuildPath, 'index.html');
+  const buildsRoot = path.resolve(PUBLIC_BUILDS_DIR);
+  const indexPath = path.resolve(buildsRoot, requestedPath);
+
+  if (indexPath !== buildsRoot && !indexPath.startsWith(`${buildsRoot}${path.sep}`)) {
+    return null;
+  }
+
+  return indexPath;
+}
+
 async function loadProject(req, res, next) {
   try {
     const project = await Project.findById(req.params.id);
@@ -731,6 +762,48 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
 
     return res.status(500).json({
       message: 'Erro ao criar build do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const indexPath = resolvePublicBuildIndexPath(req.query.url);
+
+    if (!indexPath) {
+      return res.status(400).json({
+        message: 'URL de build inválida.',
+      });
+    }
+
+    try {
+      const indexStats = await fs.stat(indexPath);
+
+      if (!indexStats.isFile()) {
+        throw new Error('Build index is not a file.');
+      }
+
+      return res.json({
+        success: true,
+        exists: true,
+      });
+    } catch (error) {
+      return res.json({
+        success: true,
+        exists: false,
+        message: 'Build não encontrado no servidor. Reimporte o ZIP ou gere novamente.',
+      });
+    }
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao verificar build do projeto.',
       error: error.message,
     });
   }
