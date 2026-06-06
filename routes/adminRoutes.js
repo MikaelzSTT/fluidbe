@@ -203,12 +203,13 @@ async function validateReactViteProject(appRoot) {
   }
 }
 
-async function runNpmCommand(args, cwd) {
+async function runNpmCommand(args, cwd, options = {}) {
   try {
     const result = await execFileAsync('npm', args, {
       cwd,
       env: {
         ...process.env,
+        ...options.env,
         CI: 'true',
       },
       maxBuffer: 20 * 1024 * 1024,
@@ -222,12 +223,13 @@ async function runNpmCommand(args, cwd) {
   }
 }
 
-async function runNpxCommand(args, cwd) {
+async function runNpxCommand(args, cwd, options = {}) {
   try {
     const result = await execFileAsync('npx', args, {
       cwd,
       env: {
         ...process.env,
+        ...options.env,
         CI: 'true',
       },
       maxBuffer: 20 * 1024 * 1024,
@@ -251,7 +253,19 @@ async function readPackageJson(appRoot) {
 function buildScriptContainsTscBuild(packageJson) {
   const buildScript = packageJson?.scripts?.build;
 
-  return typeof buildScript === 'string' && buildScript.includes('tsc -b');
+  return typeof buildScript === 'string' && /\btsc\b/.test(buildScript);
+}
+
+function looksLikeTypecheckFailure(logs) {
+  return [
+    /\btsc\b/i,
+    /\btsc\s+-b\b/i,
+    /\btsc\s+--build\b/i,
+    /\btypescript\b/i,
+    /\bTS\d{4}\b/,
+    /type\s+checking/i,
+    /vue-tsc/i,
+  ].some((pattern) => pattern.test(logs || ''));
 }
 
 async function runViteBuildWithoutTypecheck(appRoot) {
@@ -273,13 +287,13 @@ async function runFallbackViteBuild(appRoot, precedingLogs = '') {
 async function runReactViteBuild(appRoot) {
   const packageJson = await readPackageJson(appRoot);
 
-  if (buildScriptContainsTscBuild(packageJson)) {
-    return runFallbackViteBuild(appRoot);
-  }
-
   try {
     return await runNpmCommand(['run', 'build'], appRoot);
   } catch (error) {
+    if (!buildScriptContainsTscBuild(packageJson) && !looksLikeTypecheckFailure(error.message)) {
+      throw error;
+    }
+
     return runFallbackViteBuild(appRoot, error.message);
   }
 }
@@ -589,6 +603,30 @@ router.post(
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
 
+      const developmentInstallEnv = {
+        NODE_ENV: 'development',
+        NPM_CONFIG_PRODUCTION: 'false',
+      };
+
+      logs += await runNpmCommand(['install', '--include=dev'], appRoot, {
+        env: developmentInstallEnv,
+      });
+      logs += '\n';
+
+      logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot, {
+        env: developmentInstallEnv,
+      });
+      logs += '\n';
+
+      logs += await runNpmCommand(
+        ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
+        appRoot,
+        {
+          env: developmentInstallEnv,
+        }
+      );
+      logs += '\n';
+
       const fixedTsconfigPaths = await applyTsconfigDeprecationFix(appRoot);
       for (const fixedTsconfigPath of fixedTsconfigPaths) {
         logs += `Auto-fix TS5107 aplicado em: ${fixedTsconfigPath}\n`;
@@ -598,18 +636,6 @@ router.post(
       if (viteConfigFixed) {
         logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
       }
-
-      logs += await runNpmCommand(['install'], appRoot);
-      logs += '\n';
-
-      logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot);
-      logs += '\n';
-
-      logs += await runNpmCommand(
-        ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
-        appRoot
-      );
-      logs += '\n';
 
       logs += await runReactViteBuild(appRoot);
 
