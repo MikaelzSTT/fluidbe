@@ -1,10 +1,11 @@
 const express = require('express');
+const Anthropic = require('@anthropic-ai/sdk');
 const Project = require('../models/Project');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-5';
 
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') {
@@ -70,9 +71,9 @@ Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos. Nao salve dados. Nao mencio
 Contexto do projeto atual:
 ${projectContext || 'Nenhum projeto informado.'}
 
-Retorne somente JSON valido, sem markdown, no formato:
+Retorne somente JSON valido, sem markdown, sem texto antes ou depois, no formato:
 {
-  "action": "chat",
+  "action": "chat" | "wizard",
   "reply": "string"
 }
 `.trim();
@@ -105,37 +106,80 @@ function extractJson(text) {
   }
 }
 
-async function callOpenAi({ messages, json = false }) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY nao configurada.');
-  }
+function splitSystemMessage(messages) {
+  const systemMessages = [];
+  const conversationMessages = [];
 
-  const body = {
-    model: process.env.OPENAI_MODEL || 'gpt-5.5',
-    messages,
-  };
+  messages.forEach((message) => {
+    if (message.role === 'system') {
+      systemMessages.push(message.content);
+      return;
+    }
 
-  if (json) {
-    body.response_format = { type: 'json_object' };
-  }
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const content = String(message.content || '').trim();
 
-  const response = await fetch(OPENAI_API_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+    if (!content) {
+      return;
+    }
+
+    if (!conversationMessages.length && role === 'assistant') {
+      return;
+    }
+
+    const previousMessage = conversationMessages[conversationMessages.length - 1];
+
+    if (previousMessage?.role === role) {
+      previousMessage.content = `${previousMessage.content}\n\n${content}`;
+      return;
+    }
+
+    conversationMessages.push({
+      role,
+      content,
+    });
   });
 
-  const data = await response.json();
+  return {
+    system: systemMessages.filter(Boolean).join('\n\n'),
+    messages: conversationMessages,
+  };
+}
 
-  if (!response.ok) {
-    const apiMessage = data.error?.message || 'Erro na chamada da IA.';
-    throw new Error(apiMessage);
+function extractClaudeText(response) {
+  return (response.content || [])
+    .map((item) => {
+      if (item.type === 'text') {
+        return item.text;
+      }
+
+      return '';
+    })
+    .join('')
+    .trim();
+}
+
+async function callClaude({ messages }) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error('ANTHROPIC_API_KEY nao configurada.');
   }
 
-  const content = data.choices?.[0]?.message?.content;
+  const anthropic = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+  });
+  const claudeMessages = splitSystemMessage(messages);
+
+  const response = await anthropic.messages.create({
+    model:
+      process.env.CLAUDE_MODEL ||
+      process.env.ANTHROPIC_MODEL ||
+      DEFAULT_CLAUDE_MODEL,
+    max_tokens: 700,
+    system: claudeMessages.system,
+    messages: claudeMessages.messages,
+  });
+
+  const content = extractClaudeText(response);
 
   if (!content) {
     throw new Error('Resposta vazia da IA.');
@@ -145,7 +189,7 @@ async function callOpenAi({ messages, json = false }) {
 }
 
 async function getFallbackChatReply({ message, previousMessages, projectContext }) {
-  const content = await callOpenAi({
+  const content = await callClaude({
     messages: [
       { role: 'system', content: buildFallbackSystemPrompt(projectContext) },
       ...previousMessages,
@@ -178,10 +222,7 @@ async function getAiReply({ message, history, project }) {
   ];
 
   try {
-    const content = await callOpenAi({
-      messages: decisionMessages,
-      json: true,
-    });
+    const content = await callClaude({ messages: decisionMessages });
     const parsed = extractJson(content);
     const action = String(parsed.action || '').trim().toLowerCase();
     const reply = String(parsed.reply || '').trim();
