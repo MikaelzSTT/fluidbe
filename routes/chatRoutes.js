@@ -7,6 +7,131 @@ const router = express.Router();
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const READY_REPLY =
   'Perfeito, vou montar a primeira versão do seu projeto agora. Depois você poderá ajustar cores, seções e estilo comigo.';
+const UNCLEAR_INTENT_REPLY =
+  'Não entendi muito bem o que você quis dizer. Você quer criar um site, app, landing page, SaaS ou ecommerce?';
+
+function normalizeText(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+function hasProjectCreationIntent(message) {
+  const text = normalizeText(message);
+
+  if (!text) {
+    return false;
+  }
+
+  const hasCreationVerb =
+    /\b(criar|crie|fazer|faca|montar|monte|gerar|gere|desenvolver|construir|quero|preciso|precisamos)\b/.test(
+      text
+    );
+  const hasProjectType =
+    /\b(site|website|app|aplicativo|landing|landing page|saas|ecommerce|e-commerce|loja|loja virtual|loja online|blog|sistema|plataforma|portfolio|portifolio)\b/.test(
+      text
+    );
+  const startsAsProjectRequest =
+    /^(site|website|app|aplicativo|landing|landing page|saas|ecommerce|e-commerce|loja|loja virtual|loja online|blog|sistema|plataforma|portfolio|portifolio)\b.+\b(para|de|do|da|sobre)\b/.test(
+      text
+    );
+
+  return hasProjectType && (hasCreationVerb || startsAsProjectRequest);
+}
+
+function isProjectBriefingFollowup(history) {
+  if (!Array.isArray(history)) {
+    return false;
+  }
+
+  const normalizedHistory = history.map(normalizeHistoryItem).filter(Boolean);
+  const lastAssistantIndex = normalizedHistory
+    .map((item) => item.role)
+    .lastIndexOf('assistant');
+
+  if (lastAssistantIndex < 0) {
+    return false;
+  }
+
+  const lastAssistant = normalizedHistory[lastAssistantIndex];
+  const previousUserMessages = normalizedHistory
+    .slice(0, lastAssistantIndex)
+    .filter((item) => item.role === 'user');
+
+  return (
+    lastAssistant.content !== READY_REPLY &&
+    lastAssistant.content.includes('?') &&
+    previousUserMessages.some((item) => hasProjectCreationIntent(item.content))
+  );
+}
+
+function looksLikeUnclearMessage(message) {
+  const text = normalizeText(message);
+  const compact = text.replace(/[^a-z0-9]/g, '');
+
+  if (!compact) {
+    return true;
+  }
+
+  if (compact.length >= 4 && !/[aeiou]/.test(compact)) {
+    return true;
+  }
+
+  if (compact.length >= 6 && /[bcdfghjklmnpqrstvwxyz]{4,}/.test(compact)) {
+    return true;
+  }
+
+  if (/\b(asdf|qwer|zxcv|hjkl)\b/.test(text)) {
+    return true;
+  }
+
+  if (/^(.)\1{3,}$/.test(compact)) {
+    return true;
+  }
+
+  return false;
+}
+
+function looksLikeGeneralConversation(message) {
+  const text = normalizeText(message);
+
+  if (!text) {
+    return false;
+  }
+
+  return (
+    text.includes('?') ||
+    /\b(oi|ola|bom dia|boa tarde|boa noite|tudo bem|me ajuda|ajuda|duvida|pergunta|explique|explica|como|qual|quais|quando|onde|porque|por que|o que|quanto|quantos)\b/.test(
+      text
+    )
+  );
+}
+
+function isFirstUserMessage(history) {
+  return !history.some((item) => item.role === 'user');
+}
+
+function shouldReturnUnclearIntent({ message, previousMessages, canStartWizard }) {
+  if (canStartWizard) {
+    return false;
+  }
+
+  if (looksLikeUnclearMessage(message)) {
+    return true;
+  }
+
+  return isFirstUserMessage(previousMessages) && !looksLikeGeneralConversation(message);
+}
+
+function isProjectContinuationFallback(reply) {
+  const text = normalizeText(reply);
+
+  return /\bcontinuar\s+(trabalhando|mexendo|editando|ajustando)\s+no\s+projeto\b/.test(
+    text
+  );
+}
 
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') {
@@ -39,11 +164,15 @@ Seu comportamento e hibrido:
 - Se o usuario perguntar sobre carro, roupa, curiosidade, duvidas gerais, ideias ou qualquer assunto que nao seja pedir criacao de projeto/site/app/SaaS/landing/ecommerce, responda normalmente.
 - Nao force briefing.
 - Nao fale de projeto se o usuario nao pediu projeto.
+- Nao responda "continuar trabalhando no projeto" quando a mensagem do usuario nao indicar claramente essa intencao.
 - Chat comum continua livre, normal e natural.
 
 2. Pedido de criacao de projeto:
-- Quando o usuario pedir para criar projeto, site, app, SaaS, landing page, ecommerce, blog ou algo equivalente, entre em modo briefing curto.
+- Quando o usuario pedir claramente para criar projeto, site, app, SaaS, landing page, ecommerce, blog ou algo equivalente, entre em modo briefing curto.
 - Nao transforme pedido de projeto em conversa comum.
+- Nao trate texto aleatorio, palavra solta sem sentido ou mensagem sem intencao clara como projeto valido.
+- Nao use o nome/titulo do projeto atual, nem a mensagem solta do usuario, como prova de intencao de criacao.
+- Se a primeira mensagem nao tiver intencao clara, responda que nao entendeu e pergunte se o usuario quer criar site, app, landing page, SaaS ou ecommerce.
 - Faca no maximo 1 pergunta de briefing no total.
 - A pergunta deve ser curta, pratica e objetiva, apenas para descobrir o tema, nicho, negocio ou objetivo principal quando isso ainda nao estiver claro.
 - Exemplos de pergunta unica: "Qual e o tema principal do blog?", "Qual e o tipo de negocio?", "Qual e o produto principal da landing page?"
@@ -106,10 +235,22 @@ async function getAiReply({ message, history, project }) {
         .filter(Boolean)
         .join('\n')
     : '';
+  const canStartWizard =
+    hasProjectCreationIntent(message) || isProjectBriefingFollowup(previousMessages);
+
+  if (shouldReturnUnclearIntent({ message, previousMessages, canStartWizard })) {
+    return {
+      reply: UNCLEAR_INTENT_REPLY,
+      readyForWizard: false,
+    };
+  }
+
+  const shouldIncludeProjectContext =
+    projectContext && (canStartWizard || !isFirstUserMessage(previousMessages));
 
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
-    ...(projectContext
+    ...(shouldIncludeProjectContext
       ? [{ role: 'system', content: `Contexto opcional do projeto:\n${projectContext}` }]
       : []),
     ...previousMessages,
@@ -144,10 +285,21 @@ async function getAiReply({ message, history, project }) {
 
   const parsed = extractJson(content);
   const reply = String(parsed.reply || '').trim();
-  const readyForWizard = parsed.readyForWizard === true && reply === READY_REPLY;
+  const modelWantsWizard = parsed.readyForWizard === true && reply === READY_REPLY;
+  const readyForWizard = canStartWizard && modelWantsWizard;
 
   if (!reply) {
     throw new Error('Resposta invalida da IA.');
+  }
+
+  if (
+    (modelWantsWizard && !canStartWizard) ||
+    (!canStartWizard && isProjectContinuationFallback(reply))
+  ) {
+    return {
+      reply: UNCLEAR_INTENT_REPLY,
+      readyForWizard: false,
+    };
   }
 
   return {
