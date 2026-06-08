@@ -7,8 +7,6 @@ const router = express.Router();
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const READY_REPLY =
   'Perfeito, vou montar a primeira versão do seu projeto agora. Depois você poderá ajustar cores, seções e estilo comigo.';
-const UNCLEAR_INTENT_REPLY =
-  'Não entendi muito bem o que você quis dizer. Você quer criar um site, app, landing page, SaaS ou ecommerce?';
 
 function normalizeText(text) {
   return String(text || '')
@@ -67,72 +65,6 @@ function isProjectBriefingFollowup(history) {
   );
 }
 
-function looksLikeUnclearMessage(message) {
-  const text = normalizeText(message);
-  const compact = text.replace(/[^a-z0-9]/g, '');
-
-  if (!compact) {
-    return true;
-  }
-
-  if (compact.length >= 4 && !/[aeiou]/.test(compact)) {
-    return true;
-  }
-
-  if (compact.length >= 6 && /[bcdfghjklmnpqrstvwxyz]{4,}/.test(compact)) {
-    return true;
-  }
-
-  if (/\b(asdf|qwer|zxcv|hjkl)\b/.test(text)) {
-    return true;
-  }
-
-  if (/^(.)\1{3,}$/.test(compact)) {
-    return true;
-  }
-
-  return false;
-}
-
-function looksLikeGeneralConversation(message) {
-  const text = normalizeText(message);
-
-  if (!text) {
-    return false;
-  }
-
-  return (
-    text.includes('?') ||
-    /\b(oi|ola|bom dia|boa tarde|boa noite|tudo bem|me ajuda|ajuda|duvida|pergunta|explique|explica|como|qual|quais|quando|onde|porque|por que|o que|quanto|quantos)\b/.test(
-      text
-    )
-  );
-}
-
-function isFirstUserMessage(history) {
-  return !history.some((item) => item.role === 'user');
-}
-
-function shouldReturnUnclearIntent({ message, previousMessages, canStartWizard }) {
-  if (canStartWizard) {
-    return false;
-  }
-
-  if (looksLikeUnclearMessage(message)) {
-    return true;
-  }
-
-  return isFirstUserMessage(previousMessages) && !looksLikeGeneralConversation(message);
-}
-
-function isProjectContinuationFallback(reply) {
-  const text = normalizeText(reply);
-
-  return /\bcontinuar\s+(trabalhando|mexendo|editando|ajustando)\s+no\s+projeto\b/.test(
-    text
-  );
-}
-
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') {
     return null;
@@ -172,7 +104,7 @@ Seu comportamento e hibrido:
 - Nao transforme pedido de projeto em conversa comum.
 - Nao trate texto aleatorio, palavra solta sem sentido ou mensagem sem intencao clara como projeto valido.
 - Nao use o nome/titulo do projeto atual, nem a mensagem solta do usuario, como prova de intencao de criacao.
-- Se a primeira mensagem nao tiver intencao clara, responda que nao entendeu e pergunte se o usuario quer criar site, app, landing page, SaaS ou ecommerce.
+- Se a mensagem nao tiver intencao clara, responda livremente de forma natural, sem usar respostas fixas.
 - Faca no maximo 1 pergunta de briefing no total.
 - A pergunta deve ser curta, pratica e objetiva, apenas para descobrir o tema, nicho, negocio ou objetivo principal quando isso ainda nao estiver claro.
 - Exemplos de pergunta unica: "Qual e o tema principal do blog?", "Qual e o tipo de negocio?", "Qual e o produto principal da landing page?"
@@ -238,15 +170,8 @@ async function getAiReply({ message, history, project }) {
   const canStartWizard =
     hasProjectCreationIntent(message) || isProjectBriefingFollowup(previousMessages);
 
-  if (shouldReturnUnclearIntent({ message, previousMessages, canStartWizard })) {
-    return {
-      reply: UNCLEAR_INTENT_REPLY,
-      readyForWizard: false,
-    };
-  }
-
   const shouldIncludeProjectContext =
-    projectContext && (canStartWizard || !isFirstUserMessage(previousMessages));
+    projectContext && (canStartWizard || previousMessages.length > 0);
 
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
@@ -290,16 +215,6 @@ async function getAiReply({ message, history, project }) {
 
   if (!reply) {
     throw new Error('Resposta invalida da IA.');
-  }
-
-  if (
-    (modelWantsWizard && !canStartWizard) ||
-    (!canStartWizard && isProjectContinuationFallback(reply))
-  ) {
-    return {
-      reply: UNCLEAR_INTENT_REPLY,
-      readyForWizard: false,
-    };
   }
 
   return {
