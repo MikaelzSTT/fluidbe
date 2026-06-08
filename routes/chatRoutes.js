@@ -7,6 +7,12 @@ const router = express.Router();
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const READY_REPLY =
   'Perfeito, vou montar a primeira versão do seu projeto agora. Depois você poderá ajustar cores, seções e estilo comigo.';
+const PROJECT_TYPE_PATTERN =
+  /\b(site|website|app|aplicativo|landing|landing page|saas|ecommerce|e-commerce|loja|loja virtual|loja online|blog|sistema|plataforma|portfolio|portifolio)\b/;
+const CREATION_VERB_PATTERN =
+  /\b(criar|cria|crie|fazer|faz|faca|montar|monte|gerar|gera|gere|desenvolver|construir|construa|quero|preciso|precisamos)\b/;
+const FOLLOWUP_BUILD_TRIGGER_PATTERN =
+  /\b(faz|faca|fazer|cria|crie|criar|pode fazer|pode criar|manda ver|gera|gere|gerar|monta|monte|montar|construa|construir|bora|vamos|ok|sim|isso)\b/;
 
 function normalizeText(text) {
   return String(text || '')
@@ -23,14 +29,8 @@ function hasProjectCreationIntent(message) {
     return false;
   }
 
-  const hasCreationVerb =
-    /\b(criar|crie|fazer|faca|montar|monte|gerar|gere|desenvolver|construir|quero|preciso|precisamos)\b/.test(
-      text
-    );
-  const hasProjectType =
-    /\b(site|website|app|aplicativo|landing|landing page|saas|ecommerce|e-commerce|loja|loja virtual|loja online|blog|sistema|plataforma|portfolio|portifolio)\b/.test(
-      text
-    );
+  const hasCreationVerb = CREATION_VERB_PATTERN.test(text);
+  const hasProjectType = PROJECT_TYPE_PATTERN.test(text);
   const startsAsProjectRequest =
     /^(site|website|app|aplicativo|landing|landing page|saas|ecommerce|e-commerce|loja|loja virtual|loja online|blog|sistema|plataforma|portfolio|portifolio)\b.+\b(para|de|do|da|sobre)\b/.test(
       text
@@ -39,29 +39,81 @@ function hasProjectCreationIntent(message) {
   return hasProjectType && (hasCreationVerb || startsAsProjectRequest);
 }
 
-function isProjectBriefingFollowup(history) {
+function hasProjectBriefingQuestion(content) {
+  const text = normalizeText(content);
+
+  return (
+    text !== normalizeText(READY_REPLY) &&
+    content.includes('?') &&
+    /\b(tema|nicho|negocio|produto|servico|objetivo|principal|sobre quem|qual negocio)\b/.test(
+      text
+    )
+  );
+}
+
+function isMeaningfulBriefingAnswer(content) {
+  const text = normalizeText(content);
+
+  if (!text || hasProjectCreationIntent(text)) {
+    return false;
+  }
+
+  return /[a-z0-9]/i.test(text);
+}
+
+function hasAnsweredProjectBriefing(history, currentMessage = '') {
   if (!Array.isArray(history)) {
     return false;
   }
 
-  const normalizedHistory = history.map(normalizeHistoryItem).filter(Boolean);
-  const lastAssistantIndex = normalizedHistory
-    .map((item) => item.role)
-    .lastIndexOf('assistant');
+  const normalizedHistory = [
+    ...history.map(normalizeHistoryItem).filter(Boolean),
+    currentMessage ? { role: 'user', content: String(currentMessage).trim() } : null,
+  ].filter(Boolean);
+  const projectRequestIndex = normalizedHistory.findIndex(
+    (item) => item.role === 'user' && hasProjectCreationIntent(item.content)
+  );
 
-  if (lastAssistantIndex < 0) {
+  if (projectRequestIndex < 0) {
     return false;
   }
 
-  const lastAssistant = normalizedHistory[lastAssistantIndex];
-  const previousUserMessages = normalizedHistory
-    .slice(0, lastAssistantIndex)
-    .filter((item) => item.role === 'user');
+  const briefingQuestionIndex = normalizedHistory.findIndex(
+    (item, index) =>
+      index > projectRequestIndex &&
+      item.role === 'assistant' &&
+      hasProjectBriefingQuestion(item.content)
+  );
+
+  if (briefingQuestionIndex < 0) {
+    return false;
+  }
+
+  const wizardAlreadyStartedIndex = normalizedHistory.findIndex(
+    (item, index) =>
+      index > briefingQuestionIndex && item.role === 'assistant' && item.content === READY_REPLY
+  );
+
+  if (wizardAlreadyStartedIndex >= 0) {
+    return false;
+  }
+
+  return normalizedHistory
+    .slice(briefingQuestionIndex + 1)
+    .some((item) => item.role === 'user' && isMeaningfulBriefingAnswer(item.content));
+}
+
+function isProjectBriefingFollowup(history) {
+  return hasAnsweredProjectBriefing(history);
+}
+
+function isBuildTriggerAfterBriefing(message) {
+  const text = normalizeText(message);
 
   return (
-    lastAssistant.content !== READY_REPLY &&
-    lastAssistant.content.includes('?') &&
-    previousUserMessages.some((item) => hasProjectCreationIntent(item.content))
+    hasProjectCreationIntent(text) ||
+    FOLLOWUP_BUILD_TRIGGER_PATTERN.test(text) ||
+    /\b(site|website|landing|app|loja)\s+(dela|dele|disso|desse|dessa|para ela|para ele)\b/.test(text)
   );
 }
 
@@ -169,6 +221,17 @@ async function getAiReply({ message, history, project }) {
     : '';
   const canStartWizard =
     hasProjectCreationIntent(message) || isProjectBriefingFollowup(previousMessages);
+  const briefingWasAnswered = hasAnsweredProjectBriefing(previousMessages, message);
+  const shouldForceWizard =
+    briefingWasAnswered &&
+    (isMeaningfulBriefingAnswer(message) || isBuildTriggerAfterBriefing(message));
+
+  if (shouldForceWizard) {
+    return {
+      reply: READY_REPLY,
+      readyForWizard: true,
+    };
+  }
 
   const shouldIncludeProjectContext =
     projectContext && (canStartWizard || previousMessages.length > 0);
