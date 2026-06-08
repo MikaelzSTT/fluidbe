@@ -66,6 +66,11 @@ Quando action for "wizard", reply deve ser uma frase natural, curta e sem pergun
 
 Quando action for "chat", reply deve ser natural, util e breve. Nao use respostas fixas de "nao entendi".
 
+Quando action for "chat" e reply for uma pergunta, gere tambem options com 2 a 4 respostas curtas que o usuario poderia escolher.
+Quando action for "chat" e reply nao for uma pergunta, options deve ser [].
+Quando action for "wizard", options deve ser [].
+As options devem ser geradas por voce para a conversa atual, nunca copiadas de uma lista fixa.
+
 Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos. Nao salve dados. Nao mencione detalhes internos como polling, ProjectBuild, MongoDB ou JWT a menos que o usuario pergunte.
 
 Contexto do projeto atual:
@@ -74,7 +79,8 @@ ${projectContext || 'Nenhum projeto informado.'}
 Retorne somente JSON valido, sem markdown, sem texto antes ou depois, no formato:
 {
   "action": "chat" | "wizard",
-  "reply": "string"
+  "reply": "string",
+  "options": ["string"]
 }
 `.trim();
 }
@@ -159,6 +165,46 @@ function extractClaudeText(response) {
     .trim();
 }
 
+function isQuestion(text) {
+  const normalized = String(text || '').trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized.includes('?')) {
+    return true;
+  }
+
+  return /^(qual|quais|quem|quando|onde|como|por que|porque|o que|que|voce quer|você quer|pode me dizer|me diga|me conta)\b/i.test(
+    normalized
+  );
+}
+
+function normalizeOptions(options, shouldIncludeOptions) {
+  if (!shouldIncludeOptions || !Array.isArray(options)) {
+    return [];
+  }
+
+  const normalizedOptions = [];
+
+  options.forEach((option) => {
+    const value = String(option || '').replace(/\s+/g, ' ').trim();
+
+    if (!value || normalizedOptions.includes(value)) {
+      return;
+    }
+
+    normalizedOptions.push(value);
+  });
+
+  if (normalizedOptions.length < 2) {
+    return [];
+  }
+
+  return normalizedOptions.slice(0, 4);
+}
+
 async function callClaude({ messages }) {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error('ANTHROPIC_API_KEY nao configurada.');
@@ -206,6 +252,7 @@ async function getFallbackChatReply({ message, previousMessages, projectContext 
   return {
     reply,
     readyForWizard: false,
+    options: [],
   };
 }
 
@@ -231,9 +278,13 @@ async function getAiReply({ message, history, project }) {
       throw new Error('Decisao invalida da IA.');
     }
 
+    const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
+    const options = normalizeOptions(parsed.options, shouldIncludeOptions);
+
     return {
       reply,
       readyForWizard: action === 'wizard',
+      options,
     };
   } catch (error) {
     if (
@@ -282,6 +333,7 @@ router.post('/', authMiddleware, async (req, res) => {
       success: true,
       reply: aiReply.reply,
       readyForWizard: aiReply.readyForWizard,
+      options: aiReply.options || [],
     });
   } catch (error) {
     return res.status(500).json({
