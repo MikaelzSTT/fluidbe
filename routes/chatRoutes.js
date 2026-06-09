@@ -1,6 +1,8 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const mongoose = require('mongoose');
 const Project = require('../models/Project');
+const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -498,8 +500,17 @@ router.post('/', authMiddleware, async (req, res) => {
     }
 
     let project = null;
+    const trimmedMessage = message.trim();
+
+    if (!trimmedMessage) {
+      return res.status(400).json({ message: 'Mensagem obrigatória.' });
+    }
 
     if (projectId) {
+      if (!mongoose.Types.ObjectId.isValid(projectId)) {
+        return res.status(400).json({ message: 'ID de projeto inválido.' });
+      }
+
       project = await Project.findOne({
         _id: projectId,
         userId: req.userId,
@@ -508,13 +519,38 @@ router.post('/', authMiddleware, async (req, res) => {
       if (!project) {
         return res.status(404).json({ message: 'Projeto não encontrado.' });
       }
+
+      await ProjectMessage.create({
+        projectId: project._id,
+        role: 'user',
+        content: trimmedMessage,
+        metadata: {
+          source: 'api_chat',
+          userId: req.userId,
+        },
+      });
     }
 
     const aiReply = await getAiReply({
-      message: message.trim(),
+      message: trimmedMessage,
       history: history || messages,
       project,
     });
+
+    if (project) {
+      await ProjectMessage.create({
+        projectId: project._id,
+        role: 'assistant',
+        content: aiReply.reply,
+        metadata: {
+          source: 'api_chat',
+          userId: req.userId,
+          readyForWizard: Boolean(aiReply.readyForWizard),
+          needsClarification: Boolean(aiReply.needsClarification),
+          options: aiReply.options || [],
+        },
+      });
+    }
 
     return res.json({
       success: true,

@@ -8,6 +8,7 @@ const { promisify } = require('util');
 const AdmZip = require('adm-zip');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const ProjectMessage = require('../models/ProjectMessage');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -605,6 +606,36 @@ router.get('/projects/:id/versions', requireAdmin, validateProjectId, async (req
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar versões do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/messages', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id).select('name prompt status');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const messages = await ProjectMessage.find({ projectId: req.params.id })
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      messages,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar mensagens do projeto.',
       error: error.message,
     });
   }
