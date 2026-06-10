@@ -18,6 +18,7 @@ const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
+const BUILD_MODES = ['manual', 'assisted', 'automatic'];
 const BUILD_FIELDS = [
   'type',
   'status',
@@ -865,6 +866,42 @@ router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, 
   }
 });
 
+router.patch('/projects/:id/build-mode', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const { buildMode } = req.body;
+
+    if (!BUILD_MODES.includes(buildMode)) {
+      return res.status(400).json({
+        message: 'Build mode inválido.',
+        allowedBuildModes: BUILD_MODES,
+      });
+    }
+
+    const project = await Project.findByIdAndUpdate(
+      req.params.id,
+      { buildMode },
+      {
+        new: true,
+        runValidators: true,
+      }
+    );
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    return res.json({
+      success: true,
+      project,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao atualizar modo de build do projeto.',
+      error: error.message,
+    });
+  }
+});
+
 router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req, res) => {
   try {
     const existingProject = await Project.findById(req.params.id);
@@ -892,6 +929,7 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       deploy,
       reactVite,
       build,
+      buildMode,
     } = req.body;
     const update = {};
     const setIfDefined = (field, value) => {
@@ -918,6 +956,17 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
     setIfDefined('deploy', deploy);
     setIfDefined('reactVite', reactVite);
     setIfDefined('build', build);
+
+    if (buildMode !== undefined) {
+      if (!BUILD_MODES.includes(buildMode)) {
+        return res.status(400).json({
+          message: 'Build mode inválido.',
+          allowedBuildModes: BUILD_MODES,
+        });
+      }
+
+      update.buildMode = buildMode;
+    }
 
     const requestedStatus =
       generationStatus !== undefined

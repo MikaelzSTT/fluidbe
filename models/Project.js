@@ -36,6 +36,12 @@ const projectSchema = new mongoose.Schema(
       default: 'draft',
     },
 
+    buildMode: {
+      type: String,
+      enum: ['manual', 'assisted', 'automatic'],
+      default: 'manual',
+    },
+
     generationStatus: {
       type: String,
       enum: ['pending', 'in_progress', 'done'],
