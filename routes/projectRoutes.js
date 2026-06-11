@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -151,6 +152,41 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar build do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/:id/messages', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.id,
+      userId: req.userId,
+    }).select('_id');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const messages = await ProjectMessage.find({
+      projectId: project._id,
+      role: { $in: ['user', 'assistant'] },
+    })
+      .sort({ createdAt: 1, _id: 1 })
+      .select('role content createdAt -_id')
+      .lean();
+
+    return res.json({
+      success: true,
+      messages,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar mensagens do projeto.',
       error: error.message,
     });
   }
