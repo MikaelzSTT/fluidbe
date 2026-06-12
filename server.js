@@ -17,6 +17,17 @@ dotenv.config();
 const app = express();
 
 const PUBLIC_BUILDS_DIR = path.join(__dirname, 'public', 'builds');
+const allowedOrigins = [
+  'https://askfluid.now',
+  'https://www.askfluid.now',
+  'https://fluid-web-static.onrender.com',
+  'http://localhost:3000',
+  'http://localhost:5173'
+];
+const corsOptions = {
+  origin: allowedOrigins,
+  credentials: true
+};
 
 function resolvePublicBuildIndexPath(buildUrl) {
   if (typeof buildUrl !== 'string' || !buildUrl.startsWith('/builds/')) {
@@ -97,14 +108,8 @@ async function loadPublishedHtml(project) {
   return rewriteBuildAssetPaths(fileHtml, buildUrl);
 }
 
-app.use(cors({
-  origin: [
-    'https://askfluid.now',
-    'http://localhost:3000',
-    'http://localhost:5173'
-  ],
-  credentials: true
-}));
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 app.use('/builds', express.static(path.join(__dirname, 'public', 'builds')));
 app.get('/p/:slug', async (req, res) => {
