@@ -172,6 +172,41 @@ const projectSchema = new mongoose.Schema(
       default: {},
     },
 
+    requiredConnectors: {
+      type: [
+        {
+          provider: {
+            type: String,
+            required: true,
+            trim: true,
+          },
+          label: {
+            type: String,
+            default: '',
+            trim: true,
+          },
+          reason: {
+            type: String,
+            default: '',
+          },
+          status: {
+            type: String,
+            enum: ['pending', 'connected', 'skipped'],
+            default: 'pending',
+          },
+          createdAt: {
+            type: Date,
+            default: Date.now,
+          },
+          updatedAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+
     metadata: {
       lastPromptAt: {
         type: Date,

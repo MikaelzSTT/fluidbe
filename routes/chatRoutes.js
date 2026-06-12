@@ -187,6 +187,118 @@ function detectRequiredConnectors({ message, history, project }) {
   }));
 }
 
+function normalizeConnectorProvider(provider) {
+  return String(provider || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+}
+
+function sanitizeRequiredConnector(connector) {
+  if (!connector || typeof connector !== 'object') {
+    return null;
+  }
+
+  const provider = normalizeConnectorProvider(connector.provider);
+
+  if (!provider) {
+    return null;
+  }
+
+  return {
+    provider,
+    label: String(connector.label || provider).replace(/\s+/g, ' ').trim(),
+    reason: String(connector.reason || '').replace(/\s+/g, ' ').trim(),
+  };
+}
+
+function connectorToObject(connector) {
+  return typeof connector?.toObject === 'function'
+    ? connector.toObject({ getters: true, virtuals: true })
+    : connector;
+}
+
+function mergeRequiredConnectors(existingConnectors, detectedConnectors) {
+  const now = new Date();
+  const mergedConnectors = [];
+  const providerIndex = new Map();
+
+  if (Array.isArray(existingConnectors)) {
+    existingConnectors.forEach((connector) => {
+      const existing = connectorToObject(connector);
+      const provider = normalizeConnectorProvider(existing?.provider);
+
+      if (!provider || providerIndex.has(provider)) {
+        return;
+      }
+
+      providerIndex.set(provider, mergedConnectors.length);
+      mergedConnectors.push({
+        provider,
+        label: String(existing.label || provider).replace(/\s+/g, ' ').trim(),
+        reason: String(existing.reason || '').replace(/\s+/g, ' ').trim(),
+        status: ['pending', 'connected', 'skipped'].includes(existing.status)
+          ? existing.status
+          : 'pending',
+        createdAt: existing.createdAt || now,
+        updatedAt: existing.updatedAt || now,
+      });
+    });
+  }
+
+  (Array.isArray(detectedConnectors) ? detectedConnectors : []).forEach(
+    (connector) => {
+      const detected = sanitizeRequiredConnector(connector);
+
+      if (!detected) {
+        return;
+      }
+
+      const existingIndex = providerIndex.get(detected.provider);
+
+      if (existingIndex !== undefined) {
+        mergedConnectors[existingIndex] = {
+          ...mergedConnectors[existingIndex],
+          label: detected.label || mergedConnectors[existingIndex].label,
+          reason: detected.reason || mergedConnectors[existingIndex].reason,
+          updatedAt: now,
+        };
+        return;
+      }
+
+      providerIndex.set(detected.provider, mergedConnectors.length);
+      mergedConnectors.push({
+        ...detected,
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  );
+
+  return mergedConnectors;
+}
+
+async function persistRequiredConnectors(project, detectedConnectors) {
+  if (
+    !project ||
+    !Array.isArray(detectedConnectors) ||
+    detectedConnectors.length === 0
+  ) {
+    return [];
+  }
+
+  const requiredConnectors = mergeRequiredConnectors(
+    project.requiredConnectors || [],
+    detectedConnectors
+  );
+
+  project.requiredConnectors = requiredConnectors;
+  await project.save();
+
+  return requiredConnectors;
+}
+
 function buildDecisionSystemPrompt(projectContext) {
   return `
 Voce e a IA de chat da Fluid, em portugues do Brasil.
@@ -694,8 +806,16 @@ router.post('/', authMiddleware, async (req, res) => {
       history: history || messages,
       project,
     });
+    let requiredConnectors = aiReply.requiredConnectors || [];
 
     if (project) {
+      if (requiredConnectors.length > 0) {
+        requiredConnectors = await persistRequiredConnectors(
+          project,
+          requiredConnectors
+        );
+      }
+
       await ProjectMessage.create({
         projectId: project._id,
         role: 'assistant',
@@ -706,7 +826,7 @@ router.post('/', authMiddleware, async (req, res) => {
           readyForWizard: Boolean(aiReply.readyForWizard),
           needsClarification: Boolean(aiReply.needsClarification),
           options: aiReply.options || [],
-          requiredConnectors: aiReply.requiredConnectors || [],
+          requiredConnectors,
         },
       });
     }
@@ -717,7 +837,7 @@ router.post('/', authMiddleware, async (req, res) => {
       readyForWizard: aiReply.readyForWizard,
       needsClarification: Boolean(aiReply.needsClarification),
       options: aiReply.options || [],
-      requiredConnectors: aiReply.requiredConnectors || [],
+      requiredConnectors,
     });
   } catch (error) {
     return res.status(500).json({
