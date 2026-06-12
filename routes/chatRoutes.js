@@ -8,6 +8,106 @@ const authMiddleware = require('../middleware/authMiddleware');
 const router = express.Router();
 
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-5';
+const CONNECTOR_RULES = [
+  {
+    provider: 'stripe',
+    label: 'Stripe',
+    reason: 'Necessário para pagamentos por cartão, checkout ou assinaturas.',
+    patterns: [
+      /\bpagament\w*\b/,
+      /\bcartao\b/,
+      /\bcartoes\b/,
+      /\bcheckout\b/,
+      /\bassinat\w*\b/,
+      /\bloja\b/,
+      /\bmarketplace\b/,
+      /\bcorrida paga\b/,
+    ],
+  },
+  {
+    provider: 'google_maps',
+    label: 'Google Maps',
+    reason: 'Necessário para mapas, localização, rotas ou endereços.',
+    patterns: [
+      /\bmapa\w*\b/,
+      /\blocaliz\w*\b/,
+      /\brota\w*\b/,
+      /\bentrega\w*\b/,
+      /\buber\b/,
+      /\bdelivery\b/,
+      /\bmotorista\w*\b/,
+      /\bendereco\w*\b/,
+    ],
+  },
+  {
+    provider: 'resend',
+    label: 'Resend',
+    reason: 'Necessário para envio de emails, recibos ou formulários de contato.',
+    patterns: [
+      /\bemail\w*\b/,
+      /\be-mail\w*\b/,
+      /\bnotificacao por email\b/,
+      /\bnotificacoes por email\b/,
+      /\brecibo\w*\b/,
+      /\bformulario de contato\b/,
+      /\bformularios de contato\b/,
+    ],
+  },
+  {
+    provider: 'supabase',
+    label: 'Supabase',
+    reason: 'Necessário para login, banco de dados, usuários, dados salvos ou storage.',
+    patterns: [
+      /\blogin\b/,
+      /\bbanco de dados\b/,
+      /\bdashboard\b/,
+      /\bcrm\b/,
+      /\busuario\w*\b/,
+      /\bdados salvos\b/,
+      /\bstorage\b/,
+    ],
+  },
+  {
+    provider: 'openai',
+    label: 'OpenAI',
+    reason: 'Necessário para recursos de IA, chatbot, assistente ou geração por IA.',
+    patterns: [
+      /\bia\b/,
+      /\bchatbot\w*\b/,
+      /\bassistente\w*\b/,
+      /\bgeracao por ia\b/,
+      /\bgerar por ia\b/,
+    ],
+  },
+  {
+    provider: 'cloudinary',
+    label: 'Cloudinary',
+    reason: 'Necessário para upload e gerenciamento de imagens.',
+    patterns: [
+      /\bupload de imagen\w*\b/,
+      /\bupload de foto\w*\b/,
+      /\bfoto\w*\b/,
+      /\bavatar\w*\b/,
+      /\bproduto\w* com imagen\w*\b/,
+    ],
+  },
+  {
+    provider: 'backend',
+    label: 'Backend',
+    reason: 'Necessário para APIs, pedidos, corridas, status, realtime ou autenticação complexa.',
+    patterns: [
+      /\bbackend\b/,
+      /\bapi\b/,
+      /\bapis\b/,
+      /\bpedido\w*\b/,
+      /\bcorrida\w*\b/,
+      /\bstatus\b/,
+      /\brealtime\b/,
+      /\btempo real\b/,
+      /\bautenticacao complexa\b/,
+    ],
+  },
+];
 
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') {
@@ -37,6 +137,54 @@ function buildProjectContext(project) {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+function normalizeConnectorText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildConnectorDetectionText({ message, history, project }) {
+  const parts = [message];
+
+  if (Array.isArray(history)) {
+    history.forEach((item) => {
+      const normalizedItem = normalizeHistoryItem(item);
+
+      if (normalizedItem?.role === 'user') {
+        parts.push(normalizedItem.content);
+      }
+    });
+  }
+
+  const projectContext = buildProjectContext(project);
+
+  if (projectContext) {
+    parts.push(projectContext);
+  }
+
+  return normalizeConnectorText(parts.filter(Boolean).join('\n'));
+}
+
+function detectRequiredConnectors({ message, history, project }) {
+  const detectionText = buildConnectorDetectionText({ message, history, project });
+
+  if (!detectionText) {
+    return [];
+  }
+
+  return CONNECTOR_RULES.filter((rule) =>
+    rule.patterns.some((pattern) => pattern.test(detectionText))
+  ).map(({ provider, label, reason }) => ({
+    provider,
+    label,
+    reason,
+  }));
 }
 
 function buildDecisionSystemPrompt(projectContext) {
@@ -83,6 +231,7 @@ Quando action for "wizard" ou "clarify", options deve ser [].
 As options devem ser geradas por voce para a conversa atual, nunca copiadas de uma lista fixa.
 
 Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos. Nao salve dados. Nao mencione detalhes internos como polling, ProjectBuild, MongoDB ou JWT a menos que o usuario pergunte.
+Nunca peca API key, token, senha ou secret no chat.
 
 Contexto do projeto atual:
 ${projectContext || 'Nenhum projeto informado.'}
@@ -111,6 +260,7 @@ Regras obrigatorias:
 - Cada pergunta precisa ajudar a melhorar a primeira geracao do projeto.
 - Nao gere codigo, HTML, CSS ou JS.
 - Nao salve dados e nao mencione banco, ProjectBuild, MongoDB, JWT ou detalhes internos.
+- Nunca peca API key, token, senha ou secret no chat.
 - Sempre inclua uma pergunta de estilo visual quando fizer sentido.
 
 Direcionamento por tipo de projeto:
@@ -142,6 +292,7 @@ function buildFallbackSystemPrompt(projectContext) {
 Voce e a IA de chat da Fluid, em portugues do Brasil.
 
 Responda de forma natural, breve e util. Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos.
+Nunca peca API key, token, senha ou secret no chat.
 
 Se o usuario pedir algo vago sobre criar site, app, landing page, SaaS, dashboard, ecommerce, interface ou projeto, faca no maximo uma pergunta curta sobre tema, negocio, produto ou objetivo principal.
 
@@ -412,7 +563,9 @@ async function getFallbackChatReply({ message, previousMessages, projectContext 
   return {
     reply,
     readyForWizard: false,
+    needsClarification: false,
     options: [],
+    requiredConnectors: [],
   };
 }
 
@@ -440,15 +593,20 @@ async function getAiReply({ message, history, project }) {
 
     const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
     const options = normalizeOptions(parsed.options, shouldIncludeOptions);
+    const readyForWizard = action === 'wizard';
+    const requiredConnectors = readyForWizard
+      ? detectRequiredConnectors({ message, history, project })
+      : [];
 
     return {
       reply:
         action === 'clarify'
           ? 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
           : reply,
-      readyForWizard: action === 'wizard',
+      readyForWizard,
       needsClarification: action === 'clarify',
       options,
+      requiredConnectors,
     };
   } catch (error) {
     if (
@@ -548,6 +706,7 @@ router.post('/', authMiddleware, async (req, res) => {
           readyForWizard: Boolean(aiReply.readyForWizard),
           needsClarification: Boolean(aiReply.needsClarification),
           options: aiReply.options || [],
+          requiredConnectors: aiReply.requiredConnectors || [],
         },
       });
     }
@@ -558,6 +717,7 @@ router.post('/', authMiddleware, async (req, res) => {
       readyForWizard: aiReply.readyForWizard,
       needsClarification: Boolean(aiReply.needsClarification),
       options: aiReply.options || [],
+      requiredConnectors: aiReply.requiredConnectors || [],
     });
   } catch (error) {
     return res.status(500).json({
