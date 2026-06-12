@@ -19,6 +19,7 @@ const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
+const PUBLIC_BASE_URL = 'https://askfluid.now';
 const BUILD_FIELDS = [
   'type',
   'status',
@@ -40,9 +41,67 @@ function applyWizardStatus(update, value) {
   update.status = value;
 }
 
+function mergeDeployUpdate(update, deployFields) {
+  if (update.deploy && typeof update.deploy === 'object' && !Array.isArray(update.deploy)) {
+    update.deploy = {
+      ...update.deploy,
+      ...deployFields,
+    };
+    return;
+  }
+
+  Object.entries(deployFields).forEach(([field, value]) => {
+    update[`deploy.${field}`] = value;
+  });
+}
+
 function applyLoadingStatus(update) {
   applyWizardStatus(update, 'in_progress');
   update.publish = false;
+  update.isPublished = false;
+  mergeDeployUpdate(update, { isPublished: false });
+}
+
+function slugifyProjectTitle(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'projeto';
+}
+
+async function buildUniqueProjectSlug(project, title) {
+  const baseSlug = slugifyProjectTitle(title || project.title || project.name || project.prompt);
+  let slug = baseSlug;
+  let suffix = 2;
+
+  while (
+    await Project.exists({
+      _id: { $ne: project._id },
+      slug,
+    })
+  ) {
+    slug = `${baseSlug}-${suffix}`;
+    suffix += 1;
+  }
+
+  return slug;
+}
+
+async function applyPublicationFields(project, update) {
+  const slug = update.slug || project.slug || (await buildUniqueProjectSlug(project, update.title || update.name));
+  const publishedAt = new Date();
+
+  update.slug = slug;
+  update.isPublished = true;
+  update.publishedAt = publishedAt;
+  update.publish = true;
+  mergeDeployUpdate(update, {
+    isPublished: true,
+    publishedAt,
+    url: `${PUBLIC_BASE_URL}/p/${slug}`,
+  });
 }
 
 function requireAdmin(req, res, next) {
@@ -560,6 +619,38 @@ function pickBuildPayload(body) {
   }, {});
 }
 
+async function applyLatestPendingBuild(projectId, update) {
+  const latestPendingBuild = await ProjectBuild.findOne({
+    projectId,
+    status: { $in: ['draft', 'in_progress'] },
+  }).sort({
+    createdAt: -1,
+    updatedAt: -1,
+  });
+
+  if (!latestPendingBuild) {
+    return;
+  }
+
+  latestPendingBuild.status = 'done';
+  await latestPendingBuild.save();
+  const publishedBuild = latestPendingBuild.toObject({
+    getters: true,
+    virtuals: true,
+  });
+
+  update.reactVite = latestPendingBuild.type === 'react_vite';
+  update.build = publishedBuild;
+  update.distUrl = latestPendingBuild.distUrl || '';
+  update.previewUrl = latestPendingBuild.previewUrl || '';
+  update.buildUrl =
+    latestPendingBuild.buildUrl ||
+    latestPendingBuild.deployUrl ||
+    latestPendingBuild.previewUrl ||
+    latestPendingBuild.distUrl ||
+    '';
+}
+
 router.get('/projects', requireAdmin, async (req, res) => {
   try {
     const projects = await Project.find().sort({
@@ -994,43 +1085,14 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       update.publish = publish === true;
 
       if (publish === true) {
-        const latestPendingBuild = await ProjectBuild.findOne({
-          projectId: req.params.id,
-          status: { $in: ['draft', 'in_progress'] },
-        }).sort({
-          createdAt: -1,
-          updatedAt: -1,
-        });
-
-        if (latestPendingBuild) {
-          latestPendingBuild.status = 'done';
-          await latestPendingBuild.save();
-          const publishedBuild = latestPendingBuild.toObject({
-            getters: true,
-            virtuals: true,
-          });
-
-          update.reactVite = latestPendingBuild.type === 'react_vite';
-          update.build = publishedBuild;
-          update.distUrl = latestPendingBuild.distUrl || '';
-          update.previewUrl = latestPendingBuild.previewUrl || '';
-          update.buildUrl =
-            latestPendingBuild.buildUrl ||
-            latestPendingBuild.deployUrl ||
-            latestPendingBuild.previewUrl ||
-            latestPendingBuild.distUrl ||
-            '';
-
-          if (latestPendingBuild.deployUrl) {
-            update['deploy.url'] = latestPendingBuild.deployUrl;
-          }
-        }
-
+        await applyLatestPendingBuild(req.params.id, update);
         applyWizardStatus(update, 'done');
-        update['deploy.isPublished'] = true;
-        update['deploy.publishedAt'] = new Date();
         update['metadata.lastBuildAt'] = new Date();
       }
+    }
+
+    if (requestedStatus === 'done' || publish === true) {
+      await applyPublicationFields(existingProject, update);
     }
 
     const project = await Project.findByIdAndUpdate(req.params.id, update, {
@@ -1056,6 +1118,12 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
 
 router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req, res) => {
   try {
+    const existingProject = await Project.findById(req.params.id);
+
+    if (!existingProject) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
     const { generationStatus, generation_status: generationStatusSnake, status } = req.body;
     const requestedStatus =
       generationStatus !== undefined
@@ -1077,6 +1145,12 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
       applyLoadingStatus(update);
     } else {
       applyWizardStatus(update, requestedStatus);
+    }
+
+    if (requestedStatus === 'done') {
+      await applyLatestPendingBuild(req.params.id, update);
+      await applyPublicationFields(existingProject, update);
+      update['metadata.lastBuildAt'] = new Date();
     }
 
     const project = await Project.findByIdAndUpdate(

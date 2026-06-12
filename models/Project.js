@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const PUBLIC_BASE_URL = 'https://askfluid.now';
+
 const projectSchema = new mongoose.Schema(
   {
     userId: {
@@ -18,6 +20,22 @@ const projectSchema = new mongoose.Schema(
       type: String,
       default: '',
       trim: true,
+    },
+
+    slug: {
+      type: String,
+      trim: true,
+      lowercase: true,
+    },
+
+    publishedAt: {
+      type: Date,
+      default: null,
+    },
+
+    isPublished: {
+      type: Boolean,
+      default: false,
     },
 
     description: {
@@ -222,7 +240,17 @@ const projectSchema = new mongoose.Schema(
       },
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+projectSchema.index({ slug: 1 }, { unique: true, sparse: true });
+
+projectSchema.virtual('publicUrl').get(function getPublicUrl() {
+  return this.slug ? `${PUBLIC_BASE_URL}/p/${this.slug}` : '';
+});
 
 module.exports = mongoose.model('Project', projectSchema);
