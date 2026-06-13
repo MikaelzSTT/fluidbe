@@ -72,6 +72,31 @@ const projectBuildSchema = new mongoose.Schema(
       default: '',
     },
 
+    artifactFiles: {
+      type: [
+        {
+          path: {
+            type: String,
+            required: true,
+          },
+          contentType: {
+            type: String,
+            default: 'application/octet-stream',
+          },
+          encoding: {
+            type: String,
+            enum: ['base64'],
+            default: 'base64',
+          },
+          content: {
+            type: String,
+            required: true,
+          },
+        },
+      ],
+      default: [],
+    },
+
     logs: {
       type: mongoose.Schema.Types.Mixed,
       default: '',

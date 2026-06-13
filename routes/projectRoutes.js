@@ -7,11 +7,75 @@ const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
+function getBackendBaseUrl(req) {
+  const configuredBaseUrl =
+    process.env.BACKEND_PUBLIC_URL ||
+    process.env.PUBLIC_BACKEND_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    '';
+
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/+$/, '');
+  }
+
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function toAbsoluteBackendUrl(req, value) {
+  if (typeof value !== 'string' || !value) {
+    return value || '';
+  }
+
+  if (!value.startsWith('/builds/')) {
+    return value;
+  }
+
+  return new URL(value, `${getBackendBaseUrl(req)}/`).toString();
+}
+
+function withAbsoluteBuildUrls(req, value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  const payload =
+    typeof value.toObject === 'function'
+      ? value.toObject({ getters: true, virtuals: true })
+      : { ...value };
+
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
+    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+  }
+
+  return payload;
+}
+
+function withAbsoluteProjectBuildUrls(req, value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  const payload =
+    typeof value.toObject === 'function'
+      ? value.toObject({ getters: true, virtuals: true })
+      : { ...value };
+
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl']) {
+    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+  }
+
+  if (payload.build && typeof payload.build === 'object') {
+    payload.build = withAbsoluteBuildUrls(req, payload.build);
+  }
+
+  return payload;
+}
+
 function getEffectiveBuildStatus(project) {
   return project.generationStatus || project.generation_status || project.status || 'pending';
 }
 
-function buildProjectPayload(projectDocument) {
+function buildProjectPayload(req, projectDocument) {
   const project =
     typeof projectDocument.toObject === 'function'
       ? projectDocument.toObject({ getters: true, virtuals: true })
@@ -24,7 +88,7 @@ function buildProjectPayload(projectDocument) {
     status: effectiveStatus,
     generationStatus: effectiveStatus,
     generation_status: effectiveStatus,
-    project,
+    project: withAbsoluteProjectBuildUrls(req, project),
   };
 
   if (effectiveStatus !== 'done') {
@@ -40,16 +104,16 @@ function buildProjectPayload(projectDocument) {
     js: project.js || '',
     fullHtml,
     latestFullHtml: project.latestFullHtml || fullHtml,
-    distUrl: project.distUrl || build.distUrl || '',
-    previewUrl: project.previewUrl || build.previewUrl || '',
-    buildUrl: project.buildUrl || build.buildUrl || '',
+    distUrl: toAbsoluteBackendUrl(req, project.distUrl || build.distUrl || ''),
+    previewUrl: toAbsoluteBackendUrl(req, project.previewUrl || build.previewUrl || ''),
+    buildUrl: toAbsoluteBackendUrl(req, project.buildUrl || build.buildUrl || ''),
     deploy: project.deploy || {},
     reactVite: project.reactVite === true || build.reactVite === true,
-    build,
+    build: withAbsoluteBuildUrls(req, build),
   };
 }
 
-function buildDoneProjectBuildPayload(project, buildDocument) {
+function buildDoneProjectBuildPayload(req, project, buildDocument) {
   const build =
     typeof buildDocument.toObject === 'function'
       ? buildDocument.toObject({ getters: true, virtuals: true })
@@ -60,17 +124,17 @@ function buildDoneProjectBuildPayload(project, buildDocument) {
     status: 'done',
     generationStatus: 'done',
     generation_status: 'done',
-    project,
-    build,
+    project: withAbsoluteProjectBuildUrls(req, project),
+    build: withAbsoluteBuildUrls(req, build),
     html: build.html || '',
     css: build.css || '',
     js: build.js || '',
     fullHtml: build.fullHtml || '',
     latestFullHtml: build.fullHtml || '',
-    distUrl: build.distUrl || '',
-    previewUrl: build.previewUrl || '',
-    buildUrl: build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '',
-    deployUrl: build.deployUrl || '',
+    distUrl: toAbsoluteBackendUrl(req, build.distUrl || ''),
+    previewUrl: toAbsoluteBackendUrl(req, build.previewUrl || ''),
+    buildUrl: toAbsoluteBackendUrl(req, build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || ''),
+    deployUrl: toAbsoluteBackendUrl(req, build.deployUrl || ''),
     sourceZipUrl: build.sourceZipUrl || '',
     logs: build.logs || '',
     reactVite: build.type === 'react_vite',
@@ -145,10 +209,10 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     });
 
     if (latestDoneBuild) {
-      return res.json(buildDoneProjectBuildPayload(project, latestDoneBuild));
+      return res.json(buildDoneProjectBuildPayload(req, project, latestDoneBuild));
     }
 
-    return res.json(buildProjectPayload(project));
+    return res.json(buildProjectPayload(req, project));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar build do projeto.',

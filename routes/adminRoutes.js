@@ -16,6 +16,7 @@ const execFileAsync = promisify(execFile);
 const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
+const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 8 * 1024 * 1024);
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
@@ -32,8 +33,95 @@ const BUILD_FIELDS = [
   'buildUrl',
   'deployUrl',
   'sourceZipUrl',
+  'artifactFiles',
   'logs',
 ];
+
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+};
+
+function getContentType(filePath) {
+  return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
+
+function getBackendBaseUrl(req) {
+  const configuredBaseUrl =
+    process.env.BACKEND_PUBLIC_URL ||
+    process.env.PUBLIC_BACKEND_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    '';
+
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/+$/, '');
+  }
+
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function toAbsoluteBackendUrl(req, value) {
+  if (typeof value !== 'string' || !value) {
+    return value || '';
+  }
+
+  if (!value.startsWith('/builds/')) {
+    return value;
+  }
+
+  return new URL(value, `${getBackendBaseUrl(req)}/`).toString();
+}
+
+function withAbsoluteBuildUrls(req, document) {
+  if (!document || typeof document !== 'object') {
+    return document;
+  }
+
+  const payload =
+    typeof document.toObject === 'function'
+      ? document.toObject({ getters: true, virtuals: true })
+      : { ...document };
+
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
+    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+  }
+
+  return payload;
+}
+
+function withAbsoluteProjectBuildUrls(req, document) {
+  if (!document || typeof document !== 'object') {
+    return document;
+  }
+
+  const payload =
+    typeof document.toObject === 'function'
+      ? document.toObject({ getters: true, virtuals: true })
+      : { ...document };
+
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl']) {
+    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+  }
+
+  if (payload.build && typeof payload.build === 'object') {
+    payload.build = withAbsoluteBuildUrls(req, payload.build);
+  }
+
+  return payload;
+}
 
 function applyWizardStatus(update, value) {
   update.generationStatus = value;
@@ -123,7 +211,7 @@ function validateProjectId(req, res, next) {
 }
 
 function resolvePublicBuildIndexPath(buildUrl) {
-  if (typeof buildUrl !== 'string' || !buildUrl.startsWith('/builds/')) {
+  if (typeof buildUrl !== 'string') {
     return null;
   }
 
@@ -151,6 +239,130 @@ function resolvePublicBuildIndexPath(buildUrl) {
   }
 
   return indexPath;
+}
+
+function parsePublicBuildUrl(buildUrl) {
+  if (typeof buildUrl !== 'string') {
+    return null;
+  }
+
+  let pathname;
+
+  try {
+    pathname = decodeURIComponent(new URL(buildUrl, 'http://localhost').pathname);
+  } catch (error) {
+    return null;
+  }
+
+  if (!pathname.startsWith('/builds/')) {
+    return null;
+  }
+
+  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
+
+  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
+    return null;
+  }
+
+  const projectId = parts[0];
+  const buildKey = parts[1];
+
+  return {
+    projectId,
+    buildKey,
+    indexBuildUrl: `/builds/${projectId}/${buildKey}/index.html`,
+  };
+}
+
+async function hasMongoBuildFallback(buildUrl) {
+  const parsedUrl = parsePublicBuildUrl(buildUrl);
+
+  if (!parsedUrl) {
+    return false;
+  }
+
+  const escapedIndexBuildUrl = parsedUrl.indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
+  const build = await ProjectBuild.findOne({
+    projectId: parsedUrl.projectId,
+    $or: [
+      { distUrl: parsedUrl.indexBuildUrl },
+      { previewUrl: parsedUrl.indexBuildUrl },
+      { buildUrl: parsedUrl.indexBuildUrl },
+      { deployUrl: parsedUrl.indexBuildUrl },
+      { distUrl: absoluteIndexBuildUrlPattern },
+      { previewUrl: absoluteIndexBuildUrlPattern },
+      { buildUrl: absoluteIndexBuildUrlPattern },
+      { deployUrl: absoluteIndexBuildUrlPattern },
+    ],
+  }).select('fullHtml html artifactFiles.path');
+
+  return Boolean(
+    build &&
+      (
+        build.fullHtml ||
+        build.html ||
+        (Array.isArray(build.artifactFiles) && build.artifactFiles.some((file) => file.path === 'index.html'))
+      )
+  );
+}
+
+async function collectBuildArtifactFiles(distDir) {
+  const distRoot = path.resolve(distDir);
+  const files = [];
+  let totalBytes = 0;
+
+  async function collect(currentDir) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        const childComplete = await collect(entryPath);
+        if (!childComplete) {
+          return false;
+        }
+
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      const absolutePath = path.resolve(entryPath);
+      if (absolutePath !== distRoot && !absolutePath.startsWith(`${distRoot}${path.sep}`)) {
+        continue;
+      }
+
+      const stats = await fs.stat(absolutePath);
+      totalBytes += stats.size;
+
+      if (totalBytes > MAX_MONGO_ARTIFACT_BYTES) {
+        return false;
+      }
+
+      const relativePath = path.relative(distRoot, absolutePath).split(path.sep).join('/');
+      const content = await fs.readFile(absolutePath);
+      files.push({
+        path: relativePath,
+        contentType: getContentType(relativePath),
+        encoding: 'base64',
+        content: content.toString('base64'),
+      });
+    }
+
+    return true;
+  }
+
+  const complete = await collect(distRoot);
+
+  return {
+    files: complete === false ? [] : files,
+    complete: complete !== false,
+    totalBytes,
+  };
 }
 
 async function loadProject(req, res, next) {
@@ -649,6 +861,11 @@ async function applyLatestPendingBuild(projectId, update) {
     latestPendingBuild.previewUrl ||
     latestPendingBuild.distUrl ||
     '';
+
+  if (latestPendingBuild.fullHtml) {
+    update.fullHtml = latestPendingBuild.fullHtml;
+    update.latestFullHtml = latestPendingBuild.fullHtml;
+  }
 }
 
 router.get('/projects', requireAdmin, async (req, res) => {
@@ -660,7 +877,7 @@ router.get('/projects', requireAdmin, async (req, res) => {
 
     return res.json({
       success: true,
-      projects,
+      projects: projects.map((project) => withAbsoluteProjectBuildUrls(req, project)),
     });
   } catch (error) {
     return res.status(500).json({
@@ -803,6 +1020,14 @@ router.post(
         logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
       }
 
+      const distIndexPath = path.join(distDir, 'index.html');
+      const fullHtml = await fs.readFile(distIndexPath, 'utf8');
+      const artifactSnapshot = await collectBuildArtifactFiles(distDir);
+
+      if (!artifactSnapshot.complete) {
+        logs += `\nAviso: dist gerado tem mais de ${MAX_MONGO_ARTIFACT_BYTES} bytes; fallback via MongoDB não foi salvo para os assets.\n`;
+      }
+
       const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
       await fs.mkdir(publicBuildDir, { recursive: true });
       await fs.cp(distDir, publicBuildDir, { recursive: true });
@@ -816,6 +1041,8 @@ router.post(
         previewUrl,
         buildUrl: previewUrl,
         deployUrl: previewUrl,
+        fullHtml,
+        artifactFiles: artifactSnapshot.files,
         sourceZipUrl: '',
         logs: [logs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
       });
@@ -836,8 +1063,8 @@ router.post(
 
       return res.status(201).json({
         success: true,
-        build,
-        previewUrl,
+        build: withAbsoluteBuildUrls(req, build),
+        previewUrl: toAbsoluteBackendUrl(req, previewUrl),
       });
     } catch (error) {
       const errorLogs = [logs, error.message].filter(Boolean).join('\n');
@@ -873,7 +1100,7 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
 
     return res.status(201).json({
       success: true,
-      build,
+      build: withAbsoluteBuildUrls(req, build),
     });
   } catch (error) {
     if (error.name === 'ValidationError') {
@@ -918,6 +1145,14 @@ router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async 
         exists: true,
       });
     } catch (error) {
+      if (await hasMongoBuildFallback(req.query.url)) {
+        return res.json({
+          success: true,
+          exists: true,
+          source: 'mongodb',
+        });
+      }
+
       return res.json({
         success: true,
         exists: false,
@@ -947,7 +1182,7 @@ router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, 
 
     return res.json({
       success: true,
-      builds,
+      builds: builds.map((build) => withAbsoluteBuildUrls(req, build)),
     });
   } catch (error) {
     return res.status(500).json({
@@ -983,7 +1218,7 @@ router.patch('/projects/:id/build-mode', requireAdmin, validateProjectId, async 
 
     return res.json({
       success: true,
-      project,
+      project: withAbsoluteProjectBuildUrls(req, project),
     });
   } catch (error) {
     return res.status(500).json({
@@ -1106,7 +1341,7 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
 
     return res.json({
       success: true,
-      project,
+      project: withAbsoluteProjectBuildUrls(req, project),
     });
   } catch (error) {
     return res.status(500).json({
@@ -1168,7 +1403,7 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
 
     return res.json({
       success: true,
-      project,
+      project: withAbsoluteProjectBuildUrls(req, project),
     });
   } catch (error) {
     return res.status(500).json({

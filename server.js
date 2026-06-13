@@ -30,7 +30,7 @@ const corsOptions = {
 };
 
 function resolvePublicBuildIndexPath(buildUrl) {
-  if (typeof buildUrl !== 'string' || !buildUrl.startsWith('/builds/')) {
+  if (typeof buildUrl !== 'string') {
     return null;
   }
 
@@ -76,6 +76,93 @@ function rewriteBuildAssetPaths(html, buildUrl) {
     .replaceAll("url('./assets/", `url('${buildBasePath}assets/`);
 }
 
+function parseBuildRequestPath(requestPath) {
+  let pathname;
+
+  try {
+    pathname = decodeURIComponent(new URL(requestPath, 'http://localhost').pathname);
+  } catch (error) {
+    return null;
+  }
+
+  if (!pathname.startsWith('/builds/')) {
+    return null;
+  }
+
+  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
+
+  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
+    return null;
+  }
+
+  const projectId = parts[0];
+  const buildKey = parts[1];
+  const artifactPath = parts.slice(2).join('/') || 'index.html';
+  const indexBuildUrl = `/builds/${projectId}/${buildKey}/index.html`;
+
+  if (artifactPath.includes('..')) {
+    return null;
+  }
+
+  return {
+    projectId,
+    buildKey,
+    artifactPath,
+    indexBuildUrl,
+  };
+}
+
+async function findMongoBuildArtifact(requestPath) {
+  const parsedPath = parseBuildRequestPath(requestPath);
+
+  if (!parsedPath) {
+    return null;
+  }
+
+  const escapedIndexBuildUrl = parsedPath.indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
+  const build = await ProjectBuild.findOne({
+    projectId: parsedPath.projectId,
+    $or: [
+      { distUrl: parsedPath.indexBuildUrl },
+      { previewUrl: parsedPath.indexBuildUrl },
+      { buildUrl: parsedPath.indexBuildUrl },
+      { deployUrl: parsedPath.indexBuildUrl },
+      { distUrl: absoluteIndexBuildUrlPattern },
+      { previewUrl: absoluteIndexBuildUrlPattern },
+      { buildUrl: absoluteIndexBuildUrlPattern },
+      { deployUrl: absoluteIndexBuildUrlPattern },
+    ],
+  }).sort({
+    createdAt: -1,
+    updatedAt: -1,
+  });
+
+  if (!build) {
+    return null;
+  }
+
+  const artifact = Array.isArray(build.artifactFiles)
+    ? build.artifactFiles.find((file) => file.path === parsedPath.artifactPath)
+    : null;
+
+  if (artifact && artifact.content) {
+    return {
+      contentType: artifact.contentType || 'application/octet-stream',
+      body: Buffer.from(artifact.content, artifact.encoding || 'base64'),
+    };
+  }
+
+  if (parsedPath.artifactPath === 'index.html' && (build.fullHtml || build.html)) {
+    return {
+      contentType: 'text/html; charset=utf-8',
+      body: build.fullHtml || build.html,
+    };
+  }
+
+  return null;
+}
+
 async function loadPublishedHtml(project) {
   const latestDoneBuild = await ProjectBuild.findOne({
     projectId: project._id,
@@ -108,10 +195,24 @@ async function loadPublishedHtml(project) {
   return rewriteBuildAssetPaths(fileHtml, buildUrl);
 }
 
+app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 app.use('/builds', express.static(path.join(__dirname, 'public', 'builds')));
+app.get(/^\/builds\/.+$/, async (req, res, next) => {
+  try {
+    const artifact = await findMongoBuildArtifact(req.path);
+
+    if (!artifact) {
+      return next();
+    }
+
+    return res.type(artifact.contentType).send(artifact.body);
+  } catch (error) {
+    return next(error);
+  }
+});
 app.get('/p/:slug', async (req, res) => {
   try {
     const project = await Project.findOne({
