@@ -257,7 +257,7 @@ function mergeRequiredConnectors(existingConnectors, detectedConnectors) {
         provider,
         label: String(existing.label || provider).replace(/\s+/g, ' ').trim(),
         reason: String(existing.reason || '').replace(/\s+/g, ' ').trim(),
-        status: ['pending', 'connected', 'skipped'].includes(existing.status)
+        status: ['pending', 'connected', 'skipped', 'error'].includes(existing.status)
           ? existing.status
           : 'pending',
         createdAt: existing.createdAt || now,

@@ -209,7 +209,7 @@ const projectSchema = new mongoose.Schema(
           },
           status: {
             type: String,
-            enum: ['pending', 'connected', 'skipped'],
+            enum: ['pending', 'connected', 'skipped', 'error'],
             default: 'pending',
           },
           createdAt: {

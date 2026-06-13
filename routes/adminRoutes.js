@@ -40,6 +40,19 @@ const BUILD_FIELDS = [
   'artifactFiles',
   'logs',
 ];
+const CONNECTOR_STATUSES = ['pending', 'connected', 'skipped', 'error'];
+const CONNECTOR_STATUS_LABELS = {
+  pending: 'Pendente',
+  connected: 'Conectado',
+  skipped: 'Ignorado',
+  error: 'Erro',
+};
+const CONNECTOR_STATUS_TONES = {
+  pending: 'yellow',
+  connected: 'green',
+  skipped: 'gray',
+  error: 'red',
+};
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -253,22 +266,21 @@ function connectorSecretToConfiguredFields(secret) {
 
 function buildSafeConnectorPayload(projectConnector, connector, secret) {
   const updatedAt = projectConnector?.updatedAt || secret?.lastUpdatedAt || secret?.updatedAt || null;
-  const status = secret ? 'connected' : projectConnector?.status || 'pending';
+  const projectStatus = CONNECTOR_STATUSES.includes(projectConnector?.status)
+    ? projectConnector.status
+    : '';
+  const status = projectStatus === 'error'
+    ? 'error'
+    : secret
+      ? 'connected'
+      : projectStatus || 'pending';
 
   return {
     provider: connector?.provider || projectConnector?.provider || secret?.provider || '',
     label: connector?.label || projectConnector?.label || projectConnector?.provider || secret?.provider || '',
     status,
-    statusLabel: status === 'connected'
-      ? 'Conectado'
-      : status === 'pending'
-        ? 'Pendente'
-        : 'Ignorado',
-    statusTone: status === 'connected'
-      ? 'green'
-      : status === 'pending'
-        ? 'yellow'
-        : 'gray',
+    statusLabel: CONNECTOR_STATUS_LABELS[status] || CONNECTOR_STATUS_LABELS.pending,
+    statusTone: CONNECTOR_STATUS_TONES[status] || CONNECTOR_STATUS_TONES.pending,
     connectedAt: secret?.createdAt || (status === 'connected' ? updatedAt : null),
     updatedAt,
     fieldsConfigured: connectorSecretToConfiguredFields(secret),

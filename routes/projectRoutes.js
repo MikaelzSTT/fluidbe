@@ -11,6 +11,29 @@ const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const router = express.Router();
 const CONNECTOR_VALIDATION_FAILURE_MESSAGE = 'Não foi possível validar este conector. Confira a credencial.';
 const CONNECTOR_VALIDATION_TIMEOUT_MS = 5000;
+const CONNECTOR_STATUSES = ['pending', 'connected', 'skipped', 'error'];
+const CONNECTOR_ERROR_MESSAGES = {
+  stripe: 'Stripe Secret Key inválida ou sem permissão.',
+  google_maps: 'Google Maps API Key inválida ou bloqueada.',
+  resend: 'Resend API Key inválida.',
+  openai: 'OpenAI API Key inválida.',
+  twilio: 'Credenciais Twilio inválidas.',
+  shopify: 'Credenciais Shopify inválidas ou loja inacessível.',
+  supabase: 'Credenciais Supabase inválidas ou projeto inacessível.',
+  cloudinary: 'Credenciais Cloudinary inválidas.',
+};
+const CONNECTOR_STATUS_LABELS = {
+  pending: 'Pendente',
+  connected: 'Conectado',
+  skipped: 'Ignorado',
+  error: 'Erro',
+};
+const CONNECTOR_STATUS_TONES = {
+  pending: 'yellow',
+  connected: 'green',
+  skipped: 'gray',
+  error: 'red',
+};
 const CONNECTOR_RULES = [
   {
     provider: 'stripe',
@@ -118,6 +141,15 @@ function normalizeShopifyStoreUrl(value) {
   }
 }
 
+function isSupabaseProjectUrl(value) {
+  try {
+    const parsedUrl = new URL(String(value || '').trim());
+    return parsedUrl.protocol === 'https:' && parsedUrl.hostname.endsWith('.supabase.co');
+  } catch (error) {
+    return false;
+  }
+}
+
 function normalizeConnectorValues(connector, values) {
   const normalizedValues = {};
   const provider = normalizeConnectorProvider(connector.provider);
@@ -195,6 +227,14 @@ function validateConnectorValues(connector, values) {
     }
   }
 
+  if (provider === 'supabase') {
+    const projectUrl = trimmedValue('project_url');
+
+    if (!isSupabaseProjectUrl(projectUrl)) {
+      return CONNECTOR_ERROR_MESSAGES.supabase;
+    }
+  }
+
   return '';
 }
 
@@ -227,8 +267,36 @@ async function validateGoogleMapsCredentials(values) {
   return body?.status === 'OK' || body?.status === 'ZERO_RESULTS';
 }
 
+async function validateSupabaseCredentials(values) {
+  const projectUrl = String(values.project_url || '').trim().replace(/\/+$/, '');
+  const response = await fetchWithConnectorTimeout(`${projectUrl}/rest/v1/`, {
+    headers: {
+      apikey: values.anon_key,
+      Authorization: `Bearer ${values.anon_key}`,
+    },
+  });
+
+  return [200, 401, 404, 406].includes(response.status);
+}
+
+async function validateCloudinaryCredentials(values) {
+  const credentials = Buffer.from(`${values.api_key}:${values.api_secret}`).toString('base64');
+  const cloudName = encodeURIComponent(String(values.cloud_name || '').trim());
+  const response = await fetchWithConnectorTimeout(
+    `https://api.cloudinary.com/v1_1/${cloudName}/resources/image`,
+    {
+      headers: {
+        Authorization: `Basic ${credentials}`,
+      },
+    }
+  );
+
+  return response.status === 200;
+}
+
 async function validateConnectorCredentials(connector, values) {
   const provider = normalizeConnectorProvider(connector.provider);
+  const errorMessage = CONNECTOR_ERROR_MESSAGES[provider] || CONNECTOR_VALIDATION_FAILURE_MESSAGE;
 
   try {
     if (provider === 'stripe') {
@@ -237,7 +305,7 @@ async function validateConnectorCredentials(connector, values) {
           Authorization: `Bearer ${values.secret_key}`,
         },
       });
-      return response.status === 200;
+      return { valid: response.status === 200, message: errorMessage };
     }
 
     if (provider === 'openai') {
@@ -246,7 +314,7 @@ async function validateConnectorCredentials(connector, values) {
           Authorization: `Bearer ${values.api_key}`,
         },
       });
-      return response.status === 200;
+      return { valid: response.status === 200, message: errorMessage };
     }
 
     if (provider === 'resend') {
@@ -255,7 +323,7 @@ async function validateConnectorCredentials(connector, values) {
           Authorization: `Bearer ${values.api_key}`,
         },
       });
-      return response.status === 200;
+      return { valid: response.status === 200, message: errorMessage };
     }
 
     if (provider === 'twilio') {
@@ -268,11 +336,11 @@ async function validateConnectorCredentials(connector, values) {
           },
         }
       );
-      return response.status === 200;
+      return { valid: response.status === 200, message: errorMessage };
     }
 
     if (provider === 'google_maps') {
-      return await validateGoogleMapsCredentials(values);
+      return { valid: await validateGoogleMapsCredentials(values), message: errorMessage };
     }
 
     if (provider === 'shopify') {
@@ -282,13 +350,21 @@ async function validateConnectorCredentials(connector, values) {
           'X-Shopify-Access-Token': values.access_token,
         },
       });
-      return response.status === 200;
+      return { valid: response.status === 200, message: errorMessage };
+    }
+
+    if (provider === 'supabase') {
+      return { valid: await validateSupabaseCredentials(values), message: errorMessage };
+    }
+
+    if (provider === 'cloudinary') {
+      return { valid: await validateCloudinaryCredentials(values), message: errorMessage };
     }
   } catch (error) {
-    return false;
+    return { valid: false, message: errorMessage };
   }
 
-  return false;
+  return { valid: false, message: errorMessage };
 }
 
 function encryptConnectorValues(connector, values, key) {
@@ -352,26 +428,48 @@ function connectorSecretToConfiguredFields(secret) {
 
 function buildSafeConnectorPayload(projectConnector, connector, secret) {
   const updatedAt = projectConnector?.updatedAt || secret?.lastUpdatedAt || secret?.updatedAt || null;
-  const status = secret ? 'connected' : projectConnector?.status || 'pending';
+  const projectStatus = CONNECTOR_STATUSES.includes(projectConnector?.status)
+    ? projectConnector.status
+    : '';
+  const status = projectStatus === 'error'
+    ? 'error'
+    : secret
+      ? 'connected'
+      : projectStatus || 'pending';
 
   return {
     provider: connector?.provider || projectConnector?.provider || secret?.provider || '',
     label: connector?.label || projectConnector?.label || projectConnector?.provider || secret?.provider || '',
     status,
-    statusLabel: status === 'connected'
-      ? 'Conectado'
-      : status === 'pending'
-        ? 'Pendente'
-        : 'Ignorado',
-    statusTone: status === 'connected'
-      ? 'green'
-      : status === 'pending'
-        ? 'yellow'
-        : 'gray',
+    statusLabel: CONNECTOR_STATUS_LABELS[status] || CONNECTOR_STATUS_LABELS.pending,
+    statusTone: CONNECTOR_STATUS_TONES[status] || CONNECTOR_STATUS_TONES.pending,
     connectedAt: secret?.createdAt || (status === 'connected' ? updatedAt : null),
     updatedAt,
     fieldsConfigured: connectorSecretToConfiguredFields(secret),
   };
+}
+
+function markRequiredConnectorError(project, connector, now) {
+  const provider = connector.provider;
+  const existingConnector = project.requiredConnectors.find(
+    (item) => normalizeConnectorProvider(item.provider) === provider
+  );
+
+  if (existingConnector) {
+    existingConnector.label = existingConnector.label || connector.label || provider;
+    existingConnector.status = 'error';
+    existingConnector.updatedAt = now;
+    return;
+  }
+
+  project.requiredConnectors.push({
+    provider,
+    label: connector.label || provider,
+    reason: connector.description || '',
+    status: 'error',
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 function markRequiredConnectorConnected(project, connector, now) {
@@ -412,7 +510,7 @@ function sanitizeRequiredConnector(connector) {
     provider,
     label: String(connector.label || provider).replace(/\s+/g, ' ').trim(),
     reason: String(connector.reason || '').replace(/\s+/g, ' ').trim(),
-    status: ['pending', 'connected', 'skipped'].includes(connector.status)
+    status: CONNECTOR_STATUSES.includes(connector.status)
       ? connector.status
       : 'pending',
   };
@@ -720,15 +818,6 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
       });
     }
 
-    const values = req.body?.values;
-    const validationError = validateConnectorValues(connector, values);
-
-    if (validationError) {
-      return res.status(400).json({ message: validationError });
-    }
-
-    const normalizedValues = normalizeConnectorValues(connector, values);
-
     const project = await Project.findOne({
       _id: req.params.projectId,
       userId: req.userId,
@@ -738,10 +827,41 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    const credentialsValidated = await validateConnectorCredentials(connector, normalizedValues);
+    const values = req.body?.values;
+    const validationError = validateConnectorValues(connector, values);
 
-    if (!credentialsValidated) {
-      return res.status(400).json({ message: CONNECTOR_VALIDATION_FAILURE_MESSAGE });
+    if (validationError) {
+      const now = new Date();
+      markRequiredConnectorError(project, connector, now);
+      await project.save();
+
+      return res.status(400).json({
+        message: CONNECTOR_ERROR_MESSAGES[provider] || validationError,
+        connector: buildSafeConnectorPayload(
+          project.requiredConnectors.find((item) => normalizeConnectorProvider(item.provider) === provider),
+          connector,
+          null
+        ),
+      });
+    }
+
+    const normalizedValues = normalizeConnectorValues(connector, values);
+
+    const credentialsValidation = await validateConnectorCredentials(connector, normalizedValues);
+
+    if (!credentialsValidation.valid) {
+      const now = new Date();
+      markRequiredConnectorError(project, connector, now);
+      await project.save();
+
+      return res.status(400).json({
+        message: credentialsValidation.message,
+        connector: buildSafeConnectorPayload(
+          project.requiredConnectors.find((item) => normalizeConnectorProvider(item.provider) === provider),
+          connector,
+          null
+        ),
+      });
     }
 
     const now = new Date();
