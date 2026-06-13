@@ -128,6 +128,37 @@ function validateConnectorValues(connector, values) {
     return `Campos obrigatórios ausentes: ${missingFields.join(', ')}.`;
   }
 
+  const provider = normalizeConnectorProvider(connector.provider);
+  const trimmedValue = (fieldName) => String(values[fieldName] || '').trim();
+
+  if (provider === 'stripe' && !/^sk_(test|live)_/.test(trimmedValue('secret_key'))) {
+    return 'Stripe secret_key inválida. A chave precisa começar com sk_test_ ou sk_live_.';
+  }
+
+  if (provider === 'google_maps' && !trimmedValue('api_key').startsWith('AIza')) {
+    return 'Google Maps api_key inválida. A chave precisa começar com AIza.';
+  }
+
+  if (provider === 'resend' && !trimmedValue('api_key').startsWith('re_')) {
+    return 'Resend api_key inválida. A chave precisa começar com re_.';
+  }
+
+  if (provider === 'openai' && !trimmedValue('api_key').startsWith('sk-')) {
+    return 'OpenAI api_key inválida. A chave precisa começar com sk-.';
+  }
+
+  if (provider === 'twilio' && !trimmedValue('account_sid').startsWith('AC')) {
+    return 'Twilio account_sid inválido. O valor precisa começar com AC.';
+  }
+
+  if (provider === 'shopify') {
+    const storeUrl = trimmedValue('store_url');
+
+    if (!storeUrl.includes('.myshopify.com') && !storeUrl.startsWith('https://')) {
+      return 'Shopify store_url inválida. O valor precisa conter .myshopify.com ou começar com https://.';
+    }
+  }
+
   return '';
 }
 
@@ -153,15 +184,41 @@ function encryptConnectorValues(connector, values, key) {
 }
 
 function connectorSecretToConfiguredFields(secret) {
-  if (!secret || !secret.encryptedValues) {
+  if (!secret) {
+    return [];
+  }
+
+  if (Array.isArray(secret.fieldsMeta) && secret.fieldsMeta.length > 0) {
+    return secret.fieldsMeta.map((field) => ({
+      name: field.name,
+      label: field.label || field.name,
+      type: field.type || '',
+      required: field.required === true,
+      configured: field.configured !== false,
+    }));
+  }
+
+  if (!secret.encryptedValues) {
     return [];
   }
 
   if (typeof secret.encryptedValues.keys === 'function') {
-    return Array.from(secret.encryptedValues.keys());
+    return Array.from(secret.encryptedValues.keys()).map((name) => ({
+      name,
+      label: name,
+      type: '',
+      required: false,
+      configured: true,
+    }));
   }
 
-  return Object.keys(secret.encryptedValues);
+  return Object.keys(secret.encryptedValues).map((name) => ({
+    name,
+    label: name,
+    type: '',
+    required: false,
+    configured: true,
+  }));
 }
 
 function buildSafeConnectorPayload(projectConnector, connector, secret) {
@@ -172,6 +229,16 @@ function buildSafeConnectorPayload(projectConnector, connector, secret) {
     provider: connector?.provider || projectConnector?.provider || secret?.provider || '',
     label: connector?.label || projectConnector?.label || projectConnector?.provider || secret?.provider || '',
     status,
+    statusLabel: status === 'connected'
+      ? 'Conectado'
+      : status === 'pending'
+        ? 'Pendente'
+        : 'Ignorado',
+    statusTone: status === 'connected'
+      ? 'green'
+      : status === 'pending'
+        ? 'yellow'
+        : 'gray',
     connectedAt: secret?.createdAt || (status === 'connected' ? updatedAt : null),
     updatedAt,
     fieldsConfigured: connectorSecretToConfiguredFields(secret),

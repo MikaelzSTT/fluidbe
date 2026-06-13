@@ -11,6 +11,8 @@ const ProjectBuild = require('../models/ProjectBuild');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
+const ConnectorSecret = require('../models/ConnectorSecret');
+const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -202,6 +204,75 @@ function requireAdmin(req, res, next) {
   }
 
   return next();
+}
+
+function normalizeConnectorProvider(provider) {
+  return String(provider || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+}
+
+function connectorSecretToConfiguredFields(secret) {
+  if (!secret) {
+    return [];
+  }
+
+  if (Array.isArray(secret.fieldsMeta) && secret.fieldsMeta.length > 0) {
+    return secret.fieldsMeta.map((field) => ({
+      name: field.name,
+      label: field.label || field.name,
+      type: field.type || '',
+      required: field.required === true,
+      configured: field.configured !== false,
+    }));
+  }
+
+  if (!secret.encryptedValues) {
+    return [];
+  }
+
+  if (typeof secret.encryptedValues.keys === 'function') {
+    return Array.from(secret.encryptedValues.keys()).map((name) => ({
+      name,
+      label: name,
+      type: '',
+      required: false,
+      configured: true,
+    }));
+  }
+
+  return Object.keys(secret.encryptedValues).map((name) => ({
+    name,
+    label: name,
+    type: '',
+    required: false,
+    configured: true,
+  }));
+}
+
+function buildSafeConnectorPayload(projectConnector, connector, secret) {
+  const updatedAt = projectConnector?.updatedAt || secret?.lastUpdatedAt || secret?.updatedAt || null;
+  const status = secret ? 'connected' : projectConnector?.status || 'pending';
+
+  return {
+    provider: connector?.provider || projectConnector?.provider || secret?.provider || '',
+    label: connector?.label || projectConnector?.label || projectConnector?.provider || secret?.provider || '',
+    status,
+    statusLabel: status === 'connected'
+      ? 'Conectado'
+      : status === 'pending'
+        ? 'Pendente'
+        : 'Ignorado',
+    statusTone: status === 'connected'
+      ? 'green'
+      : status === 'pending'
+        ? 'yellow'
+        : 'gray',
+    connectedAt: secret?.createdAt || (status === 'connected' ? updatedAt : null),
+    updatedAt,
+    fieldsConfigured: connectorSecretToConfiguredFields(secret),
+  };
 }
 
 function validateProjectId(req, res, next) {
@@ -1017,6 +1088,67 @@ router.get('/projects/:id/change-requests', requireAdmin, validateProjectId, asy
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar change requests do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/connectors', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id)
+      .select('name prompt status requiredConnectors userId')
+      .lean();
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const secrets = await ConnectorSecret.find({
+      projectId: project._id,
+      userId: project.userId,
+    }).lean();
+    const secretByProvider = new Map(
+      secrets.map((secret) => [normalizeConnectorProvider(secret.provider), secret])
+    );
+    const connectorByProvider = new Map();
+
+    (Array.isArray(project.requiredConnectors) ? project.requiredConnectors : []).forEach((projectConnector) => {
+      const provider = normalizeConnectorProvider(projectConnector.provider);
+      const registryConnector = getConnectorByProvider(provider);
+
+      connectorByProvider.set(
+        provider,
+        buildSafeConnectorPayload(projectConnector, registryConnector, secretByProvider.get(provider))
+      );
+    });
+
+    secrets.forEach((secret) => {
+      const provider = normalizeConnectorProvider(secret.provider);
+
+      if (connectorByProvider.has(provider)) {
+        return;
+      }
+
+      const registryConnector = getConnectorByProvider(provider);
+      connectorByProvider.set(
+        provider,
+        buildSafeConnectorPayload(null, registryConnector, secret)
+      );
+    });
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      connectors: Array.from(connectorByProvider.values()),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar conectores do projeto.',
       error: error.message,
     });
   }
