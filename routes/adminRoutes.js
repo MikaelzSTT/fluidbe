@@ -13,6 +13,10 @@ const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
+const {
+  collectConnectorInjectionBuildFiles,
+  resolveProjectConnectorInjection,
+} = require('../utils/connectorInjection');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -706,6 +710,27 @@ function looksLikeTypecheckFailure(logs) {
   ].some((pattern) => pattern.test(logs || ''));
 }
 
+function formatConnectorInjectionLog(resolution) {
+  if (!resolution || !Array.isArray(resolution.requiredEnvVars)) {
+    return '';
+  }
+
+  const resolvedProviders = (resolution.resolvedConnectors || [])
+    .map((connector) => connector.provider)
+    .join(', ');
+  const unresolvedProviders = (resolution.unresolvedConnectors || [])
+    .map((connector) => connector.provider)
+    .join(', ');
+
+  return [
+    'Connector injection plan:',
+    `- requiredEnvVars: ${resolution.requiredEnvVars.length ? resolution.requiredEnvVars.join(', ') : 'none'}`,
+    `- resolvedConnectors: ${resolvedProviders || 'none'}`,
+    `- unresolvedConnectors: ${unresolvedProviders || 'none'}`,
+    '- secretsInjected: false',
+  ].join('\n');
+}
+
 async function runViteBuildWithoutTypecheck(appRoot) {
   return runNpxCommand(['vite', 'build'], appRoot);
 }
@@ -1291,12 +1316,28 @@ router.post(
     const sourceZipPath = req.file.path;
     const extractDir = path.join(buildDir, 'source');
     let logs = '';
+    let connectorInjection = {
+      requiredEnvVars: [],
+      resolvedConnectors: [],
+      unresolvedConnectors: [],
+      injectionPlan: [],
+    };
 
     try {
       await extractZipSafely(sourceZipPath, extractDir);
 
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
+      try {
+        const connectorInjectionBuildFiles = await collectConnectorInjectionBuildFiles(appRoot);
+        connectorInjection = await resolveProjectConnectorInjection(
+          project._id,
+          connectorInjectionBuildFiles
+        );
+        logs += `${formatConnectorInjectionLog(connectorInjection)}\n`;
+      } catch (connectorInjectionError) {
+        logs += `Connector injection plan unavailable: ${connectorInjectionError.message}\n`;
+      }
 
       const developmentInstallEnv = {
         NODE_ENV: 'development',
@@ -1389,6 +1430,7 @@ router.post(
         success: true,
         build: withAbsoluteBuildUrls(req, build),
         previewUrl: toAbsoluteBackendUrl(req, previewUrl),
+        connectorInjection,
       });
     } catch (error) {
       const errorLogs = [logs, error.message].filter(Boolean).join('\n');
@@ -1403,6 +1445,7 @@ router.post(
         success: false,
         message: 'Erro ao gerar build React/Vite.',
         build,
+        connectorInjection,
         error: error.message,
       });
     }
