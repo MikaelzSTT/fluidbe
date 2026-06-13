@@ -9,6 +9,8 @@ const authMiddleware = require('../middleware/authMiddleware');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 
 const router = express.Router();
+const CONNECTOR_VALIDATION_FAILURE_MESSAGE = 'Não foi possível validar este conector. Confira a credencial.';
+const CONNECTOR_VALIDATION_TIMEOUT_MS = 5000;
 const CONNECTOR_RULES = [
   {
     provider: 'stripe',
@@ -97,6 +99,40 @@ function encryptConnectorValue(value, key) {
   };
 }
 
+function normalizeShopifyStoreUrl(value) {
+  const storeUrl = String(value || '').trim();
+
+  if (!storeUrl) {
+    return '';
+  }
+
+  try {
+    const parsedUrl = new URL(storeUrl.includes('://') ? storeUrl : `https://${storeUrl}`);
+    return parsedUrl.hostname.toLowerCase();
+  } catch (error) {
+    return storeUrl
+      .replace(/^https?:\/\//i, '')
+      .split('/')[0]
+      .trim()
+      .toLowerCase();
+  }
+}
+
+function normalizeConnectorValues(connector, values) {
+  const normalizedValues = {};
+  const provider = normalizeConnectorProvider(connector.provider);
+
+  Object.entries(values || {}).forEach(([key, value]) => {
+    normalizedValues[key] = typeof value === 'string' ? value.trim() : value;
+  });
+
+  if (provider === 'shopify' && Object.prototype.hasOwnProperty.call(normalizedValues, 'store_url')) {
+    normalizedValues.store_url = normalizeShopifyStoreUrl(normalizedValues.store_url);
+  }
+
+  return normalizedValues;
+}
+
 function buildConfiguredFields(connector, values) {
   return (Array.isArray(connector.fields) ? connector.fields : [])
     .filter((field) => Object.prototype.hasOwnProperty.call(values, field.name))
@@ -160,6 +196,99 @@ function validateConnectorValues(connector, values) {
   }
 
   return '';
+}
+
+async function fetchWithConnectorTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONNECTOR_VALIDATION_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function validateGoogleMapsCredentials(values) {
+  const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+  url.searchParams.set('address', 'New York');
+  url.searchParams.set('key', values.api_key);
+
+  const response = await fetchWithConnectorTimeout(url);
+
+  if (!response.ok) {
+    return false;
+  }
+
+  const body = await response.json().catch(() => null);
+  return body?.status === 'OK' || body?.status === 'ZERO_RESULTS';
+}
+
+async function validateConnectorCredentials(connector, values) {
+  const provider = normalizeConnectorProvider(connector.provider);
+
+  try {
+    if (provider === 'stripe') {
+      const response = await fetchWithConnectorTimeout('https://api.stripe.com/v1/account', {
+        headers: {
+          Authorization: `Bearer ${values.secret_key}`,
+        },
+      });
+      return response.status === 200;
+    }
+
+    if (provider === 'openai') {
+      const response = await fetchWithConnectorTimeout('https://api.openai.com/v1/models', {
+        headers: {
+          Authorization: `Bearer ${values.api_key}`,
+        },
+      });
+      return response.status === 200;
+    }
+
+    if (provider === 'resend') {
+      const response = await fetchWithConnectorTimeout('https://api.resend.com/domains', {
+        headers: {
+          Authorization: `Bearer ${values.api_key}`,
+        },
+      });
+      return response.status === 200;
+    }
+
+    if (provider === 'twilio') {
+      const credentials = Buffer.from(`${values.account_sid}:${values.auth_token}`).toString('base64');
+      const response = await fetchWithConnectorTimeout(
+        `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(values.account_sid)}.json`,
+        {
+          headers: {
+            Authorization: `Basic ${credentials}`,
+          },
+        }
+      );
+      return response.status === 200;
+    }
+
+    if (provider === 'google_maps') {
+      return await validateGoogleMapsCredentials(values);
+    }
+
+    if (provider === 'shopify') {
+      const storeUrl = normalizeShopifyStoreUrl(values.store_url);
+      const response = await fetchWithConnectorTimeout(`https://${storeUrl}/admin/api/2024-10/shop.json`, {
+        headers: {
+          'X-Shopify-Access-Token': values.access_token,
+        },
+      });
+      return response.status === 200;
+    }
+  } catch (error) {
+    return false;
+  }
+
+  return false;
 }
 
 function encryptConnectorValues(connector, values, key) {
@@ -579,6 +708,10 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
       return res.status(404).json({ message: 'Conector não encontrado no registry.' });
     }
 
+    if (connector.authType === 'manual') {
+      return res.status(400).json({ message: CONNECTOR_VALIDATION_FAILURE_MESSAGE });
+    }
+
     const encryptionKey = getConnectorEncryptionKey();
 
     if (!encryptionKey) {
@@ -594,6 +727,8 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
       return res.status(400).json({ message: validationError });
     }
 
+    const normalizedValues = normalizeConnectorValues(connector, values);
+
     const project = await Project.findOne({
       _id: req.params.projectId,
       userId: req.userId,
@@ -603,9 +738,15 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
+    const credentialsValidated = await validateConnectorCredentials(connector, normalizedValues);
+
+    if (!credentialsValidated) {
+      return res.status(400).json({ message: CONNECTOR_VALIDATION_FAILURE_MESSAGE });
+    }
+
     const now = new Date();
-    const encryptedValues = encryptConnectorValues(connector, values, encryptionKey);
-    const fieldsMeta = buildConfiguredFields(connector, values);
+    const encryptedValues = encryptConnectorValues(connector, normalizedValues, encryptionKey);
+    const fieldsMeta = buildConfiguredFields(connector, normalizedValues);
 
     const secret = await ConnectorSecret.findOneAndUpdate(
       {
