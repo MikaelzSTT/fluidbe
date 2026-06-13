@@ -725,8 +725,14 @@ function formatConnectorInjectionLog(resolution) {
   return [
     'Connector injection plan:',
     `- requiredEnvVars: ${resolution.requiredEnvVars.length ? resolution.requiredEnvVars.join(', ') : 'none'}`,
+    `- frontendEnvVars: ${resolution.frontendEnvVars?.length ? resolution.frontendEnvVars.join(', ') : 'none'}`,
+    `- backendEnvVars: ${resolution.backendEnvVars?.length ? resolution.backendEnvVars.join(', ') : 'none'}`,
     `- resolvedConnectors: ${resolvedProviders || 'none'}`,
     `- unresolvedConnectors: ${unresolvedProviders || 'none'}`,
+    `- blockedEnvVars: ${resolution.blockedEnvVars?.length ? resolution.blockedEnvVars.join(', ') : 'none'}`,
+    resolution.blockedEnvVars?.length
+      ? '- backendSecrets: blocked; backend connector secrets will not be injected into frontend builds.'
+      : '- backendSecrets: none blocked',
     '- secretsInjected: false',
   ].join('\n');
 }
@@ -1318,9 +1324,13 @@ router.post(
     let logs = '';
     let connectorInjection = {
       requiredEnvVars: [],
+      frontendEnvVars: [],
+      backendEnvVars: [],
       resolvedConnectors: [],
       unresolvedConnectors: [],
       injectionPlan: [],
+      blockedEnvVars: [],
+      unresolvedBackendEnvVars: [],
     };
 
     try {

@@ -116,6 +116,28 @@ function detectRequiredEnvVars(buildFiles) {
   return KNOWN_ENV_VARS.filter((envVar) => detected.has(envVar));
 }
 
+function isFrontendEnvVar(envVar) {
+  return String(envVar || '').startsWith('VITE_');
+}
+
+function classifyEnvVars(envVars) {
+  return (Array.isArray(envVars) ? envVars : []).reduce(
+    (classified, envVar) => {
+      if (isFrontendEnvVar(envVar)) {
+        classified.frontendEnvVars.push(envVar);
+      } else {
+        classified.backendEnvVars.push(envVar);
+      }
+
+      return classified;
+    },
+    {
+      frontendEnvVars: [],
+      backendEnvVars: [],
+    }
+  );
+}
+
 function groupEnvVarsByProvider(envVars) {
   return envVars.reduce((grouped, envVar) => {
     const provider = ENV_VAR_TO_PROVIDER[envVar];
@@ -133,37 +155,95 @@ function groupEnvVarsByProvider(envVars) {
   }, new Map());
 }
 
+function getEncryptedFieldNames(encryptedValues) {
+  if (!encryptedValues) {
+    return [];
+  }
+
+  if (typeof encryptedValues.keys === 'function') {
+    return Array.from(encryptedValues.keys());
+  }
+
+  return Object.keys(encryptedValues);
+}
+
+function getConfiguredFieldNames(secret) {
+  const fieldNames = new Set();
+
+  (Array.isArray(secret.fieldsMeta) ? secret.fieldsMeta : []).forEach((field) => {
+    if (field && field.configured !== false && field.name) {
+      fieldNames.add(field.name);
+    }
+  });
+
+  getEncryptedFieldNames(secret.encryptedValues).forEach((fieldName) => {
+    if (fieldName) {
+      fieldNames.add(fieldName);
+    }
+  });
+
+  return fieldNames;
+}
+
+function buildAvailableEnvVarSet(secrets) {
+  const availableEnvVars = new Set();
+
+  (Array.isArray(secrets) ? secrets : []).forEach((secret) => {
+    const provider = normalizeProvider(secret.provider);
+    const fieldEnvMap = CONNECTOR_FIELD_ENV_MAP[provider];
+
+    if (!fieldEnvMap) {
+      return;
+    }
+
+    const configuredFieldNames = getConfiguredFieldNames(secret);
+
+    Object.entries(fieldEnvMap).forEach(([fieldName, envVar]) => {
+      if (configuredFieldNames.has(fieldName)) {
+        availableEnvVars.add(envVar);
+      }
+    });
+  });
+
+  return availableEnvVars;
+}
+
 async function resolveProjectConnectorInjection(projectId, buildFiles) {
   const requiredEnvVars = detectRequiredEnvVars(buildFiles);
+  const { frontendEnvVars, backendEnvVars } = classifyEnvVars(requiredEnvVars);
   const envVarsByProvider = groupEnvVarsByProvider(requiredEnvVars);
   const providerList = Array.from(envVarsByProvider.keys());
 
   if (providerList.length === 0) {
     return {
       requiredEnvVars: [],
+      frontendEnvVars: [],
+      backendEnvVars: [],
       resolvedConnectors: [],
       unresolvedConnectors: [],
       injectionPlan: [],
+      blockedEnvVars: [],
+      unresolvedBackendEnvVars: [],
       availableEnvVars: [],
     };
   }
-
-  const connectorEnvValues = await resolveConnectorEnvValues(projectId);
-  const availableEnvVarSet = new Set(connectorEnvValues.availableEnvVars);
 
   const secrets = await ConnectorSecret.find({
     projectId,
     provider: { $in: providerList },
   })
-    .select('provider fieldsMeta lastUpdatedAt createdAt updatedAt')
+    .select('provider fieldsMeta encryptedValues lastUpdatedAt createdAt updatedAt')
     .lean();
   const connectedProviders = new Set(
     secrets.map((secret) => normalizeProvider(secret.provider)).filter(Boolean)
   );
+  const availableEnvVarSet = buildAvailableEnvVarSet(secrets);
 
   const resolvedConnectors = [];
   const unresolvedConnectors = [];
   const injectionPlan = [];
+  const blockedEnvVars = [];
+  const unresolvedBackendEnvVars = [];
 
   providerList.forEach((provider) => {
     const envVars = envVarsByProvider.get(provider);
@@ -182,13 +262,29 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
 
     envVars.forEach((envVar) => {
       const valueAvailable = availableEnvVarSet.has(envVar);
+      const safeToInjectInFrontend = isFrontendEnvVar(envVar);
+      const target = safeToInjectInFrontend ? 'frontend' : 'backend';
+      const resolved = connected && valueAvailable;
+      const status = connected
+        ? (valueAvailable ? 'ready' : 'missing_value')
+        : 'missing_connector';
+
+      if (!safeToInjectInFrontend) {
+        blockedEnvVars.push(envVar);
+
+        if (!resolved) {
+          unresolvedBackendEnvVars.push(envVar);
+        }
+      }
 
       injectionPlan.push({
         envVar,
         provider,
-        resolved: connected && valueAvailable,
+        target,
+        resolved,
         valueAvailable,
-        status: connected ? (valueAvailable ? 'ready' : 'missing_value') : 'missing_connector',
+        safeToInjectInFrontend,
+        status: safeToInjectInFrontend ? status : 'blocked_backend_secret',
         inject: false,
       });
     });
@@ -196,10 +292,14 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
 
   return {
     requiredEnvVars,
+    frontendEnvVars,
+    backendEnvVars,
     resolvedConnectors,
     unresolvedConnectors,
     injectionPlan,
-    availableEnvVars: connectorEnvValues.availableEnvVars,
+    blockedEnvVars,
+    unresolvedBackendEnvVars: Array.from(new Set(unresolvedBackendEnvVars)),
+    availableEnvVars: Array.from(availableEnvVarSet),
   };
 }
 
@@ -260,4 +360,5 @@ module.exports = {
   resolveProjectConnectorInjection,
   collectConnectorInjectionBuildFiles,
   detectRequiredEnvVars,
+  classifyEnvVars,
 };
