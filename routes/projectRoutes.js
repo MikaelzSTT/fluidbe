@@ -1,12 +1,15 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const crypto = require('crypto');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const authMiddleware = require('../middleware/authMiddleware');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
+const {
+  encryptConnectorValue,
+  getConnectorEncryptionKey,
+} = require('../utils/connectorSecrets');
 
 const router = express.Router();
 const CONNECTOR_VALIDATION_FAILURE_MESSAGE = 'Não foi possível validar este conector. Confira a credencial.';
@@ -94,32 +97,6 @@ function normalizeConnectorProvider(provider) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
-}
-
-function getConnectorEncryptionKey() {
-  const rawKey = process.env.CONNECTOR_SECRET_KEY;
-
-  if (!rawKey) {
-    return null;
-  }
-
-  return crypto.createHash('sha256').update(rawKey).digest();
-}
-
-function encryptConnectorValue(value, key) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(String(value), 'utf8'),
-    cipher.final(),
-  ]);
-
-  return {
-    iv: iv.toString('base64'),
-    tag: cipher.getAuthTag().toString('base64'),
-    value: encrypted.toString('base64'),
-    algorithm: 'aes-256-gcm',
-  };
 }
 
 function normalizeShopifyStoreUrl(value) {

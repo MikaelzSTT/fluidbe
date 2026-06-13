@@ -1,16 +1,17 @@
 const fs = require('fs/promises');
 const path = require('path');
 const ConnectorSecret = require('../models/ConnectorSecret');
+const {
+  CONNECTOR_FIELD_ENV_MAP,
+  resolveConnectorEnvValues,
+} = require('./connectorSecrets');
 
-const PROVIDER_ENV_VARS = Object.freeze({
-  stripe: ['STRIPE_SECRET_KEY', 'VITE_STRIPE_PUBLIC_KEY'],
-  supabase: ['VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY'],
-  google_maps: ['VITE_GOOGLE_MAPS_API_KEY'],
-  openai: ['OPENAI_API_KEY'],
-  resend: ['RESEND_API_KEY'],
-  twilio: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'],
-  cloudinary: ['CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'],
-});
+const PROVIDER_ENV_VARS = Object.freeze(
+  Object.entries(CONNECTOR_FIELD_ENV_MAP).reduce((providers, [provider, fieldEnvMap]) => {
+    providers[provider] = Object.freeze(Object.values(fieldEnvMap));
+    return providers;
+  }, {})
+);
 
 const ENV_VAR_TO_PROVIDER = Object.freeze(
   Object.entries(PROVIDER_ENV_VARS).reduce((index, [provider, envVars]) => {
@@ -143,8 +144,12 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
       resolvedConnectors: [],
       unresolvedConnectors: [],
       injectionPlan: [],
+      availableEnvVars: [],
     };
   }
+
+  const connectorEnvValues = await resolveConnectorEnvValues(projectId);
+  const availableEnvVarSet = new Set(connectorEnvValues.availableEnvVars);
 
   const secrets = await ConnectorSecret.find({
     projectId,
@@ -176,10 +181,14 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
     }
 
     envVars.forEach((envVar) => {
+      const valueAvailable = availableEnvVarSet.has(envVar);
+
       injectionPlan.push({
         envVar,
         provider,
-        status: connected ? 'ready' : 'missing_connector',
+        resolved: connected && valueAvailable,
+        valueAvailable,
+        status: connected ? (valueAvailable ? 'ready' : 'missing_value') : 'missing_connector',
         inject: false,
       });
     });
@@ -190,6 +199,7 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
     resolvedConnectors,
     unresolvedConnectors,
     injectionPlan,
+    availableEnvVars: connectorEnvValues.availableEnvVars,
   };
 }
 
@@ -244,7 +254,9 @@ async function collectConnectorInjectionBuildFiles(rootDir) {
 }
 
 module.exports = {
+  CONNECTOR_FIELD_ENV_MAP,
   PROVIDER_ENV_VARS,
+  resolveConnectorEnvValues,
   resolveProjectConnectorInjection,
   collectConnectorInjectionBuildFiles,
   detectRequiredEnvVars,
