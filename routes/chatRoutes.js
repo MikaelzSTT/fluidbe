@@ -2,6 +2,7 @@ const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
+const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 
@@ -149,8 +150,12 @@ function normalizeConnectorText(value) {
     .trim();
 }
 
-function buildConnectorDetectionText({ message, history, project }) {
+function buildConnectorDetectionText({ message, history, project, scope = 'initial' }) {
   const parts = [message];
+
+  if (scope === 'edit') {
+    return normalizeConnectorText(parts.filter(Boolean).join('\n'));
+  }
 
   if (Array.isArray(history)) {
     history.forEach((item) => {
@@ -171,10 +176,25 @@ function buildConnectorDetectionText({ message, history, project }) {
   return normalizeConnectorText(parts.filter(Boolean).join('\n'));
 }
 
-function detectRequiredConnectors({ message, history, project }) {
-  const detectionText = buildConnectorDetectionText({ message, history, project });
+function hasNewIntegrationIntent(detectionText) {
+  return /\b(adicion\w*|inclu\w*|integr\w*|conect\w*|configur\w*|implement\w*|habilit\w*|ativ\w*|precis\w*|necessit\w*)\b/.test(
+    detectionText
+  );
+}
+
+function detectRequiredConnectors({ message, history, project, scope }) {
+  const detectionText = buildConnectorDetectionText({
+    message,
+    history,
+    project,
+    scope,
+  });
 
   if (!detectionText) {
+    return [];
+  }
+
+  if (scope === 'edit' && !hasNewIntegrationIntent(detectionText)) {
     return [];
   }
 
@@ -299,13 +319,41 @@ async function persistRequiredConnectors(project, detectedConnectors) {
   return requiredConnectors;
 }
 
-function buildDecisionSystemPrompt(projectContext) {
+function filterNewRequiredConnectors(project, detectedConnectors) {
+  const existingProviders = new Set(
+    (Array.isArray(project?.requiredConnectors) ? project.requiredConnectors : [])
+      .map((connector) => normalizeConnectorProvider(connector?.provider))
+      .filter(Boolean)
+  );
+  const newConnectors = [];
+  const seenProviders = new Set();
+
+  (Array.isArray(detectedConnectors) ? detectedConnectors : []).forEach((connector) => {
+    const sanitized = sanitizeRequiredConnector(connector);
+
+    if (!sanitized) {
+      return;
+    }
+
+    if (existingProviders.has(sanitized.provider) || seenProviders.has(sanitized.provider)) {
+      return;
+    }
+
+    seenProviders.add(sanitized.provider);
+    newConnectors.push(sanitized);
+  });
+
+  return newConnectors;
+}
+
+function buildDecisionSystemPrompt(projectContext, hasProjectContext = false) {
   return `
 Voce e a IA de chat da Fluid, em portugues do Brasil.
 
 Sua tarefa e orquestrar uma conversa e decidir se o sistema deve iniciar o wizard de criacao ou pedir clarificacao.
 
 Use action "wizard" somente quando houver intencao clara de criar, gerar, montar, construir ou iniciar um site, app, landing page, SaaS, dashboard, ecommerce, interface ou projeto.
+${hasProjectContext ? 'Como ha um projeto atual, tambem use action "wizard" quando o usuario pedir para editar, alterar, adicionar, remover, ajustar, trocar, melhorar ou modificar qualquer parte do projeto existente.' : ''}
 
 Use action "chat" para conversa normal, duvidas, mensagens aleatorias, testes, cumprimentos, risadas, reacoes curtas ou texto sem intencao clara de criacao.
 
@@ -688,7 +736,7 @@ async function getAiReply({ message, history, project }) {
   const projectContext = buildProjectContext(project);
 
   const decisionMessages = [
-    { role: 'system', content: buildDecisionSystemPrompt(projectContext) },
+    { role: 'system', content: buildDecisionSystemPrompt(projectContext, Boolean(project)) },
     ...previousMessages,
     { role: 'user', content: message },
   ];
@@ -706,9 +754,18 @@ async function getAiReply({ message, history, project }) {
     const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
     const options = normalizeOptions(parsed.options, shouldIncludeOptions);
     const readyForWizard = action === 'wizard';
-    const requiredConnectors = readyForWizard
-      ? detectRequiredConnectors({ message, history, project })
+    const connectorScope = project ? 'edit' : 'initial';
+    const detectedRequiredConnectors = readyForWizard
+      ? detectRequiredConnectors({
+          message,
+          history,
+          project,
+          scope: connectorScope,
+        })
       : [];
+    const requiredConnectors = project
+      ? filterNewRequiredConnectors(project, detectedRequiredConnectors)
+      : detectedRequiredConnectors;
 
     return {
       reply:
@@ -770,6 +827,8 @@ router.post('/', authMiddleware, async (req, res) => {
     }
 
     let project = null;
+    let userMessage = null;
+    let changeRequest = null;
     const trimmedMessage = message.trim();
 
     if (!trimmedMessage) {
@@ -790,13 +849,24 @@ router.post('/', authMiddleware, async (req, res) => {
         return res.status(404).json({ message: 'Projeto não encontrado.' });
       }
 
-      await ProjectMessage.create({
+      userMessage = await ProjectMessage.create({
         projectId: project._id,
         role: 'user',
         content: trimmedMessage,
         metadata: {
           source: 'api_chat',
           userId: req.userId,
+        },
+      });
+
+      changeRequest = await ProjectChangeRequest.create({
+        projectId: project._id,
+        userId: req.userId,
+        messageId: userMessage._id,
+        content: trimmedMessage,
+        metadata: {
+          source: 'api_chat',
+          classification: 'edit',
         },
       });
     }
@@ -810,13 +880,10 @@ router.post('/', authMiddleware, async (req, res) => {
 
     if (project) {
       if (requiredConnectors.length > 0) {
-        requiredConnectors = await persistRequiredConnectors(
-          project,
-          requiredConnectors
-        );
+        await persistRequiredConnectors(project, requiredConnectors);
       }
 
-      await ProjectMessage.create({
+      const assistantMessage = await ProjectMessage.create({
         projectId: project._id,
         role: 'assistant',
         content: aiReply.reply,
@@ -829,6 +896,17 @@ router.post('/', authMiddleware, async (req, res) => {
           requiredConnectors,
         },
       });
+
+      if (changeRequest) {
+        changeRequest.assistantMessageId = assistantMessage._id;
+        changeRequest.requiredConnectors = requiredConnectors;
+        changeRequest.metadata = {
+          ...(changeRequest.metadata || {}),
+          readyForWizard: Boolean(aiReply.readyForWizard),
+          needsClarification: Boolean(aiReply.needsClarification),
+        };
+        await changeRequest.save();
+      }
     }
 
     return res.json({
@@ -838,6 +916,7 @@ router.post('/', authMiddleware, async (req, res) => {
       needsClarification: Boolean(aiReply.needsClarification),
       options: aiReply.options || [],
       requiredConnectors,
+      changeRequest,
     });
   } catch (error) {
     return res.status(500).json({

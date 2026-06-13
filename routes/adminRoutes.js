@@ -8,6 +8,8 @@ const { promisify } = require('util');
 const AdmZip = require('adm-zip');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const ProjectChangeRequest = require('../models/ProjectChangeRequest');
+const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 
 const router = express.Router();
@@ -208,6 +210,16 @@ function validateProjectId(req, res, next) {
   }
 
   return next();
+}
+
+function validateObjectIdParam(paramName, message) {
+  return function validateObjectId(req, res, next) {
+    if (!mongoose.Types.ObjectId.isValid(req.params[paramName])) {
+      return res.status(400).json({ message });
+    }
+
+    return next();
+  };
 }
 
 function resolvePublicBuildIndexPath(buildUrl) {
@@ -868,16 +880,70 @@ async function applyLatestPendingBuild(projectId, update) {
   }
 }
 
+router.get('/change-requests', requireAdmin, async (req, res) => {
+  try {
+    const query = {};
+    const status = String(req.query.status || '').trim();
+
+    if (status) {
+      if (!CHANGE_REQUEST_STATUSES.includes(status)) {
+        return res.status(400).json({
+          message: 'Status de change request inválido.',
+          allowedStatuses: CHANGE_REQUEST_STATUSES,
+        });
+      }
+
+      query.status = status;
+    }
+
+    const changeRequests = await ProjectChangeRequest.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .populate('projectId', 'name title prompt status generationStatus generation_status')
+      .populate('userId', 'name email')
+      .lean();
+
+    return res.json({
+      success: true,
+      changeRequests,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar change requests.',
+      error: error.message,
+    });
+  }
+});
+
 router.get('/projects', requireAdmin, async (req, res) => {
   try {
     const projects = await Project.find().sort({
       updatedAt: -1,
       createdAt: -1,
     });
+    const pendingChangeRequestCounts = await ProjectChangeRequest.aggregate([
+      {
+        $match: {
+          status: 'pending',
+          projectId: { $in: projects.map((project) => project._id) },
+        },
+      },
+      {
+        $group: {
+          _id: '$projectId',
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+    const pendingCountByProjectId = new Map(
+      pendingChangeRequestCounts.map((item) => [String(item._id), item.count])
+    );
 
     return res.json({
       success: true,
-      projects: projects.map((project) => withAbsoluteProjectBuildUrls(req, project)),
+      projects: projects.map((project) => ({
+        ...withAbsoluteProjectBuildUrls(req, project),
+        pendingChangeRequestCount: pendingCountByProjectId.get(String(project._id)) || 0,
+      })),
     });
   } catch (error) {
     return res.status(500).json({
@@ -886,6 +952,77 @@ router.get('/projects', requireAdmin, async (req, res) => {
     });
   }
 });
+
+router.get('/projects/:id/change-requests', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id).select('name prompt status');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const changeRequests = await ProjectChangeRequest.find({ projectId: project._id })
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      changeRequests,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar change requests do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.patch(
+  '/change-requests/:requestId/status',
+  requireAdmin,
+  validateObjectIdParam('requestId', 'ID de change request inválido.'),
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+
+      if (!CHANGE_REQUEST_STATUSES.includes(status)) {
+        return res.status(400).json({
+          message: 'Status de change request inválido.',
+          allowedStatuses: CHANGE_REQUEST_STATUSES,
+        });
+      }
+
+      const changeRequest = await ProjectChangeRequest.findByIdAndUpdate(
+        req.params.requestId,
+        { status },
+        {
+          new: true,
+          runValidators: true,
+        }
+      );
+
+      if (!changeRequest) {
+        return res.status(404).json({ message: 'Change request não encontrado.' });
+      }
+
+      return res.json({
+        success: true,
+        changeRequest,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        message: 'Erro ao atualizar status do change request.',
+        error: error.message,
+      });
+    }
+  }
+);
 
 router.get('/projects/:id/versions', requireAdmin, validateProjectId, async (req, res) => {
   try {
@@ -931,6 +1068,9 @@ router.get('/projects/:id/messages', requireAdmin, validateProjectId, async (req
     const messages = await ProjectMessage.find({ projectId: req.params.id })
       .sort({ createdAt: 1, _id: 1 })
       .lean();
+    const changeRequests = await ProjectChangeRequest.find({ projectId: req.params.id })
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
 
     return res.json({
       success: true,
@@ -941,6 +1081,7 @@ router.get('/projects/:id/messages', requireAdmin, validateProjectId, async (req
         status: project.status,
       },
       messages,
+      changeRequests,
     });
   } catch (error) {
     return res.status(500).json({

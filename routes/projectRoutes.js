@@ -6,6 +6,121 @@ const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
+const CONNECTOR_RULES = [
+  {
+    provider: 'stripe',
+    label: 'Stripe',
+    reason: 'Necessário para pagamentos por cartão, checkout ou assinaturas.',
+    patterns: [/\bpagament\w*\b/, /\bcartao\b/, /\bcartoes\b/, /\bcheckout\b/, /\bassinat\w*\b/, /\bloja\b/, /\bmarketplace\b/, /\bcorrida paga\b/],
+  },
+  {
+    provider: 'google_maps',
+    label: 'Google Maps',
+    reason: 'Necessário para mapas, localização, rotas ou endereços.',
+    patterns: [/\bmapa\w*\b/, /\blocaliz\w*\b/, /\brota\w*\b/, /\bentrega\w*\b/, /\buber\b/, /\bdelivery\b/, /\bmotorista\w*\b/, /\bendereco\w*\b/],
+  },
+  {
+    provider: 'resend',
+    label: 'Resend',
+    reason: 'Necessário para envio de emails, recibos ou formulários de contato.',
+    patterns: [/\bemail\w*\b/, /\be-mail\w*\b/, /\bnotificacao por email\b/, /\bnotificacoes por email\b/, /\brecibo\w*\b/, /\bformulario de contato\b/, /\bformularios de contato\b/],
+  },
+  {
+    provider: 'supabase',
+    label: 'Supabase',
+    reason: 'Necessário para login, banco de dados, usuários, dados salvos ou storage.',
+    patterns: [/\blogin\b/, /\bbanco de dados\b/, /\bdashboard\b/, /\bcrm\b/, /\busuario\w*\b/, /\bdados salvos\b/, /\bstorage\b/],
+  },
+  {
+    provider: 'openai',
+    label: 'OpenAI',
+    reason: 'Necessário para recursos de IA, chatbot, assistente ou geração por IA.',
+    patterns: [/\bia\b/, /\bchatbot\w*\b/, /\bassistente\w*\b/, /\bgeracao por ia\b/, /\bgerar por ia\b/],
+  },
+  {
+    provider: 'cloudinary',
+    label: 'Cloudinary',
+    reason: 'Necessário para upload e gerenciamento de imagens.',
+    patterns: [/\bupload de imagen\w*\b/, /\bupload de foto\w*\b/, /\bfoto\w*\b/, /\bavatar\w*\b/, /\bproduto\w* com imagen\w*\b/],
+  },
+  {
+    provider: 'backend',
+    label: 'Backend',
+    reason: 'Necessário para APIs, pedidos, corridas, status, realtime ou autenticação complexa.',
+    patterns: [/\bbackend\b/, /\bapi\b/, /\bapis\b/, /\bpedido\w*\b/, /\bcorrida\w*\b/, /\bstatus\b/, /\brealtime\b/, /\btempo real\b/, /\bautenticacao complexa\b/],
+  },
+];
+
+function normalizeConnectorText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeConnectorProvider(provider) {
+  return String(provider || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+}
+
+function sanitizeRequiredConnector(connector) {
+  if (!connector || typeof connector !== 'object') {
+    return null;
+  }
+
+  const provider = normalizeConnectorProvider(connector.provider);
+
+  if (!provider) {
+    return null;
+  }
+
+  return {
+    provider,
+    label: String(connector.label || provider).replace(/\s+/g, ' ').trim(),
+    reason: String(connector.reason || '').replace(/\s+/g, ' ').trim(),
+    status: ['pending', 'connected', 'skipped'].includes(connector.status)
+      ? connector.status
+      : 'pending',
+  };
+}
+
+function detectInitialRequiredConnectors({ name, description, prompt, requiredConnectors }) {
+  const detectedConnectors = [];
+  const seenProviders = new Set();
+  const detectionText = normalizeConnectorText([name, description, prompt].filter(Boolean).join('\n'));
+
+  CONNECTOR_RULES.forEach((rule) => {
+    if (!detectionText || !rule.patterns.some((pattern) => pattern.test(detectionText))) {
+      return;
+    }
+
+    seenProviders.add(rule.provider);
+    detectedConnectors.push({
+      provider: rule.provider,
+      label: rule.label,
+      reason: rule.reason,
+      status: 'pending',
+    });
+  });
+
+  (Array.isArray(requiredConnectors) ? requiredConnectors : []).forEach((connector) => {
+    const sanitized = sanitizeRequiredConnector(connector);
+
+    if (!sanitized || seenProviders.has(sanitized.provider)) {
+      return;
+    }
+
+    seenProviders.add(sanitized.provider);
+    detectedConnectors.push(sanitized);
+  });
+
+  return detectedConnectors;
+}
 
 function getBackendBaseUrl(req) {
   const configuredBaseUrl =
@@ -158,7 +273,7 @@ router.get('/', authMiddleware, async (req, res) => {
 
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { name, description, status, prompt, type, settings } = req.body;
+    const { name, description, status, prompt, type, settings, requiredConnectors } = req.body;
 
     if (!name) {
       return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
@@ -172,6 +287,12 @@ router.post('/', authMiddleware, async (req, res) => {
   prompt,
   type,
   settings,
+  requiredConnectors: detectInitialRequiredConnectors({
+    name,
+    description,
+    prompt,
+    requiredConnectors,
+  }),
 });
     return res.status(201).json({
       message: 'Projeto criado com sucesso.',
