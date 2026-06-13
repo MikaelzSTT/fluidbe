@@ -495,6 +495,29 @@ function markRequiredConnectorConnected(project, connector, now) {
   });
 }
 
+function markRequiredConnectorPending(project, connector, now) {
+  const provider = connector.provider;
+  const existingConnector = project.requiredConnectors.find(
+    (item) => normalizeConnectorProvider(item.provider) === provider
+  );
+
+  if (existingConnector) {
+    existingConnector.label = existingConnector.label || connector.label || provider;
+    existingConnector.status = 'pending';
+    existingConnector.updatedAt = now;
+    return;
+  }
+
+  project.requiredConnectors.push({
+    provider,
+    label: connector.label || provider,
+    reason: connector.description || '',
+    status: 'pending',
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
 function sanitizeRequiredConnector(connector) {
   if (!connector || typeof connector !== 'object') {
     return null;
@@ -905,6 +928,54 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao salvar credenciais do conector.',
+      error: error.message,
+    });
+  }
+});
+
+router.delete('/:projectId/connectors/:provider', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) {
+      return res.status(400).json({ message: 'ID de projeto inválido.' });
+    }
+
+    const provider = normalizeConnectorProvider(req.params.provider);
+    const connector = getConnectorByProvider(provider);
+
+    if (!connector) {
+      return res.status(404).json({ message: 'Conector não encontrado no registry.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.projectId,
+      userId: req.userId,
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const secret = await ConnectorSecret.findOneAndDelete({
+      projectId: project._id,
+      userId: req.userId,
+      provider,
+    });
+
+    if (!secret) {
+      return res.status(404).json({ message: 'Credenciais do conector não encontradas.' });
+    }
+
+    markRequiredConnectorPending(project, connector, new Date());
+    await project.save();
+
+    return res.json({
+      success: true,
+      provider,
+      status: 'pending',
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao remover credenciais do conector.',
       error: error.message,
     });
   }
