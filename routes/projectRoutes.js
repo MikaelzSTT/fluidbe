@@ -1,9 +1,12 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const ProjectMessage = require('../models/ProjectMessage');
+const ConnectorSecret = require('../models/ConnectorSecret');
 const authMiddleware = require('../middleware/authMiddleware');
+const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 
 const router = express.Router();
 const CONNECTOR_RULES = [
@@ -66,6 +69,136 @@ function normalizeConnectorProvider(provider) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
+}
+
+function getConnectorEncryptionKey() {
+  const rawKey = process.env.CONNECTOR_SECRET_KEY;
+
+  if (!rawKey) {
+    return null;
+  }
+
+  return crypto.createHash('sha256').update(rawKey).digest();
+}
+
+function encryptConnectorValue(value, key) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(String(value), 'utf8'),
+    cipher.final(),
+  ]);
+
+  return {
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    value: encrypted.toString('base64'),
+    algorithm: 'aes-256-gcm',
+  };
+}
+
+function buildConfiguredFields(connector, values) {
+  return (Array.isArray(connector.fields) ? connector.fields : [])
+    .filter((field) => Object.prototype.hasOwnProperty.call(values, field.name))
+    .filter((field) => values[field.name] !== undefined && values[field.name] !== null && String(values[field.name]).trim() !== '')
+    .map((field) => ({
+      name: field.name,
+      label: field.label || field.name,
+      type: field.type || '',
+      required: field.required === true,
+      configured: true,
+    }));
+}
+
+function validateConnectorValues(connector, values) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    return 'values deve ser um objeto com as credenciais do conector.';
+  }
+
+  const fields = Array.isArray(connector.fields) ? connector.fields : [];
+  const missingFields = fields
+    .filter((field) => field.required === true)
+    .filter((field) => {
+      const value = values[field.name];
+      return value === undefined || value === null || String(value).trim() === '';
+    })
+    .map((field) => field.name);
+
+  if (missingFields.length > 0) {
+    return `Campos obrigatórios ausentes: ${missingFields.join(', ')}.`;
+  }
+
+  return '';
+}
+
+function encryptConnectorValues(connector, values, key) {
+  const encryptedValues = {};
+  const fields = Array.isArray(connector.fields) ? connector.fields : [];
+
+  fields.forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(values, field.name)) {
+      return;
+    }
+
+    const value = values[field.name];
+
+    if (value === undefined || value === null || String(value).trim() === '') {
+      return;
+    }
+
+    encryptedValues[field.name] = encryptConnectorValue(value, key);
+  });
+
+  return encryptedValues;
+}
+
+function connectorSecretToConfiguredFields(secret) {
+  if (!secret || !secret.encryptedValues) {
+    return [];
+  }
+
+  if (typeof secret.encryptedValues.keys === 'function') {
+    return Array.from(secret.encryptedValues.keys());
+  }
+
+  return Object.keys(secret.encryptedValues);
+}
+
+function buildSafeConnectorPayload(projectConnector, connector, secret) {
+  const updatedAt = projectConnector?.updatedAt || secret?.lastUpdatedAt || secret?.updatedAt || null;
+  const status = secret ? 'connected' : projectConnector?.status || 'pending';
+
+  return {
+    provider: connector?.provider || projectConnector?.provider || secret?.provider || '',
+    label: connector?.label || projectConnector?.label || projectConnector?.provider || secret?.provider || '',
+    status,
+    connectedAt: secret?.createdAt || (status === 'connected' ? updatedAt : null),
+    updatedAt,
+    fieldsConfigured: connectorSecretToConfiguredFields(secret),
+  };
+}
+
+function markRequiredConnectorConnected(project, connector, now) {
+  const provider = connector.provider;
+  const existingConnector = project.requiredConnectors.find(
+    (item) => normalizeConnectorProvider(item.provider) === provider
+  );
+
+  if (existingConnector) {
+    existingConnector.label = existingConnector.label || connector.label || provider;
+    existingConnector.status = 'connected';
+    existingConnector.updatedAt = now;
+    return;
+  }
+
+  project.requiredConnectors.push({
+    provider,
+    label: connector.label || provider,
+    reason: connector.description || '',
+    status: 'connected',
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 function sanitizeRequiredConnector(connector) {
@@ -301,6 +434,149 @@ router.post('/', authMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao criar projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/:projectId/connectors', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) {
+      return res.status(400).json({ message: 'ID de projeto inválido.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.projectId,
+      userId: req.userId,
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const secrets = await ConnectorSecret.find({
+      projectId: project._id,
+      userId: req.userId,
+    }).lean();
+    const secretByProvider = new Map(
+      secrets.map((secret) => [normalizeConnectorProvider(secret.provider), secret])
+    );
+    const connectorByProvider = new Map();
+
+    project.requiredConnectors.forEach((projectConnector) => {
+      const provider = normalizeConnectorProvider(projectConnector.provider);
+      const registryConnector = getConnectorByProvider(provider);
+
+      connectorByProvider.set(
+        provider,
+        buildSafeConnectorPayload(projectConnector, registryConnector, secretByProvider.get(provider))
+      );
+    });
+
+    secrets.forEach((secret) => {
+      const provider = normalizeConnectorProvider(secret.provider);
+
+      if (connectorByProvider.has(provider)) {
+        return;
+      }
+
+      const registryConnector = getConnectorByProvider(provider);
+      connectorByProvider.set(
+        provider,
+        buildSafeConnectorPayload(null, registryConnector, secret)
+      );
+    });
+
+    return res.json({
+      success: true,
+      connectors: Array.from(connectorByProvider.values()),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao buscar conectores do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.post('/:projectId/connectors/:provider/credentials', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) {
+      return res.status(400).json({ message: 'ID de projeto inválido.' });
+    }
+
+    const provider = normalizeConnectorProvider(req.params.provider);
+    const connector = getConnectorByProvider(provider);
+
+    if (!connector) {
+      return res.status(404).json({ message: 'Conector não encontrado no registry.' });
+    }
+
+    const encryptionKey = getConnectorEncryptionKey();
+
+    if (!encryptionKey) {
+      return res.status(500).json({
+        message: 'CONNECTOR_SECRET_KEY não configurada. Não é possível salvar credenciais com segurança.',
+      });
+    }
+
+    const values = req.body?.values;
+    const validationError = validateConnectorValues(connector, values);
+
+    if (validationError) {
+      return res.status(400).json({ message: validationError });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.projectId,
+      userId: req.userId,
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const now = new Date();
+    const encryptedValues = encryptConnectorValues(connector, values, encryptionKey);
+    const fieldsMeta = buildConfiguredFields(connector, values);
+
+    const secret = await ConnectorSecret.findOneAndUpdate(
+      {
+        projectId: project._id,
+        userId: req.userId,
+        provider,
+      },
+      {
+        projectId: project._id,
+        userId: req.userId,
+        provider,
+        encryptedValues,
+        fieldsMeta,
+        lastUpdatedAt: now,
+      },
+      {
+        new: true,
+        upsert: true,
+        runValidators: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    markRequiredConnectorConnected(project, connector, now);
+    await project.save();
+
+    return res.status(201).json({
+      success: true,
+      message: 'Credenciais do conector salvas com segurança.',
+      connector: buildSafeConnectorPayload(
+        project.requiredConnectors.find((item) => normalizeConnectorProvider(item.provider) === provider),
+        connector,
+        secret
+      ),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao salvar credenciais do conector.',
       error: error.message,
     });
   }

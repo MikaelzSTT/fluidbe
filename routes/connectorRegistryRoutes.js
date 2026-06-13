@@ -216,3 +216,8 @@ router.get('/registry/:provider', authMiddleware, (req, res) => {
 });
 
 module.exports = router;
+module.exports.CONNECTOR_REGISTRY = CONNECTOR_REGISTRY;
+module.exports.CONNECTOR_BY_PROVIDER = CONNECTOR_BY_PROVIDER;
+module.exports.getConnectorByProvider = function getConnectorByProvider(provider) {
+  return CONNECTOR_BY_PROVIDER.get(String(provider || '').trim().toLowerCase());
+};
