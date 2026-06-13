@@ -17,6 +17,23 @@ dotenv.config();
 const app = express();
 
 const PUBLIC_BUILDS_DIR = path.join(__dirname, 'public', 'builds');
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+};
 const allowedOrigins = [
   'https://askfluid.now',
   'https://www.askfluid.now',
@@ -28,6 +45,10 @@ const corsOptions = {
   origin: allowedOrigins,
   credentials: true
 };
+
+function getContentType(filePath) {
+  return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
 
 function resolvePublicBuildIndexPath(buildUrl) {
   if (typeof buildUrl !== 'string') {
@@ -61,7 +82,16 @@ function resolvePublicBuildIndexPath(buildUrl) {
 }
 
 function rewriteBuildAssetPaths(html, buildUrl) {
+  if (typeof html !== 'string' || !html || typeof buildUrl !== 'string' || !buildUrl) {
+    return html || '';
+  }
+
   const buildPath = new URL(buildUrl, 'http://localhost').pathname;
+
+  if (!buildPath.startsWith('/builds/')) {
+    return html;
+  }
+
   const buildBasePath = buildPath.endsWith('/index.html')
     ? buildPath.slice(0, -'index.html'.length)
     : `${buildPath.replace(/\/+$/, '')}/`;
@@ -100,7 +130,7 @@ function parseBuildRequestPath(requestPath) {
   const artifactPath = parts.slice(2).join('/') || 'index.html';
   const indexBuildUrl = `/builds/${projectId}/${buildKey}/index.html`;
 
-  if (artifactPath.includes('..')) {
+  if (artifactPath.split('/').some((segment) => segment === '..')) {
     return null;
   }
 
@@ -143,12 +173,15 @@ async function findMongoBuildArtifact(requestPath) {
   }
 
   const artifact = Array.isArray(build.artifactFiles)
-    ? build.artifactFiles.find((file) => file.path === parsedPath.artifactPath)
+    ? build.artifactFiles.find((file) => (file.relativePath || file.path) === parsedPath.artifactPath)
     : null;
 
   if (artifact && artifact.content) {
     return {
-      contentType: artifact.contentType || 'application/octet-stream',
+      contentType:
+        artifact.mimeType ||
+        artifact.contentType ||
+        getContentType(artifact.relativePath || artifact.path || parsedPath.artifactPath),
       body: Buffer.from(artifact.content, artifact.encoding || 'base64'),
     };
   }
@@ -179,20 +212,38 @@ async function loadPublishedHtml(project) {
     project.latestFullHtml ||
     project.html ||
     '';
+  const buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || project.buildUrl || '';
 
   if (inlineHtml) {
-    return inlineHtml;
+    return rewriteBuildAssetPaths(inlineHtml, buildUrl);
   }
 
-  const buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || project.buildUrl || '';
+  const mongoArtifact = await findMongoBuildArtifact(buildUrl);
+
+  if (mongoArtifact) {
+    const artifactHtml = Buffer.isBuffer(mongoArtifact.body)
+      ? mongoArtifact.body.toString('utf8')
+      : String(mongoArtifact.body || '');
+
+    return rewriteBuildAssetPaths(artifactHtml, buildUrl);
+  }
+
   const indexPath = resolvePublicBuildIndexPath(buildUrl);
 
   if (!indexPath) {
     return '';
   }
 
-  const fileHtml = await fs.readFile(indexPath, 'utf8');
-  return rewriteBuildAssetPaths(fileHtml, buildUrl);
+  try {
+    const fileHtml = await fs.readFile(indexPath, 'utf8');
+    return rewriteBuildAssetPaths(fileHtml, buildUrl);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return '';
+    }
+
+    throw error;
+  }
 }
 
 app.set('trust proxy', 1);
@@ -208,7 +259,7 @@ app.get(/^\/builds\/.+$/, async (req, res, next) => {
       return next();
     }
 
-    return res.type(artifact.contentType).send(artifact.body);
+    return res.set('Content-Type', artifact.contentType).send(artifact.body);
   } catch (error) {
     return next(error);
   }

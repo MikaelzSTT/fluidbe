@@ -307,35 +307,33 @@ async function hasMongoBuildFallback(buildUrl) {
       { buildUrl: absoluteIndexBuildUrlPattern },
       { deployUrl: absoluteIndexBuildUrlPattern },
     ],
-  }).select('fullHtml html artifactFiles.path');
+  }).select('fullHtml html artifactFiles.path artifactFiles.relativePath');
 
   return Boolean(
     build &&
       (
         build.fullHtml ||
         build.html ||
-        (Array.isArray(build.artifactFiles) && build.artifactFiles.some((file) => file.path === 'index.html'))
+        (Array.isArray(build.artifactFiles) &&
+          build.artifactFiles.some((file) => (file.relativePath || file.path) === 'index.html'))
       )
   );
 }
 
 async function collectBuildArtifactFiles(distDir) {
   const distRoot = path.resolve(distDir);
+  const candidates = [];
   const files = [];
   let totalBytes = 0;
 
-  async function collect(currentDir) {
+  async function discover(currentDir) {
     const entries = await fs.readdir(currentDir, { withFileTypes: true });
 
     for (const entry of entries) {
       const entryPath = path.join(currentDir, entry.name);
 
       if (entry.isDirectory()) {
-        const childComplete = await collect(entryPath);
-        if (!childComplete) {
-          return false;
-        }
-
+        await discover(entryPath);
         continue;
       }
 
@@ -349,31 +347,72 @@ async function collectBuildArtifactFiles(distDir) {
       }
 
       const stats = await fs.stat(absolutePath);
-      totalBytes += stats.size;
-
-      if (totalBytes > MAX_MONGO_ARTIFACT_BYTES) {
-        return false;
-      }
-
       const relativePath = path.relative(distRoot, absolutePath).split(path.sep).join('/');
-      const content = await fs.readFile(absolutePath);
-      files.push({
-        path: relativePath,
-        contentType: getContentType(relativePath),
-        encoding: 'base64',
-        content: content.toString('base64'),
+      candidates.push({
+        absolutePath,
+        relativePath,
+        size: stats.size,
       });
     }
-
-    return true;
   }
 
-  const complete = await collect(distRoot);
+  await discover(distRoot);
+
+  const priorityFor = (relativePath) => {
+    const ext = path.extname(relativePath).toLowerCase();
+
+    if (relativePath === 'index.html') {
+      return 0;
+    }
+
+    if (['.css', '.js', '.mjs'].includes(ext)) {
+      return 1;
+    }
+
+    if (['.json', '.svg', '.woff', '.woff2', '.ttf'].includes(ext)) {
+      return 2;
+    }
+
+    if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico'].includes(ext)) {
+      return 3;
+    }
+
+    return 4;
+  };
+
+  candidates.sort((a, b) => {
+    const priorityDifference = priorityFor(a.relativePath) - priorityFor(b.relativePath);
+
+    if (priorityDifference !== 0) {
+      return priorityDifference;
+    }
+
+    return a.relativePath.localeCompare(b.relativePath);
+  });
+
+  for (const candidate of candidates) {
+    if (totalBytes + candidate.size > MAX_MONGO_ARTIFACT_BYTES) {
+      continue;
+    }
+
+    const content = await fs.readFile(candidate.absolutePath);
+    const mimeType = getContentType(candidate.relativePath);
+    totalBytes += candidate.size;
+    files.push({
+      relativePath: candidate.relativePath,
+      path: candidate.relativePath,
+      mimeType,
+      contentType: mimeType,
+      encoding: 'base64',
+      content: content.toString('base64'),
+    });
+  }
 
   return {
-    files: complete === false ? [] : files,
-    complete: complete !== false,
+    files,
+    complete: files.length === candidates.length,
     totalBytes,
+    skippedFiles: Math.max(candidates.length - files.length, 0),
   };
 }
 
@@ -1166,7 +1205,7 @@ router.post(
       const artifactSnapshot = await collectBuildArtifactFiles(distDir);
 
       if (!artifactSnapshot.complete) {
-        logs += `\nAviso: dist gerado tem mais de ${MAX_MONGO_ARTIFACT_BYTES} bytes; fallback via MongoDB não foi salvo para os assets.\n`;
+        logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
       }
 
       const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);

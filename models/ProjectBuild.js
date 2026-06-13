@@ -75,9 +75,17 @@ const projectBuildSchema = new mongoose.Schema(
     artifactFiles: {
       type: [
         {
+          relativePath: {
+            type: String,
+            default: '',
+          },
           path: {
             type: String,
-            required: true,
+            default: '',
+          },
+          mimeType: {
+            type: String,
+            default: '',
           },
           contentType: {
             type: String,
