@@ -8,6 +8,7 @@ const authRoutes = require('./routes/authRoutes');
 const projectRoutes = require('./routes/projectRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
 
@@ -290,6 +291,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/connectors', connectorRegistryRoutes);
 
 mongoose
   .connect(process.env.MONGODB_URI)
