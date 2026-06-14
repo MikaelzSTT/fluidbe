@@ -3,6 +3,8 @@ const path = require('path');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const {
   CONNECTOR_FIELD_ENV_MAP,
+  decryptConnectorValue,
+  getConnectorEncryptionKey,
   resolveConnectorEnvValues,
 } = require('./connectorSecrets');
 
@@ -120,6 +122,18 @@ function isFrontendEnvVar(envVar) {
   return String(envVar || '').startsWith('VITE_');
 }
 
+function isInjectableFrontendPlanItem(item) {
+  return (
+    item &&
+    item.futureInjectable === true &&
+    typeof item.envVar === 'string' &&
+    item.envVar.startsWith('VITE_') &&
+    item.target === 'frontend' &&
+    item.resolved === true &&
+    item.valueAvailable === true
+  );
+}
+
 function classifyEnvVars(envVars) {
   return (Array.isArray(envVars) ? envVars : []).reduce(
     (classified, envVar) => {
@@ -165,6 +179,18 @@ function getEncryptedFieldNames(encryptedValues) {
   }
 
   return Object.keys(encryptedValues);
+}
+
+function getEncryptedFieldEntries(encryptedValues) {
+  if (!encryptedValues) {
+    return [];
+  }
+
+  if (typeof encryptedValues.entries === 'function') {
+    return Array.from(encryptedValues.entries());
+  }
+
+  return Object.entries(encryptedValues);
 }
 
 function getConfiguredFieldNames(secret) {
@@ -354,12 +380,152 @@ async function collectConnectorInjectionBuildFiles(rootDir) {
   return files;
 }
 
+function formatDotEnvValue(value) {
+  return JSON.stringify(String(value)).replace(/\$/g, '\\$');
+}
+
+async function getExistingRegularFileState(filePath) {
+  try {
+    const stats = await fs.lstat(filePath);
+
+    if (!stats.isFile()) {
+      throw new Error(`Temporary frontend env path is not a regular file: ${path.basename(filePath)}`);
+    }
+
+    return {
+      exists: true,
+      content: await fs.readFile(filePath, 'utf8'),
+    };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return {
+        exists: false,
+        content: null,
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function createTemporaryFrontendEnv({ projectId, projectDir, injectionPlan }) {
+  const injectableEnvVars = Array.from(
+    new Set(
+      (Array.isArray(injectionPlan) ? injectionPlan : [])
+        .filter(isInjectableFrontendPlanItem)
+        .map((item) => item.envVar)
+    )
+  );
+
+  if (injectableEnvVars.length === 0) {
+    return {
+      injectedEnvVars: [],
+      cleanup: async () => {},
+    };
+  }
+
+  const encryptionKey = getConnectorEncryptionKey();
+
+  if (!encryptionKey) {
+    return {
+      injectedEnvVars: [],
+      cleanup: async () => {},
+    };
+  }
+
+  const injectableEnvVarSet = new Set(injectableEnvVars);
+  const providers = Array.from(
+    new Set(
+      (Array.isArray(injectionPlan) ? injectionPlan : [])
+        .filter((item) => injectableEnvVarSet.has(item.envVar))
+        .map((item) => item.provider)
+        .filter(Boolean)
+    )
+  );
+  const valuesByEnvVar = new Map();
+  const secrets = await ConnectorSecret.find({
+    projectId,
+    provider: { $in: providers },
+  })
+    .select('provider encryptedValues')
+    .lean();
+
+  for (const secret of secrets) {
+    const provider = normalizeProvider(secret.provider);
+    const fieldEnvMap = CONNECTOR_FIELD_ENV_MAP[provider];
+
+    if (!fieldEnvMap) {
+      continue;
+    }
+
+    for (const [fieldName, encryptedValue] of getEncryptedFieldEntries(secret.encryptedValues)) {
+      const envVar = fieldEnvMap[fieldName];
+
+      if (!injectableEnvVarSet.has(envVar) || valuesByEnvVar.has(envVar)) {
+        continue;
+      }
+
+      try {
+        valuesByEnvVar.set(envVar, decryptConnectorValue(encryptedValue, encryptionKey));
+      } catch (error) {
+        valuesByEnvVar.delete(envVar);
+      }
+    }
+  }
+
+  const injectedEnvVars = injectableEnvVars.filter((envVar) => valuesByEnvVar.has(envVar));
+
+  if (injectedEnvVars.length === 0) {
+    return {
+      injectedEnvVars: [],
+      cleanup: async () => {},
+    };
+  }
+
+  const envPath = path.join(projectDir, '.env');
+  const existingEnv = await getExistingRegularFileState(envPath);
+  const temporaryEnvContent = `${injectedEnvVars
+    .map((envVar) => `${envVar}=${formatDotEnvValue(valuesByEnvVar.get(envVar))}`)
+    .join('\n')}\n`;
+  let cleaned = false;
+
+  await fs.writeFile(envPath, temporaryEnvContent, {
+    mode: 0o600,
+    flag: existingEnv.exists ? 'w' : 'wx',
+  });
+
+  return {
+    injectedEnvVars,
+    cleanup: async () => {
+      if (cleaned) {
+        return;
+      }
+
+      cleaned = true;
+
+      if (existingEnv.exists) {
+        await fs.writeFile(envPath, existingEnv.content, { mode: 0o600 });
+        return;
+      }
+
+      try {
+        await fs.unlink(envPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+    },
+  };
+}
+
 module.exports = {
   CONNECTOR_FIELD_ENV_MAP,
   PROVIDER_ENV_VARS,
   resolveConnectorEnvValues,
   resolveProjectConnectorInjection,
   collectConnectorInjectionBuildFiles,
+  createTemporaryFrontendEnv,
   detectRequiredEnvVars,
   classifyEnvVars,
 };

@@ -15,6 +15,7 @@ const ConnectorSecret = require('../models/ConnectorSecret');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
+  createTemporaryFrontendEnv,
   resolveProjectConnectorInjection,
 } = require('../utils/connectorInjection');
 
@@ -1354,36 +1355,50 @@ router.post(
         NPM_CONFIG_PRODUCTION: 'false',
       };
 
-      logs += await runNpmCommand(['install', '--include=dev'], appRoot, {
-        env: developmentInstallEnv,
+      const temporaryFrontendEnv = await createTemporaryFrontendEnv({
+        projectId: project._id,
+        projectDir: appRoot,
+        injectionPlan: connectorInjection.injectionPlan,
       });
-      logs += '\n';
 
-      logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot, {
-        env: developmentInstallEnv,
-      });
-      logs += '\n';
+      if (temporaryFrontendEnv.injectedEnvVars.length > 0) {
+        logs += `Frontend env vars injected: ${temporaryFrontendEnv.injectedEnvVars.join(', ')}\n`;
+      }
 
-      logs += await runNpmCommand(
-        ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
-        appRoot,
-        {
+      try {
+        logs += await runNpmCommand(['install', '--include=dev'], appRoot, {
           env: developmentInstallEnv,
+        });
+        logs += '\n';
+
+        logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot, {
+          env: developmentInstallEnv,
+        });
+        logs += '\n';
+
+        logs += await runNpmCommand(
+          ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
+          appRoot,
+          {
+            env: developmentInstallEnv,
+          }
+        );
+        logs += '\n';
+
+        const fixedTsconfigPaths = await applyTsconfigDeprecationFix(appRoot);
+        for (const fixedTsconfigPath of fixedTsconfigPaths) {
+          logs += `Auto-fix TS5107 aplicado em: ${fixedTsconfigPath}\n`;
         }
-      );
-      logs += '\n';
 
-      const fixedTsconfigPaths = await applyTsconfigDeprecationFix(appRoot);
-      for (const fixedTsconfigPath of fixedTsconfigPaths) {
-        logs += `Auto-fix TS5107 aplicado em: ${fixedTsconfigPath}\n`;
+        const viteConfigFixed = await ensureViteRelativeBase(appRoot);
+        if (viteConfigFixed) {
+          logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
+        }
+
+        logs += await runReactViteBuild(appRoot);
+      } finally {
+        await temporaryFrontendEnv.cleanup();
       }
-
-      const viteConfigFixed = await ensureViteRelativeBase(appRoot);
-      if (viteConfigFixed) {
-        logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
-      }
-
-      logs += await runReactViteBuild(appRoot);
 
       const distDir = path.join(appRoot, 'dist');
 
