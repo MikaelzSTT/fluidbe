@@ -51,6 +51,18 @@ function getContentType(filePath) {
   return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 }
 
+function getArtifactContentType(artifact, fallbackPath) {
+  const artifactPath = artifact.relativePath || artifact.path || fallbackPath;
+  const pathContentType = getContentType(artifactPath);
+  const storedContentType = artifact.mimeType || artifact.contentType || '';
+
+  if (!storedContentType || storedContentType === 'application/octet-stream') {
+    return pathContentType;
+  }
+
+  return storedContentType;
+}
+
 function resolvePublicBuildIndexPath(buildUrl) {
   if (typeof buildUrl !== 'string') {
     return null;
@@ -152,7 +164,7 @@ async function findMongoBuildArtifact(requestPath) {
 
   const escapedIndexBuildUrl = parsedPath.indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
-  const build = await ProjectBuild.findOne({
+  const builds = await ProjectBuild.find({
     projectId: parsedPath.projectId,
     $or: [
       { distUrl: parsedPath.indexBuildUrl },
@@ -165,35 +177,54 @@ async function findMongoBuildArtifact(requestPath) {
       { deployUrl: absoluteIndexBuildUrlPattern },
     ],
   }).sort({
-    createdAt: -1,
     updatedAt: -1,
+    createdAt: -1,
   });
 
-  if (!build) {
-    return null;
+  const logArtifactLookup = (found) => {
+    console.info('[build-artifact]', {
+      artifactPath: parsedPath.artifactPath,
+      candidates: builds.length,
+      found,
+    });
+  };
+
+  const findArtifact = (build) => {
+    if (!Array.isArray(build.artifactFiles)) {
+      return null;
+    }
+
+    return build.artifactFiles.find((file) => {
+      const artifactFilePath = file.relativePath || file.path;
+      return artifactFilePath === parsedPath.artifactPath;
+    });
+  };
+
+  for (const build of builds) {
+    const artifact = findArtifact(build);
+
+    if (artifact && artifact.content) {
+      logArtifactLookup(true);
+      return {
+        contentType: getArtifactContentType(artifact, parsedPath.artifactPath),
+        body: Buffer.from(artifact.content, artifact.encoding || 'base64'),
+      };
+    }
   }
 
-  const artifact = Array.isArray(build.artifactFiles)
-    ? build.artifactFiles.find((file) => (file.relativePath || file.path) === parsedPath.artifactPath)
-    : null;
+  if (parsedPath.artifactPath === 'index.html') {
+    const htmlBuild = builds.find((build) => build.fullHtml || build.html);
 
-  if (artifact && artifact.content) {
-    return {
-      contentType:
-        artifact.mimeType ||
-        artifact.contentType ||
-        getContentType(artifact.relativePath || artifact.path || parsedPath.artifactPath),
-      body: Buffer.from(artifact.content, artifact.encoding || 'base64'),
-    };
+    if (htmlBuild) {
+      logArtifactLookup(true);
+      return {
+        contentType: 'text/html; charset=utf-8',
+        body: htmlBuild.fullHtml || htmlBuild.html,
+      };
+    }
   }
 
-  if (parsedPath.artifactPath === 'index.html' && (build.fullHtml || build.html)) {
-    return {
-      contentType: 'text/html; charset=utf-8',
-      body: build.fullHtml || build.html,
-    };
-  }
-
+  logArtifactLookup(false);
   return null;
 }
 
