@@ -29,7 +29,10 @@ const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
-const PUBLIC_BASE_URL = 'https://askfluid.now';
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL ||
+  process.env.BACKEND_PUBLIC_URL ||
+  'https://fluidbe.onrender.com';
 const BUILD_FIELDS = [
   'type',
   'status',
