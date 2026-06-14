@@ -285,6 +285,7 @@ async function resolveProjectConnectorInjection(projectId, buildFiles) {
         valueAvailable,
         safeToInjectInFrontend,
         status: safeToInjectInFrontend ? status : 'blocked_backend_secret',
+        futureInjectable: safeToInjectInFrontend && resolved,
         inject: false,
       });
     });
