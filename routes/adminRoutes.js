@@ -26,6 +26,8 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
 const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 8 * 1024 * 1024);
+const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
+const MAX_PROJECT_FILE_TREE_ENTRIES = Number(process.env.MAX_PROJECT_FILE_TREE_ENTRIES || 5000);
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
@@ -60,6 +62,29 @@ const CONNECTOR_STATUS_TONES = {
   connected: 'green',
   skipped: 'gray',
   error: 'red',
+};
+const PROJECT_FILE_TREE_IGNORED_DIRS = new Set([
+  '.git',
+  '.next',
+  '.turbo',
+  'coverage',
+  'node_modules',
+]);
+const PROJECT_FILE_LANGUAGE_BY_EXT = {
+  '.css': 'css',
+  '.csv': 'csv',
+  '.html': 'html',
+  '.js': 'javascript',
+  '.jsx': 'javascript',
+  '.json': 'json',
+  '.md': 'markdown',
+  '.mjs': 'javascript',
+  '.scss': 'scss',
+  '.ts': 'typescript',
+  '.tsx': 'typescript',
+  '.txt': 'text',
+  '.yml': 'yaml',
+  '.yaml': 'yaml',
 };
 
 const CONTENT_TYPES = {
@@ -602,6 +627,322 @@ async function pathExists(targetPath) {
   }
 }
 
+function normalizeProjectFilePath(requestPath = '') {
+  const rawPath = String(requestPath || '').replace(/\\/g, '/').trim();
+
+  if (!rawPath || rawPath === '.') {
+    return '';
+  }
+
+  if (
+    rawPath.includes('\0') ||
+    rawPath.startsWith('/') ||
+    /^[a-z]:\//i.test(rawPath)
+  ) {
+    return null;
+  }
+
+  const segments = rawPath.split('/').filter(Boolean);
+
+  if (segments.some((segment) => segment === '..')) {
+    return null;
+  }
+
+  const normalizedPath = path.posix.normalize(segments.join('/'));
+
+  if (normalizedPath === '.' || normalizedPath === '/') {
+    return '';
+  }
+
+  if (normalizedPath.startsWith('../') || normalizedPath.includes('/../')) {
+    return null;
+  }
+
+  return normalizedPath;
+}
+
+function isProjectFileSensitive(relativePath) {
+  const segments = String(relativePath || '')
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase());
+  const basename = segments[segments.length - 1] || '';
+
+  if (basename === '.env.example') {
+    return false;
+  }
+
+  if (basename === '.env' || basename.startsWith('.env.')) {
+    return true;
+  }
+
+  if (['.pem', '.key', '.cert', '.crt', '.p12', '.pfx'].includes(path.extname(basename))) {
+    return true;
+  }
+
+  return segments.some((segment) => (
+    segment === 'keys' ||
+    segment === 'secrets' ||
+    segment.includes('secret') ||
+    segment.includes('private-key') ||
+    segment.includes('private_key')
+  ));
+}
+
+function getProjectFileMetadata(rootDir, absolutePath, stats, dirent = null) {
+  const relativePath = path.relative(rootDir, absolutePath).split(path.sep).join('/');
+  const name = relativePath ? path.posix.basename(relativePath) : path.basename(rootDir);
+  const isDirectory = dirent ? dirent.isDirectory() : stats.isDirectory();
+  const ext = isDirectory ? '' : path.extname(name).toLowerCase();
+
+  return {
+    path: relativePath,
+    name,
+    type: isDirectory ? 'folder' : 'file',
+    size: isDirectory ? 0 : stats.size,
+    ext,
+    language: PROJECT_FILE_LANGUAGE_BY_EXT[ext] || ext.replace(/^\./, '') || '',
+  };
+}
+
+async function resolveProjectFileRoot(projectId) {
+  const projectStorageDir = path.join(REACT_VITE_STORAGE_DIR, String(projectId));
+
+  try {
+    const sourceCandidates = await fs.readdir(projectStorageDir, { withFileTypes: true });
+    const sourceDirs = [];
+
+    for (const entry of sourceCandidates) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const sourceDir = path.join(projectStorageDir, entry.name, 'source');
+
+      if (!(await pathExists(sourceDir))) {
+        continue;
+      }
+
+      const stats = await fs.stat(sourceDir);
+
+      if (stats.isDirectory()) {
+        sourceDirs.push({
+          rootDir: sourceDir,
+          label: entry.name,
+          mtimeMs: stats.mtimeMs,
+        });
+      }
+    }
+
+    sourceDirs.sort((a, b) => {
+      const numericDifference = Number(b.label) - Number(a.label);
+
+      if (!Number.isNaN(numericDifference) && numericDifference !== 0) {
+        return numericDifference;
+      }
+
+      return b.mtimeMs - a.mtimeMs;
+    });
+
+    if (sourceDirs[0]) {
+      return {
+        type: 'source',
+        rootDir: sourceDirs[0].rootDir,
+        buildKey: sourceDirs[0].label,
+      };
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  const latestBuild = await ProjectBuild.findOne({
+    projectId,
+    $or: [
+      { distUrl: { $regex: /\/builds\// } },
+      { previewUrl: { $regex: /\/builds\// } },
+      { buildUrl: { $regex: /\/builds\// } },
+      { deployUrl: { $regex: /\/builds\// } },
+    ],
+  }).sort({
+    createdAt: -1,
+    updatedAt: -1,
+  }).lean();
+  const buildUrls = latestBuild
+    ? [latestBuild.buildUrl, latestBuild.deployUrl, latestBuild.previewUrl, latestBuild.distUrl]
+    : [];
+
+  for (const buildUrl of buildUrls) {
+    const parsedUrl = parsePublicBuildUrl(buildUrl);
+
+    if (!parsedUrl || String(parsedUrl.projectId) !== String(projectId)) {
+      continue;
+    }
+
+    const rootDir = path.join(PUBLIC_BUILDS_DIR, String(projectId), parsedUrl.buildKey);
+
+    if (await pathExists(rootDir)) {
+      const stats = await fs.stat(rootDir);
+
+      if (stats.isDirectory()) {
+        return {
+          type: 'build',
+          rootDir,
+          buildKey: parsedUrl.buildKey,
+        };
+      }
+    }
+  }
+
+  const publicProjectDir = path.join(PUBLIC_BUILDS_DIR, String(projectId));
+
+  try {
+    const buildCandidates = await fs.readdir(publicProjectDir, { withFileTypes: true });
+    const buildDirs = [];
+
+    for (const entry of buildCandidates) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const rootDir = path.join(publicProjectDir, entry.name);
+      const stats = await fs.stat(rootDir);
+
+      if (stats.isDirectory()) {
+        buildDirs.push({
+          rootDir,
+          label: entry.name,
+          mtimeMs: stats.mtimeMs,
+        });
+      }
+    }
+
+    buildDirs.sort((a, b) => {
+      const numericDifference = Number(b.label) - Number(a.label);
+
+      if (!Number.isNaN(numericDifference) && numericDifference !== 0) {
+        return numericDifference;
+      }
+
+      return b.mtimeMs - a.mtimeMs;
+    });
+
+    if (buildDirs[0]) {
+      return {
+        type: 'build',
+        rootDir: buildDirs[0].rootDir,
+        buildKey: buildDirs[0].label,
+      };
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  return null;
+}
+
+async function resolveProjectFilePath(rootDir, requestPath) {
+  const relativePath = normalizeProjectFilePath(requestPath);
+
+  if (relativePath === null) {
+    return null;
+  }
+
+  if (isProjectFileSensitive(relativePath)) {
+    return {
+      blocked: true,
+      relativePath,
+    };
+  }
+
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedPath = path.resolve(resolvedRoot, relativePath);
+
+  if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+    return null;
+  }
+
+  let realRoot;
+  let realPath;
+
+  try {
+    realRoot = await fs.realpath(resolvedRoot);
+    realPath = await fs.realpath(resolvedPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return {
+        missing: true,
+        relativePath,
+        absolutePath: resolvedPath,
+      };
+    }
+
+    throw error;
+  }
+
+  if (realPath !== realRoot && !realPath.startsWith(`${realRoot}${path.sep}`)) {
+    return null;
+  }
+
+  return {
+    relativePath,
+    rootDir: realRoot,
+    absolutePath: realPath,
+  };
+}
+
+async function buildProjectFileTree(rootDir, currentDir = rootDir, counters = { entries: 0 }) {
+  const entries = await fs.readdir(currentDir, { withFileTypes: true });
+  const children = [];
+
+  entries.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) {
+      return a.isDirectory() ? -1 : 1;
+    }
+
+    return a.name.localeCompare(b.name);
+  });
+
+  for (const entry of entries) {
+    if (counters.entries >= MAX_PROJECT_FILE_TREE_ENTRIES) {
+      break;
+    }
+
+    const absolutePath = path.join(currentDir, entry.name);
+    const relativePath = path.relative(rootDir, absolutePath).split(path.sep).join('/');
+
+    if (
+      entry.isSymbolicLink() ||
+      isProjectFileSensitive(relativePath) ||
+      (entry.isDirectory() && PROJECT_FILE_TREE_IGNORED_DIRS.has(entry.name))
+    ) {
+      continue;
+    }
+
+    const stats = await fs.stat(absolutePath);
+    const item = getProjectFileMetadata(rootDir, absolutePath, stats, entry);
+
+    counters.entries += 1;
+
+    if (entry.isDirectory()) {
+      item.children = await buildProjectFileTree(rootDir, absolutePath, counters);
+    }
+
+    children.push(item);
+  }
+
+  return children;
+}
+
+function isLikelyTextBuffer(buffer) {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 8192));
+
+  return !sample.includes(0);
+}
+
 async function findReactViteRoot(extractDir) {
   if (await pathExists(path.join(extractDir, 'package.json'))) {
     return extractDir;
@@ -1105,6 +1446,161 @@ router.get('/projects', requireAdmin, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar projetos.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/files', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id).select('_id name title prompt status').lean();
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const fileRoot = await resolveProjectFileRoot(project._id);
+
+    if (!fileRoot) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const rootPath = await resolveProjectFilePath(fileRoot.rootDir, '');
+
+    if (!rootPath || rootPath.blocked || rootPath.missing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const stats = await fs.stat(rootPath.absolutePath);
+    const root = getProjectFileMetadata(rootPath.absolutePath, rootPath.absolutePath, stats);
+    const counters = { entries: 0 };
+
+    root.path = '';
+    root.name = project.title || project.name || project.prompt || String(project._id);
+    root.children = await buildProjectFileTree(rootPath.absolutePath, rootPath.absolutePath, counters);
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        title: project.title,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      source: {
+        type: fileRoot.type,
+        buildKey: fileRoot.buildKey,
+      },
+      limits: {
+        maxContentBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+        maxTreeEntries: MAX_PROJECT_FILE_TREE_ENTRIES,
+        treeTruncated: counters.entries >= MAX_PROJECT_FILE_TREE_ENTRIES,
+      },
+      root,
+      files: root.children,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao listar arquivos do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/projects/:id/files/content', requireAdmin, validateProjectId, async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id).select('_id name title prompt status').lean();
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const fileRoot = await resolveProjectFileRoot(project._id);
+
+    if (!fileRoot) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const resolvedFile = await resolveProjectFilePath(fileRoot.rootDir, req.query.path || '');
+
+    if (!resolvedFile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Path inválido.',
+      });
+    }
+
+    if (resolvedFile.blocked) {
+      return res.status(403).json({
+        success: false,
+        message: 'Arquivo bloqueado por política de segurança.',
+      });
+    }
+
+    if (resolvedFile.missing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivo não encontrado.',
+      });
+    }
+
+    const stats = await fs.stat(resolvedFile.absolutePath);
+
+    if (!stats.isFile()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Path informado não é um arquivo.',
+      });
+    }
+
+    if (stats.size > MAX_PROJECT_FILE_CONTENT_BYTES) {
+      return res.status(413).json({
+        success: false,
+        message: 'Arquivo excede o limite de tamanho para preview.',
+        maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+        size: stats.size,
+      });
+    }
+
+    const contentBuffer = await fs.readFile(resolvedFile.absolutePath);
+    const isText = isLikelyTextBuffer(contentBuffer);
+    const metadata = getProjectFileMetadata(
+      resolvedFile.rootDir,
+      resolvedFile.absolutePath,
+      stats
+    );
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        title: project.title,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      source: {
+        type: fileRoot.type,
+        buildKey: fileRoot.buildKey,
+      },
+      file: metadata,
+      encoding: isText ? 'utf8' : 'base64',
+      content: isText ? contentBuffer.toString('utf8') : contentBuffer.toString('base64'),
+      maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao ler arquivo do projeto.',
       error: error.message,
     });
   }
