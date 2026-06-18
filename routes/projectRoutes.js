@@ -14,9 +14,11 @@ const {
 const {
   MAX_PROJECT_FILE_CONTENT_BYTES,
   MAX_PROJECT_FILE_TREE_ENTRIES,
+  buildProjectArtifactFileTree,
   buildProjectFileTree,
   getProjectFileMetadata,
   isLikelyTextBuffer,
+  resolveProjectArtifactFile,
   resolveProjectFilePath,
   resolveProjectFileRoot,
 } = require('../utils/projectFiles');
@@ -1063,22 +1065,36 @@ router.get('/:id/files', authMiddleware, async (req, res) => {
       });
     }
 
-    const rootPath = await resolveProjectFilePath(fileRoot.rootDir, '');
-
-    if (!rootPath || rootPath.blocked || rootPath.missing) {
-      return res.status(404).json({
-        success: false,
-        message: 'Arquivos do projeto não encontrados.',
-      });
-    }
-
-    const stats = await fs.stat(rootPath.absolutePath);
-    const root = getProjectFileMetadata(rootPath.absolutePath, rootPath.absolutePath, stats);
     const counters = { entries: 0 };
+    let root;
 
-    root.path = '';
-    root.name = project.title || project.name || project.prompt || String(project._id);
-    root.children = await buildProjectFileTree(rootPath.absolutePath, rootPath.absolutePath, counters);
+    if (fileRoot.type === 'artifact') {
+      root = {
+        path: '',
+        name: project.title || project.name || project.prompt || String(project._id),
+        type: 'folder',
+        size: 0,
+        ext: '',
+        language: '',
+        children: buildProjectArtifactFileTree(fileRoot.artifactFiles, counters),
+      };
+    } else {
+      const rootPath = await resolveProjectFilePath(fileRoot.rootDir, '');
+
+      if (!rootPath || rootPath.blocked || rootPath.missing) {
+        return res.status(404).json({
+          success: false,
+          message: 'Arquivos do projeto não encontrados.',
+        });
+      }
+
+      const stats = await fs.stat(rootPath.absolutePath);
+      root = getProjectFileMetadata(rootPath.absolutePath, rootPath.absolutePath, stats);
+
+      root.path = '';
+      root.name = project.title || project.name || project.prompt || String(project._id);
+      root.children = await buildProjectFileTree(rootPath.absolutePath, rootPath.absolutePath, counters);
+    }
 
     return res.json({
       success: true,
@@ -1092,6 +1108,7 @@ router.get('/:id/files', authMiddleware, async (req, res) => {
       source: {
         type: fileRoot.type,
         buildKey: fileRoot.buildKey,
+        buildId: fileRoot.buildId,
       },
       limits: {
         maxContentBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
@@ -1133,54 +1150,95 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
       });
     }
 
-    const resolvedFile = await resolveProjectFilePath(fileRoot.rootDir, req.query.path || '');
+    let metadata;
+    let contentBuffer;
 
-    if (!resolvedFile) {
-      return res.status(400).json({
-        success: false,
-        message: 'Path inválido.',
-      });
+    if (fileRoot.type === 'artifact') {
+      const resolvedFile = resolveProjectArtifactFile(fileRoot, req.query.path || '');
+
+      if (!resolvedFile) {
+        return res.status(400).json({
+          success: false,
+          message: 'Path inválido.',
+        });
+      }
+
+      if (resolvedFile.blocked) {
+        return res.status(403).json({
+          success: false,
+          message: 'Arquivo bloqueado por política de segurança.',
+        });
+      }
+
+      if (resolvedFile.missing) {
+        return res.status(404).json({
+          success: false,
+          message: 'Arquivo não encontrado.',
+        });
+      }
+
+      if (resolvedFile.contentBuffer.length > MAX_PROJECT_FILE_CONTENT_BYTES) {
+        return res.status(413).json({
+          success: false,
+          message: 'Arquivo excede o limite de tamanho para preview.',
+          maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+          size: resolvedFile.contentBuffer.length,
+        });
+      }
+
+      metadata = resolvedFile.metadata;
+      contentBuffer = resolvedFile.contentBuffer;
+    } else {
+      const resolvedFile = await resolveProjectFilePath(fileRoot.rootDir, req.query.path || '');
+
+      if (!resolvedFile) {
+        return res.status(400).json({
+          success: false,
+          message: 'Path inválido.',
+        });
+      }
+
+      if (resolvedFile.blocked) {
+        return res.status(403).json({
+          success: false,
+          message: 'Arquivo bloqueado por política de segurança.',
+        });
+      }
+
+      if (resolvedFile.missing) {
+        return res.status(404).json({
+          success: false,
+          message: 'Arquivo não encontrado.',
+        });
+      }
+
+      const stats = await fs.stat(resolvedFile.absolutePath);
+
+      if (!stats.isFile()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Path informado não é um arquivo.',
+        });
+      }
+
+      if (stats.size > MAX_PROJECT_FILE_CONTENT_BYTES) {
+        return res.status(413).json({
+          success: false,
+          message: 'Arquivo excede o limite de tamanho para preview.',
+          maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+          size: stats.size,
+        });
+      }
+
+      contentBuffer = await fs.readFile(resolvedFile.absolutePath);
+      metadata = getProjectFileMetadata(
+        resolvedFile.rootDir,
+        resolvedFile.absolutePath,
+        stats
+      );
     }
 
-    if (resolvedFile.blocked) {
-      return res.status(403).json({
-        success: false,
-        message: 'Arquivo bloqueado por política de segurança.',
-      });
-    }
-
-    if (resolvedFile.missing) {
-      return res.status(404).json({
-        success: false,
-        message: 'Arquivo não encontrado.',
-      });
-    }
-
-    const stats = await fs.stat(resolvedFile.absolutePath);
-
-    if (!stats.isFile()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Path informado não é um arquivo.',
-      });
-    }
-
-    if (stats.size > MAX_PROJECT_FILE_CONTENT_BYTES) {
-      return res.status(413).json({
-        success: false,
-        message: 'Arquivo excede o limite de tamanho para preview.',
-        maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
-        size: stats.size,
-      });
-    }
-
-    const contentBuffer = await fs.readFile(resolvedFile.absolutePath);
     const isText = isLikelyTextBuffer(contentBuffer);
-    const metadata = getProjectFileMetadata(
-      resolvedFile.rootDir,
-      resolvedFile.absolutePath,
-      stats
-    );
 
     return res.json({
       success: true,
@@ -1194,6 +1252,7 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
       source: {
         type: fileRoot.type,
         buildKey: fileRoot.buildKey,
+        buildId: fileRoot.buildId,
       },
       file: metadata,
       encoding: isText ? 'utf8' : 'base64',

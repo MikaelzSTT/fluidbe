@@ -153,6 +153,87 @@ function getProjectFileMetadata(rootDir, absolutePath, stats, dirent = null) {
   };
 }
 
+function getProjectArtifactFileMetadata(relativePath, size, isDirectory = false) {
+  const name = relativePath ? path.posix.basename(relativePath) : '';
+  const ext = isDirectory ? '' : path.extname(name).toLowerCase();
+
+  return {
+    path: relativePath,
+    name,
+    type: isDirectory ? 'folder' : 'file',
+    size: isDirectory ? 0 : size,
+    ext,
+    language: PROJECT_FILE_LANGUAGE_BY_EXT[ext] || ext.replace(/^\./, '') || '',
+  };
+}
+
+function decodeProjectArtifactContent(artifactFile) {
+  return Buffer.from(String(artifactFile.content || ''), 'base64');
+}
+
+function normalizeProjectArtifactFiles(artifactFiles = []) {
+  const seenPaths = new Set();
+  const normalizedFiles = [];
+
+  for (const artifactFile of artifactFiles) {
+    if (!artifactFile || typeof artifactFile.content !== 'string') {
+      continue;
+    }
+
+    const relativePath = normalizeProjectFilePath(
+      artifactFile.relativePath || artifactFile.path || ''
+    );
+
+    if (
+      !relativePath ||
+      seenPaths.has(relativePath) ||
+      isProjectFileSensitive(relativePath)
+    ) {
+      continue;
+    }
+
+    const contentBuffer = decodeProjectArtifactContent(artifactFile);
+
+    normalizedFiles.push({
+      ...artifactFile,
+      relativePath,
+      path: relativePath,
+      size: contentBuffer.length,
+    });
+    seenPaths.add(relativePath);
+  }
+
+  normalizedFiles.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return normalizedFiles;
+}
+
+async function findLatestProjectArtifactBuild(projectId) {
+  const latestBuild = await ProjectBuild.findOne({
+    projectId,
+    'artifactFiles.0': { $exists: true },
+  }).sort({
+    createdAt: -1,
+    updatedAt: -1,
+  }).lean();
+
+  if (!latestBuild) {
+    return null;
+  }
+
+  const artifactFiles = normalizeProjectArtifactFiles(latestBuild.artifactFiles);
+
+  if (!artifactFiles.length) {
+    return null;
+  }
+
+  return {
+    type: 'artifact',
+    buildId: String(latestBuild._id),
+    buildKey: String(latestBuild._id),
+    artifactFiles,
+  };
+}
+
 async function resolveProjectFileRoot(projectId) {
   const projectStorageDir = path.join(REACT_VITE_STORAGE_DIR, String(projectId));
 
@@ -289,7 +370,7 @@ async function resolveProjectFileRoot(projectId) {
     }
   }
 
-  return null;
+  return findLatestProjectArtifactBuild(projectId);
 }
 
 async function resolveProjectFilePath(rootDir, requestPath) {
@@ -385,6 +466,114 @@ async function buildProjectFileTree(rootDir, currentDir = rootDir, counters = { 
   return children;
 }
 
+function buildProjectArtifactFileTree(artifactFiles = [], counters = { entries: 0 }) {
+  const root = { children: new Map() };
+
+  for (const artifactFile of artifactFiles) {
+    if (counters.entries >= MAX_PROJECT_FILE_TREE_ENTRIES) {
+      break;
+    }
+
+    const relativePath = normalizeProjectFilePath(artifactFile.relativePath || artifactFile.path || '');
+
+    if (!relativePath || isProjectFileSensitive(relativePath)) {
+      continue;
+    }
+
+    const segments = relativePath.split('/').filter(Boolean);
+    let current = root;
+    let currentPath = '';
+
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      const isFile = index === segments.length - 1;
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+
+      if (!current.children.has(segment)) {
+        if (counters.entries >= MAX_PROJECT_FILE_TREE_ENTRIES) {
+          break;
+        }
+
+        const item = isFile
+          ? getProjectArtifactFileMetadata(currentPath, artifactFile.size || 0, false)
+          : {
+              ...getProjectArtifactFileMetadata(currentPath, 0, true),
+              children: new Map(),
+            };
+
+        current.children.set(segment, item);
+        counters.entries += 1;
+      }
+
+      const child = current.children.get(segment);
+
+      if (isFile || child.type !== 'folder') {
+        break;
+      }
+
+      current = child;
+    }
+  }
+
+  function toSortedChildren(childrenMap) {
+    return Array.from(childrenMap.values())
+      .sort((a, b) => {
+        if (a.type !== b.type) {
+          return a.type === 'folder' ? -1 : 1;
+        }
+
+        return a.name.localeCompare(b.name);
+      })
+      .map((item) => {
+        if (item.type !== 'folder') {
+          return item;
+        }
+
+        return {
+          ...item,
+          children: toSortedChildren(item.children),
+        };
+      });
+  }
+
+  return toSortedChildren(root.children);
+}
+
+function resolveProjectArtifactFile(fileRoot, requestPath) {
+  const relativePath = normalizeProjectFilePath(requestPath);
+
+  if (relativePath === null) {
+    return null;
+  }
+
+  if (!relativePath || isProjectFileSensitive(relativePath)) {
+    return {
+      blocked: Boolean(relativePath && isProjectFileSensitive(relativePath)),
+      missing: !relativePath,
+      relativePath,
+    };
+  }
+
+  const artifactFile = (fileRoot.artifactFiles || []).find((file) => (
+    file.relativePath === relativePath || file.path === relativePath
+  ));
+
+  if (!artifactFile) {
+    return {
+      missing: true,
+      relativePath,
+    };
+  }
+
+  const contentBuffer = decodeProjectArtifactContent(artifactFile);
+
+  return {
+    relativePath,
+    contentBuffer,
+    metadata: getProjectArtifactFileMetadata(relativePath, contentBuffer.length, false),
+  };
+}
+
 function isLikelyTextBuffer(buffer) {
   const sample = buffer.subarray(0, Math.min(buffer.length, 8192));
 
@@ -394,10 +583,12 @@ function isLikelyTextBuffer(buffer) {
 module.exports = {
   MAX_PROJECT_FILE_CONTENT_BYTES,
   MAX_PROJECT_FILE_TREE_ENTRIES,
+  buildProjectArtifactFileTree,
   buildProjectFileTree,
   getProjectFileMetadata,
   isLikelyTextBuffer,
   parsePublicBuildUrl,
+  resolveProjectArtifactFile,
   resolveProjectFilePath,
   resolveProjectFileRoot,
 };
