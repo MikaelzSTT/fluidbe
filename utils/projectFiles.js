@@ -42,6 +42,27 @@ async function pathExists(targetPath) {
   }
 }
 
+async function findProjectSourceRoot(sourceDir) {
+  if (await pathExists(path.join(sourceDir, 'package.json'))) {
+    return sourceDir;
+  }
+
+  const entries = await fs.readdir(sourceDir, { withFileTypes: true });
+  const directories = entries
+    .filter((entry) => entry.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const directory of directories) {
+    const nestedRoot = path.join(sourceDir, directory.name);
+
+    if (await pathExists(path.join(nestedRoot, 'package.json'))) {
+      return nestedRoot;
+    }
+  }
+
+  return sourceDir;
+}
+
 function parsePublicBuildUrl(buildUrl) {
   if (typeof buildUrl !== 'string') {
     return null;
@@ -234,6 +255,40 @@ async function findLatestProjectArtifactBuild(projectId) {
   };
 }
 
+async function findLatestProjectSourceArtifactBuild(projectId) {
+  const latestBuild = await ProjectBuild.findOne({
+    projectId,
+    $or: [
+      { 'sourceFiles.0': { $exists: true } },
+      { 'artifactFilesSource.0': { $exists: true } },
+    ],
+  }).sort({
+    createdAt: -1,
+    updatedAt: -1,
+  }).lean();
+
+  if (!latestBuild) {
+    return null;
+  }
+
+  const artifactFiles = normalizeProjectArtifactFiles(
+    latestBuild.sourceFiles && latestBuild.sourceFiles.length
+      ? latestBuild.sourceFiles
+      : latestBuild.artifactFilesSource
+  );
+
+  if (!artifactFiles.length) {
+    return null;
+  }
+
+  return {
+    type: 'sourceArtifact',
+    buildId: String(latestBuild._id),
+    buildKey: String(latestBuild._id),
+    artifactFiles,
+  };
+}
+
 async function resolveProjectFileRoot(projectId) {
   const projectStorageDir = path.join(REACT_VITE_STORAGE_DIR, String(projectId));
 
@@ -252,11 +307,12 @@ async function resolveProjectFileRoot(projectId) {
         continue;
       }
 
-      const stats = await fs.stat(sourceDir);
+      const rootDir = await findProjectSourceRoot(sourceDir);
+      const stats = await fs.stat(rootDir);
 
       if (stats.isDirectory()) {
         sourceDirs.push({
-          rootDir: sourceDir,
+          rootDir,
           label: entry.name,
           mtimeMs: stats.mtimeMs,
         });
@@ -284,6 +340,12 @@ async function resolveProjectFileRoot(projectId) {
     if (error.code !== 'ENOENT') {
       throw error;
     }
+  }
+
+  const sourceArtifactRoot = await findLatestProjectSourceArtifactBuild(projectId);
+
+  if (sourceArtifactRoot) {
+    return sourceArtifactRoot;
   }
 
   const latestBuild = await ProjectBuild.findOne({

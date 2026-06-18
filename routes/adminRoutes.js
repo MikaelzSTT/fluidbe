@@ -31,6 +31,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
 const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 8 * 1024 * 1024);
+const MAX_MONGO_SOURCE_BYTES = Number(process.env.MAX_MONGO_SOURCE_BYTES || 3 * 1024 * 1024);
 const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
 const MAX_PROJECT_FILE_TREE_ENTRIES = Number(process.env.MAX_PROJECT_FILE_TREE_ENTRIES || 5000);
 
@@ -53,6 +54,8 @@ const BUILD_FIELDS = [
   'deployUrl',
   'sourceZipUrl',
   'artifactFiles',
+  'sourceFiles',
+  'artifactFilesSource',
   'logs',
 ];
 const CONNECTOR_STATUSES = ['pending', 'connected', 'skipped', 'error'];
@@ -73,6 +76,15 @@ const PROJECT_FILE_TREE_IGNORED_DIRS = new Set([
   '.next',
   '.turbo',
   'coverage',
+  'node_modules',
+]);
+const SOURCE_SNAPSHOT_IGNORED_DIRS = new Set([
+  '.git',
+  '.next',
+  '.turbo',
+  'build',
+  'coverage',
+  'dist',
   'node_modules',
 ]);
 const PROJECT_FILE_LANGUAGE_BY_EXT = {
@@ -537,6 +549,123 @@ async function collectBuildArtifactFiles(distDir) {
   };
 }
 
+async function collectProjectSourceFiles(sourceDir) {
+  const sourceRoot = path.resolve(sourceDir);
+  const realSourceRoot = await fs.realpath(sourceRoot);
+  const candidates = [];
+  const files = [];
+  let totalBytes = 0;
+
+  async function discover(currentDir) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDir, entry.name);
+      const absolutePath = path.resolve(entryPath);
+
+      if (absolutePath !== sourceRoot && !absolutePath.startsWith(`${sourceRoot}${path.sep}`)) {
+        continue;
+      }
+
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
+
+      const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join('/');
+
+      if (isProjectFileSensitive(relativePath)) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        if (SOURCE_SNAPSHOT_IGNORED_DIRS.has(entry.name)) {
+          continue;
+        }
+
+        await discover(absolutePath);
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      const realPath = await fs.realpath(absolutePath);
+      if (realPath !== realSourceRoot && !realPath.startsWith(`${realSourceRoot}${path.sep}`)) {
+        continue;
+      }
+
+      const stats = await fs.stat(absolutePath);
+      candidates.push({
+        absolutePath,
+        relativePath,
+        size: stats.size,
+      });
+    }
+  }
+
+  await discover(sourceRoot);
+
+  const priorityFor = (relativePath) => {
+    const basename = path.posix.basename(relativePath).toLowerCase();
+    const topLevel = relativePath.split('/')[0];
+    const ext = path.extname(relativePath).toLowerCase();
+
+    if (relativePath === 'package.json' || basename.startsWith('vite.config')) {
+      return 0;
+    }
+
+    if (basename.startsWith('tsconfig') || relativePath === 'index.html') {
+      return 1;
+    }
+
+    if (topLevel === 'src' || topLevel === 'components' || topLevel === 'routes') {
+      return 2;
+    }
+
+    if (['.ts', '.tsx', '.js', '.jsx', '.css', '.scss', '.json', '.html', '.md'].includes(ext)) {
+      return 3;
+    }
+
+    return 4;
+  };
+
+  candidates.sort((a, b) => {
+    const priorityDifference = priorityFor(a.relativePath) - priorityFor(b.relativePath);
+
+    if (priorityDifference !== 0) {
+      return priorityDifference;
+    }
+
+    return a.relativePath.localeCompare(b.relativePath);
+  });
+
+  for (const candidate of candidates) {
+    if (totalBytes + candidate.size > MAX_MONGO_SOURCE_BYTES) {
+      continue;
+    }
+
+    const content = await fs.readFile(candidate.absolutePath);
+    const mimeType = getContentType(candidate.relativePath);
+    totalBytes += candidate.size;
+    files.push({
+      relativePath: candidate.relativePath,
+      path: candidate.relativePath,
+      mimeType,
+      contentType: mimeType,
+      encoding: 'base64',
+      content: content.toString('base64'),
+    });
+  }
+
+  return {
+    files,
+    complete: files.length === candidates.length,
+    totalBytes,
+    skippedFiles: Math.max(candidates.length - files.length, 0),
+  };
+}
+
 async function loadProject(req, res, next) {
   try {
     const project = await Project.findById(req.params.id);
@@ -728,11 +857,12 @@ async function resolveProjectFileRoot(projectId) {
         continue;
       }
 
-      const stats = await fs.stat(sourceDir);
+      const rootDir = await findReactViteRoot(sourceDir);
+      const stats = await fs.stat(rootDir);
 
       if (stats.isDirectory()) {
         sourceDirs.push({
-          rootDir: sourceDir,
+          rootDir,
           label: entry.name,
           mtimeMs: stats.mtimeMs,
         });
@@ -760,6 +890,12 @@ async function resolveProjectFileRoot(projectId) {
     if (error.code !== 'ENOENT') {
       throw error;
     }
+  }
+
+  const sourceArtifactRoot = await resolveSharedProjectFileRoot(projectId);
+
+  if (sourceArtifactRoot && sourceArtifactRoot.type === 'sourceArtifact') {
+    return sourceArtifactRoot;
   }
 
   const latestBuild = await ProjectBuild.findOne({
@@ -1477,7 +1613,7 @@ router.get('/projects/:id/files', requireAdmin, validateProjectId, async (req, r
     const counters = { entries: 0 };
     let root;
 
-    if (fileRoot.type === 'artifact') {
+    if (fileRoot.type === 'artifact' || fileRoot.type === 'sourceArtifact') {
       root = {
         path: '',
         name: project.title || project.name || project.prompt || String(project._id),
@@ -1555,7 +1691,7 @@ router.get('/projects/:id/files/content', requireAdmin, validateProjectId, async
     let metadata;
     let contentBuffer;
 
-    if (fileRoot.type === 'artifact') {
+    if (fileRoot.type === 'artifact' || fileRoot.type === 'sourceArtifact') {
       const resolvedFile = resolveProjectArtifactFile(fileRoot, req.query.path || '');
 
       if (!resolvedFile) {
@@ -1975,9 +2111,14 @@ router.post(
       const distIndexPath = path.join(distDir, 'index.html');
       const fullHtml = await fs.readFile(distIndexPath, 'utf8');
       const artifactSnapshot = await collectBuildArtifactFiles(distDir);
+      const sourceSnapshot = await collectProjectSourceFiles(appRoot);
 
       if (!artifactSnapshot.complete) {
         logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
+      }
+
+      if (!sourceSnapshot.complete) {
+        logs += `\nAviso: source excedeu ${MAX_MONGO_SOURCE_BYTES} bytes; ${sourceSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
       }
 
       const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
@@ -1995,6 +2136,7 @@ router.post(
         deployUrl: previewUrl,
         fullHtml,
         artifactFiles: artifactSnapshot.files,
+        sourceFiles: sourceSnapshot.files,
         sourceZipUrl: '',
         logs: [logs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
       });

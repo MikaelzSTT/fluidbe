@@ -1068,7 +1068,7 @@ router.get('/:id/files', authMiddleware, async (req, res) => {
     const counters = { entries: 0 };
     let root;
 
-    if (fileRoot.type === 'artifact') {
+    if (fileRoot.type === 'artifact' || fileRoot.type === 'sourceArtifact') {
       root = {
         path: '',
         name: project.title || project.name || project.prompt || String(project._id),
@@ -1153,7 +1153,7 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
     let metadata;
     let contentBuffer;
 
-    if (fileRoot.type === 'artifact') {
+    if (fileRoot.type === 'artifact' || fileRoot.type === 'sourceArtifact') {
       const resolvedFile = resolveProjectArtifactFile(fileRoot, req.query.path || '');
 
       if (!resolvedFile) {
