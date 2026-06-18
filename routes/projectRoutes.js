@@ -1,4 +1,5 @@
 const express = require('express');
+const fs = require('fs/promises');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
@@ -10,6 +11,15 @@ const {
   encryptConnectorValue,
   getConnectorEncryptionKey,
 } = require('../utils/connectorSecrets');
+const {
+  MAX_PROJECT_FILE_CONTENT_BYTES,
+  MAX_PROJECT_FILE_TREE_ENTRIES,
+  buildProjectFileTree,
+  getProjectFileMetadata,
+  isLikelyTextBuffer,
+  resolveProjectFilePath,
+  resolveProjectFileRoot,
+} = require('../utils/projectFiles');
 
 const router = express.Router();
 const CONNECTOR_VALIDATION_FAILURE_MESSAGE = 'Não foi possível validar este conector. Confira a credencial.';
@@ -1024,6 +1034,175 @@ router.get('/:id/messages', authMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro ao buscar mensagens do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/:id/files', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.id,
+      userId: req.userId,
+    }).select('_id name title prompt status').lean();
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const fileRoot = await resolveProjectFileRoot(project._id);
+
+    if (!fileRoot) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const rootPath = await resolveProjectFilePath(fileRoot.rootDir, '');
+
+    if (!rootPath || rootPath.blocked || rootPath.missing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const stats = await fs.stat(rootPath.absolutePath);
+    const root = getProjectFileMetadata(rootPath.absolutePath, rootPath.absolutePath, stats);
+    const counters = { entries: 0 };
+
+    root.path = '';
+    root.name = project.title || project.name || project.prompt || String(project._id);
+    root.children = await buildProjectFileTree(rootPath.absolutePath, rootPath.absolutePath, counters);
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        title: project.title,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      source: {
+        type: fileRoot.type,
+        buildKey: fileRoot.buildKey,
+      },
+      limits: {
+        maxContentBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+        maxTreeEntries: MAX_PROJECT_FILE_TREE_ENTRIES,
+        treeTruncated: counters.entries >= MAX_PROJECT_FILE_TREE_ENTRIES,
+      },
+      root,
+      files: root.children,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao listar arquivos do projeto.',
+      error: error.message,
+    });
+  }
+});
+
+router.get('/:id/files/content', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const project = await Project.findOne({
+      _id: req.params.id,
+      userId: req.userId,
+    }).select('_id name title prompt status').lean();
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const fileRoot = await resolveProjectFileRoot(project._id);
+
+    if (!fileRoot) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivos do projeto não encontrados.',
+      });
+    }
+
+    const resolvedFile = await resolveProjectFilePath(fileRoot.rootDir, req.query.path || '');
+
+    if (!resolvedFile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Path inválido.',
+      });
+    }
+
+    if (resolvedFile.blocked) {
+      return res.status(403).json({
+        success: false,
+        message: 'Arquivo bloqueado por política de segurança.',
+      });
+    }
+
+    if (resolvedFile.missing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Arquivo não encontrado.',
+      });
+    }
+
+    const stats = await fs.stat(resolvedFile.absolutePath);
+
+    if (!stats.isFile()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Path informado não é um arquivo.',
+      });
+    }
+
+    if (stats.size > MAX_PROJECT_FILE_CONTENT_BYTES) {
+      return res.status(413).json({
+        success: false,
+        message: 'Arquivo excede o limite de tamanho para preview.',
+        maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+        size: stats.size,
+      });
+    }
+
+    const contentBuffer = await fs.readFile(resolvedFile.absolutePath);
+    const isText = isLikelyTextBuffer(contentBuffer);
+    const metadata = getProjectFileMetadata(
+      resolvedFile.rootDir,
+      resolvedFile.absolutePath,
+      stats
+    );
+
+    return res.json({
+      success: true,
+      project: {
+        id: String(project._id),
+        name: project.name,
+        title: project.title,
+        prompt: project.prompt,
+        status: project.status,
+      },
+      source: {
+        type: fileRoot.type,
+        buildKey: fileRoot.buildKey,
+      },
+      file: metadata,
+      encoding: isText ? 'utf8' : 'base64',
+      content: isText ? contentBuffer.toString('utf8') : contentBuffer.toString('base64'),
+      maxBytes: MAX_PROJECT_FILE_CONTENT_BYTES,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro ao ler arquivo do projeto.',
       error: error.message,
     });
   }
