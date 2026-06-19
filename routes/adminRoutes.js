@@ -87,6 +87,33 @@ const SOURCE_SNAPSHOT_IGNORED_DIRS = new Set([
   'dist',
   'node_modules',
 ]);
+const SUBPROCESS_ENV_ALLOWLIST = new Set([
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'NODE_ENV',
+  'CI',
+  'NPM_CONFIG_CACHE',
+  'npm_config_cache',
+  'NPM_CONFIG_PRODUCTION',
+  'npm_config_production',
+]);
+const SENSITIVE_ENV_NAME_PATTERN =
+  /(SECRET|TOKEN|PASSWORD|PASS|PRIVATE|KEY|CREDENTIAL|MONGODB|MONGO|DATABASE_URL|DB_URL|OPENAI|STRIPE|JWT|CONNECTOR|RESEND|TWILIO|SHOPIFY|AUTH)/i;
+const TOKEN_REDACTION_PATTERNS = Object.freeze([
+  /\bsk_(?:test|live)_[A-Za-z0-9_]{8,}\b/g,
+  /\bsk-[A-Za-z0-9_-]{12,}\b/g,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/g,
+  /\bre_[A-Za-z0-9_-]{8,}\b/g,
+  /\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi,
+  /\bmongodb(?:\+srv)?:\/\/[^\s'"<>]+/gi,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+]);
 const PROJECT_FILE_LANGUAGE_BY_EXT = {
   '.css': 'css',
   '.csv': 'csv',
@@ -1133,42 +1160,38 @@ async function validateReactViteProject(appRoot) {
 }
 
 async function runNpmCommand(args, cwd, options = {}) {
+  const redactionValues = getCommandRedactionValues(options);
+
   try {
     const result = await execFileAsync('npm', args, {
       cwd,
-      env: {
-        ...process.env,
-        ...options.env,
-        CI: 'true',
-      },
+      env: buildSubprocessEnv(options),
       maxBuffer: 20 * 1024 * 1024,
       timeout: 15 * 60 * 1000,
     });
 
-    return [result.stdout, result.stderr].filter(Boolean).join('\n');
+    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
     const logs = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
-    throw new Error(logs || `npm ${args.join(' ')} falhou.`);
+    throw new Error(redactBuildLogs(logs || `npm ${args.join(' ')} falhou.`, redactionValues));
   }
 }
 
 async function runNpxCommand(args, cwd, options = {}) {
+  const redactionValues = getCommandRedactionValues(options);
+
   try {
     const result = await execFileAsync('npx', args, {
       cwd,
-      env: {
-        ...process.env,
-        ...options.env,
-        CI: 'true',
-      },
+      env: buildSubprocessEnv(options),
       maxBuffer: 20 * 1024 * 1024,
       timeout: 15 * 60 * 1000,
     });
 
-    return [result.stdout, result.stderr].filter(Boolean).join('\n');
+    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
     const logs = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
-    throw new Error(logs || `npx ${args.join(' ')} falhou.`);
+    throw new Error(redactBuildLogs(logs || `npx ${args.join(' ')} falhou.`, redactionValues));
   }
 }
 
@@ -1224,33 +1247,110 @@ function formatConnectorInjectionLog(resolution) {
   ].join('\n');
 }
 
-async function runViteBuildWithoutTypecheck(appRoot) {
-  return runNpxCommand(['vite', 'build'], appRoot);
+function collectSensitiveProcessEnvValues() {
+  return Object.entries(process.env)
+    .filter(([name, value]) => SENSITIVE_ENV_NAME_PATTERN.test(name) && typeof value === 'string')
+    .map(([, value]) => value)
+    .filter((value) => value.length >= 6);
 }
 
-async function runFallbackViteBuild(appRoot, precedingLogs = '') {
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function redactKnownValues(text, values) {
+  return (Array.isArray(values) ? values : []).reduce((redacted, value) => {
+    if (typeof value !== 'string' || value.length < 6) {
+      return redacted;
+    }
+
+    return redacted.replace(new RegExp(escapeRegExp(value), 'g'), '[REDACTED]');
+  }, String(text || ''));
+}
+
+function redactBuildLogs(logs, extraSensitiveValues = []) {
+  let redacted = redactKnownValues(logs, [
+    ...collectSensitiveProcessEnvValues(),
+    ...extraSensitiveValues,
+  ]);
+
+  TOKEN_REDACTION_PATTERNS.forEach((pattern) => {
+    redacted = redacted.replace(pattern, (match) => {
+      if (/^Bearer\s+/i.test(match)) {
+        return 'Bearer [REDACTED]';
+      }
+
+      if (/^mongodb/i.test(match)) {
+        return 'mongodb://[REDACTED]';
+      }
+
+      return '[REDACTED]';
+    });
+  });
+
+  return redacted;
+}
+
+function buildSubprocessEnv(options = {}) {
+  const env = {};
+
+  SUBPROCESS_ENV_ALLOWLIST.forEach((name) => {
+    if (typeof process.env[name] === 'string') {
+      env[name] = process.env[name];
+    }
+  });
+
+  Object.entries(options.env || {}).forEach(([name, value]) => {
+    if (SUBPROCESS_ENV_ALLOWLIST.has(name) && value !== undefined && value !== null) {
+      env[name] = String(value);
+    }
+  });
+
+  Object.entries(options.frontendEnv || {}).forEach(([name, value]) => {
+    if (/^VITE_[A-Za-z0-9_]+$/.test(name) && value !== undefined && value !== null) {
+      env[name] = String(value);
+    }
+  });
+
+  env.CI = 'true';
+
+  return env;
+}
+
+function getCommandRedactionValues(options = {}) {
+  return Object.values(options.frontendEnv || {})
+    .filter((value) => typeof value === 'string' && value.length >= 6);
+}
+
+async function runViteBuildWithoutTypecheck(appRoot, options = {}) {
+  return runNpxCommand(['vite', 'build'], appRoot, options);
+}
+
+async function runFallbackViteBuild(appRoot, precedingLogs = '', options = {}) {
   const fallbackLog = [precedingLogs, 'Fallback aplicado: npx vite build sem typecheck.']
     .filter(Boolean)
     .join('\n');
 
   try {
-    return [fallbackLog, await runViteBuildWithoutTypecheck(appRoot)].filter(Boolean).join('\n');
+    return [fallbackLog, await runViteBuildWithoutTypecheck(appRoot, options)]
+      .filter(Boolean)
+      .join('\n');
   } catch (error) {
     throw new Error([fallbackLog, error.message].filter(Boolean).join('\n'));
   }
 }
 
-async function runReactViteBuild(appRoot) {
+async function runReactViteBuild(appRoot, options = {}) {
   const packageJson = await readPackageJson(appRoot);
 
   try {
-    return await runNpmCommand(['run', 'build'], appRoot);
+    return await runNpmCommand(['run', 'build'], appRoot, options);
   } catch (error) {
     if (!buildScriptContainsTscBuild(packageJson) && !looksLikeTypecheckFailure(error.message)) {
       throw error;
     }
 
-    return runFallbackViteBuild(appRoot, error.message);
+    return runFallbackViteBuild(appRoot, error.message, options);
   }
 }
 
@@ -2021,6 +2121,7 @@ router.post(
     const sourceZipPath = req.file.path;
     const extractDir = path.join(buildDir, 'source');
     let logs = '';
+    let temporaryFrontendEnvRedactionValues = [];
     let connectorInjection = {
       requiredEnvVars: [],
       frontendEnvVars: [],
@@ -2058,6 +2159,7 @@ router.post(
         projectDir: appRoot,
         injectionPlan: connectorInjection.injectionPlan,
       });
+      temporaryFrontendEnvRedactionValues = Object.values(temporaryFrontendEnv.envValues || {});
 
       if (temporaryFrontendEnv.injectedEnvVars.length > 0) {
         logs += `Frontend env vars injected: ${temporaryFrontendEnv.injectedEnvVars.join(', ')}\n`;
@@ -2093,7 +2195,9 @@ router.post(
           logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
         }
 
-        logs += await runReactViteBuild(appRoot);
+        logs += await runReactViteBuild(appRoot, {
+          frontendEnv: temporaryFrontendEnv.envValues,
+        });
       } finally {
         await temporaryFrontendEnv.cleanup();
       }
@@ -2126,6 +2230,7 @@ router.post(
       await fs.cp(distDir, publicBuildDir, { recursive: true });
 
       const previewUrl = `/builds/${project._id}/${timestamp}/index.html`;
+      const redactedLogs = redactBuildLogs(logs, temporaryFrontendEnvRedactionValues);
       const build = await ProjectBuild.create({
         projectId: project._id,
         type: 'react_vite',
@@ -2138,7 +2243,7 @@ router.post(
         artifactFiles: artifactSnapshot.files,
         sourceFiles: sourceSnapshot.files,
         sourceZipUrl: '',
-        logs: [logs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
+        logs: [redactedLogs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
       });
 
       await Project.findByIdAndUpdate(
@@ -2162,7 +2267,10 @@ router.post(
         connectorInjection,
       });
     } catch (error) {
-      const errorLogs = [logs, error.message].filter(Boolean).join('\n');
+      const errorLogs = redactBuildLogs(
+        [logs, error.message].filter(Boolean).join('\n'),
+        temporaryFrontendEnvRedactionValues
+      );
       const build = await ProjectBuild.create({
         projectId: project._id,
         type: 'react_vite',
@@ -2175,7 +2283,7 @@ router.post(
         message: 'Erro ao gerar build React/Vite.',
         build,
         connectorInjection,
-        error: error.message,
+        error: redactBuildLogs(error.message, temporaryFrontendEnvRedactionValues),
       });
     }
   }

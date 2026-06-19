@@ -420,6 +420,7 @@ async function createTemporaryFrontendEnv({ projectId, projectDir, injectionPlan
   if (injectableEnvVars.length === 0) {
     return {
       injectedEnvVars: [],
+      envValues: {},
       cleanup: async () => {},
     };
   }
@@ -429,6 +430,7 @@ async function createTemporaryFrontendEnv({ projectId, projectDir, injectionPlan
   if (!encryptionKey) {
     return {
       injectedEnvVars: [],
+      envValues: {},
       cleanup: async () => {},
     };
   }
@@ -478,6 +480,7 @@ async function createTemporaryFrontendEnv({ projectId, projectDir, injectionPlan
   if (injectedEnvVars.length === 0) {
     return {
       injectedEnvVars: [],
+      envValues: {},
       cleanup: async () => {},
     };
   }
@@ -496,6 +499,10 @@ async function createTemporaryFrontendEnv({ projectId, projectDir, injectionPlan
 
   return {
     injectedEnvVars,
+    envValues: injectedEnvVars.reduce((envValues, envVar) => {
+      envValues[envVar] = valuesByEnvVar.get(envVar);
+      return envValues;
+    }, {}),
     cleanup: async () => {
       if (cleaned) {
         return;
