@@ -114,6 +114,11 @@ const TOKEN_REDACTION_PATTERNS = Object.freeze([
   /\bmongodb(?:\+srv)?:\/\/[^\s'"<>]+/gi,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
 ]);
+const INTERNAL_BUILD_PATH_PATTERN = /(?:\/opt\/render|\/tmp)(?:\/[^\s'"`:,)\]}]*)*/g;
+const BUILD_ENV_LOG_KEY_PATTERN = /\b(?:PATH|HOME|PWD|INIT_CWD|npm_package_json|npm_config_local_prefix|npm_config_userconfig)\b/i;
+const ENV_DUMP_LINE_KEY_PATTERN = /\b(?:PATH|HOME|PWD|INIT_CWD|npm_package_json|npm_config_[A-Za-z0-9_]+)\b\s*(?::|=)/i;
+const ENV_DUMP_KEY_PATTERN = /\b(?:PATH|HOME|PWD|INIT_CWD|npm_package_json|npm_config_[A-Za-z0-9_]+)\b\s*(?::|=)/gi;
+const ENV_DUMP_REDACTION_MARKER = '[env dump redacted]';
 const PROJECT_FILE_LANGUAGE_BY_EXT = {
   '.css': 'css',
   '.csv': 'csv',
@@ -1172,8 +1177,7 @@ async function runNpmCommand(args, cwd, options = {}) {
 
     return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
-    const logs = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
-    throw new Error(redactBuildLogs(logs || `npm ${args.join(' ')} falhou.`, redactionValues));
+    throw new Error(formatBuildCommandFailure('npm', args, error, redactionValues));
   }
 }
 
@@ -1190,8 +1194,7 @@ async function runNpxCommand(args, cwd, options = {}) {
 
     return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
-    const logs = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
-    throw new Error(redactBuildLogs(logs || `npx ${args.join(' ')} falhou.`, redactionValues));
+    throw new Error(formatBuildCommandFailure('npx', args, error, redactionValues));
   }
 }
 
@@ -1268,8 +1271,97 @@ function redactKnownValues(text, values) {
   }, String(text || ''));
 }
 
+function isLargeEnvironmentDump(text) {
+  const matches = String(text || '').match(ENV_DUMP_KEY_PATTERN) || [];
+  return matches.length >= 4;
+}
+
+function redactLargeEnvironmentDumps(text) {
+  const lines = String(text || '').split('\n');
+  const redactedLines = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+
+    if (isLargeEnvironmentDump(line)) {
+      redactedLines.push(ENV_DUMP_REDACTION_MARKER);
+      continue;
+    }
+
+    if (/^\s*\{/.test(line)) {
+      let objectEndIndex = index;
+
+      while (objectEndIndex + 1 < lines.length && objectEndIndex - index < 300) {
+        objectEndIndex += 1;
+        if (/^\s*}\s*,?\s*$/.test(lines[objectEndIndex])) {
+          break;
+        }
+      }
+
+      const objectBlock = lines.slice(index, objectEndIndex + 1).join('\n');
+      if (isLargeEnvironmentDump(objectBlock)) {
+        redactedLines.push(ENV_DUMP_REDACTION_MARKER);
+        index = objectEndIndex;
+        continue;
+      }
+    }
+
+    let endIndex = index;
+    let block = line;
+
+    while (endIndex + 1 < lines.length && endIndex - index < 80) {
+      const nextLine = lines[endIndex + 1];
+
+      if (!nextLine.trim() || /^\s*(?:[}\]])?\s*,?\s*$/.test(nextLine) || ENV_DUMP_LINE_KEY_PATTERN.test(nextLine)) {
+        block += `\n${nextLine}`;
+        endIndex += 1;
+        continue;
+      }
+
+      break;
+    }
+
+    if (isLargeEnvironmentDump(block)) {
+      redactedLines.push(ENV_DUMP_REDACTION_MARKER);
+      index = endIndex;
+      continue;
+    }
+
+    redactedLines.push(line);
+  }
+
+  return redactedLines.join('\n');
+}
+
+function redactBuildEnvironmentDetails(text) {
+  return String(text || '')
+    .split('\n')
+    .map((line) => {
+      if (!BUILD_ENV_LOG_KEY_PATTERN.test(line)) {
+        return line;
+      }
+
+      return line.replace(
+        /(\b(?:PATH|HOME|PWD|INIT_CWD|npm_package_json|npm_config_local_prefix|npm_config_userconfig)\b\s*(?::|=)\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,\n}\]]+)/gi,
+        '$1[REDACTED]'
+      );
+    })
+    .join('\n');
+}
+
+function summarizeBuildStackPaths(text) {
+  return String(text || '').replace(
+    /(^|[\s(])\/(?:[^\s():/]+\/)*([^\s():/]+)(?=:\d+(?::\d+)?)/gm,
+    '$1$2'
+  );
+}
+
 function redactBuildLogs(logs, extraSensitiveValues = []) {
-  let redacted = redactKnownValues(logs, [
+  let redacted = redactLargeEnvironmentDumps(logs);
+  redacted = redactBuildEnvironmentDetails(redacted);
+  redacted = redacted.replace(INTERNAL_BUILD_PATH_PATTERN, '[REDACTED_PATH]');
+  redacted = summarizeBuildStackPaths(redacted);
+  redacted = redactKnownValues(redacted, [
     ...collectSensitiveProcessEnvValues(),
     ...extraSensitiveValues,
   ]);
@@ -1289,6 +1381,17 @@ function redactBuildLogs(logs, extraSensitiveValues = []) {
   });
 
   return redacted;
+}
+
+function formatBuildCommandFailure(command, args, error, redactionValues = []) {
+  const numericExitCode = Number(error?.code);
+  const exitCode = Number.isInteger(numericExitCode) ? numericExitCode : 'unknown';
+  const failureSummary = `[command failed: ${command} ${args.join(' ')}; exit code ${exitCode}]`;
+  const logs = [failureSummary, error?.stdout, error?.stderr, error?.message]
+    .filter(Boolean)
+    .join('\n');
+
+  return redactBuildLogs(logs, redactionValues);
 }
 
 function buildSubprocessEnv(options = {}) {
