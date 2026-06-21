@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const fs = require('fs/promises');
+const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const path = require('path');
 const authRoutes = require('./routes/authRoutes');
@@ -11,6 +12,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
+const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
 
 
 dotenv.config();
@@ -46,6 +48,26 @@ const corsOptions = {
   origin: allowedOrigins,
   credentials: true
 };
+const apiRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  keyGenerator: getClientIp,
+});
+const loginRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: getClientIp,
+});
+const chatIpRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: getClientIp,
+});
+const adminRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
+});
 
 function getContentType(filePath) {
   return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
@@ -155,6 +177,89 @@ function parseBuildRequestPath(requestPath) {
   };
 }
 
+function getBearerUserId(req) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return null;
+  }
+
+  const [scheme, token] = authHeader.split(' ');
+
+  if (scheme !== 'Bearer' || !token) {
+    return null;
+  }
+
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET).id || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function buildUrlMatchQuery(indexBuildUrl) {
+  const escapedIndexBuildUrl = indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
+
+  return {
+    $or: [
+      { distUrl: indexBuildUrl },
+      { previewUrl: indexBuildUrl },
+      { buildUrl: indexBuildUrl },
+      { deployUrl: indexBuildUrl },
+      { distUrl: absoluteIndexBuildUrlPattern },
+      { previewUrl: absoluteIndexBuildUrlPattern },
+      { buildUrl: absoluteIndexBuildUrlPattern },
+      { deployUrl: absoluteIndexBuildUrlPattern },
+    ],
+  };
+}
+
+async function authorizeBuildAccess(req, res, next) {
+  try {
+    const parsedPath = parseBuildRequestPath(req.originalUrl);
+
+    if (!parsedPath) {
+      return res.sendStatus(404);
+    }
+
+    const build = await ProjectBuild.findOne({
+      projectId: parsedPath.projectId,
+      ...buildUrlMatchQuery(parsedPath.indexBuildUrl),
+    })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .select('projectId status')
+      .lean();
+
+    if (!build) {
+      return res.sendStatus(404);
+    }
+
+    const project = await Project.findById(parsedPath.projectId)
+      .select('userId isPublished')
+      .lean();
+
+    if (!project) {
+      return res.sendStatus(404);
+    }
+
+    if (build.status === 'done' || project.isPublished === true) {
+      return next();
+    }
+
+    const isAdmin = Boolean(process.env.ADMIN_TOKEN) && req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
+    const userId = getBearerUserId(req);
+
+    if (isAdmin || (userId && String(project.userId) === String(userId))) {
+      return next();
+    }
+
+    return res.sendStatus(404);
+  } catch (error) {
+    return next(error);
+  }
+}
+
 async function findMongoBuildArtifact(requestPath) {
   const parsedPath = parseBuildRequestPath(requestPath);
 
@@ -162,20 +267,9 @@ async function findMongoBuildArtifact(requestPath) {
     return null;
   }
 
-  const escapedIndexBuildUrl = parsedPath.indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
   const builds = await ProjectBuild.find({
     projectId: parsedPath.projectId,
-    $or: [
-      { distUrl: parsedPath.indexBuildUrl },
-      { previewUrl: parsedPath.indexBuildUrl },
-      { buildUrl: parsedPath.indexBuildUrl },
-      { deployUrl: parsedPath.indexBuildUrl },
-      { distUrl: absoluteIndexBuildUrlPattern },
-      { previewUrl: absoluteIndexBuildUrlPattern },
-      { buildUrl: absoluteIndexBuildUrlPattern },
-      { deployUrl: absoluteIndexBuildUrlPattern },
-    ],
+    ...buildUrlMatchQuery(parsedPath.indexBuildUrl),
   }).sort({
     updatedAt: -1,
     createdAt: -1,
@@ -278,11 +372,12 @@ async function loadPublishedHtml(project) {
   }
 }
 
+// Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
-app.use('/builds', express.static(path.join(__dirname, 'public', 'builds')));
+app.use('/builds', authorizeBuildAccess, express.static(PUBLIC_BUILDS_DIR));
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
   try {
     const artifact = await findMongoBuildArtifact(req.path);
@@ -318,11 +413,22 @@ app.get('/p/:slug', async (req, res) => {
     return res.status(500).send('Erro ao carregar projeto publicado.');
   }
 });
+app.use('/api', apiRateLimit);
+app.use('/api/auth/login', loginRateLimit);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
-app.use('/api/chat', chatRoutes);
-app.use('/api/admin', adminRoutes);
+app.use('/api/chat', chatIpRateLimit, chatRoutes);
+app.use('/api/admin', adminRateLimit, adminRoutes);
 app.use('/api/connectors', connectorRegistryRoutes);
+app.use((error, req, res, next) => {
+  console.error('Erro não tratado na requisição:', error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return res.status(500).json({ message: 'Erro interno do servidor.' });
+});
 
 mongoose
   .connect(process.env.MONGODB_URI)

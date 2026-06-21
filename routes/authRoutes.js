@@ -37,8 +37,7 @@ router.post('/register', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao cadastrar usuário.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -80,8 +79,7 @@ router.post('/login', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao fazer login.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });

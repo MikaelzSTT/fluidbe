@@ -6,6 +6,7 @@ const ProjectBuild = require('../models/ProjectBuild');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const authMiddleware = require('../middleware/authMiddleware');
+const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   encryptConnectorValue,
@@ -24,6 +25,16 @@ const {
 } = require('../utils/projectFiles');
 
 const router = express.Router();
+const connectorCredentialIpRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: getClientIp,
+});
+const connectorCredentialUserRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 6,
+  keyGenerator: (req) => req.userId ? `user:${req.userId}` : `ip:${getClientIp(req)}`,
+});
 const CONNECTOR_VALIDATION_FAILURE_MESSAGE = 'Não foi possível validar este conector. Confira a credencial.';
 const CONNECTOR_VALIDATION_TIMEOUT_MS = 5000;
 const CONNECTOR_STATUSES = ['pending', 'connected', 'skipped', 'error'];
@@ -704,8 +715,7 @@ router.get('/', authMiddleware, async (req, res) => {
     return res.json(projects);
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar projetos.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -739,8 +749,7 @@ router.post('/', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao criar projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -799,17 +808,21 @@ router.get('/:projectId/connectors', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar conectores do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
 
-router.post('/:projectId/connectors/:provider/credentials', authMiddleware, async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) {
-      return res.status(400).json({ message: 'ID de projeto inválido.' });
-    }
+router.post(
+  '/:projectId/connectors/:provider/credentials',
+  authMiddleware,
+  connectorCredentialIpRateLimit,
+  connectorCredentialUserRateLimit,
+  async (req, res) => {
+    try {
+      if (!mongoose.Types.ObjectId.isValid(req.params.projectId)) {
+        return res.status(400).json({ message: 'ID de projeto inválido.' });
+      }
 
     const provider = normalizeConnectorProvider(req.params.provider);
     const connector = getConnectorByProvider(provider);
@@ -914,13 +927,13 @@ router.post('/:projectId/connectors/:provider/credentials', authMiddleware, asyn
         secret
       ),
     });
-  } catch (error) {
-    return res.status(500).json({
-      message: 'Erro ao salvar credenciais do conector.',
-      error: error.message,
-    });
+    } catch (error) {
+      return res.status(500).json({
+        message: 'Erro interno do servidor.',
+      });
+    }
   }
-});
+);
 
 router.delete('/:projectId/connectors/:provider', authMiddleware, async (req, res) => {
   try {
@@ -964,8 +977,7 @@ router.delete('/:projectId/connectors/:provider', authMiddleware, async (req, re
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao remover credenciais do conector.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1000,8 +1012,7 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     return res.json(buildProjectPayload(req, project));
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar build do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1035,8 +1046,7 @@ router.get('/:id/messages', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar mensagens do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1120,8 +1130,7 @@ router.get('/:id/files', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao listar arquivos do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1261,8 +1270,7 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao ler arquivo do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1281,8 +1289,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
     return res.json(project);
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1323,8 +1330,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao atualizar projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1345,8 +1351,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao excluir projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });

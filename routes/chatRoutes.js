@@ -5,8 +5,14 @@ const Project = require('../models/Project');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
+const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
 
 const router = express.Router();
+const chatUserRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyGenerator: (req) => req.userId ? `user:${req.userId}` : `ip:${getClientIp(req)}`,
+});
 
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-5';
 const CONNECTOR_RULES = [
@@ -793,7 +799,7 @@ async function getAiReply({ message, history, project }) {
   }
 }
 
-router.post('/clarify', authMiddleware, async (req, res) => {
+router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
   try {
     const { message, history, messages } = req.body;
 
@@ -812,13 +818,12 @@ router.post('/clarify', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao gerar perguntas de clarificação.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
 
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
   try {
     const { projectId, message, history, messages } = req.body;
 
@@ -920,8 +925,7 @@ router.post('/', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao processar chat.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });

@@ -12,6 +12,7 @@ const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
+const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
@@ -25,11 +26,23 @@ const {
 } = require('../utils/projectFiles');
 
 const router = express.Router();
+const reactViteUploadRateLimit = createRateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
+});
 const execFileAsync = promisify(execFile);
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
+const MAX_REACT_VITE_ZIP_BYTES = 50 * 1024 * 1024;
+const MAX_REACT_VITE_ZIP_ENTRIES = 5000;
+const MAX_REACT_VITE_UNCOMPRESSED_BYTES = 500 * 1024 * 1024;
+const MAX_REACT_VITE_ENTRY_BYTES = 100 * 1024 * 1024;
+const MAX_REACT_VITE_COMPRESSION_RATIO = 100;
+const INVALID_REACT_VITE_ZIP_MESSAGE = 'Arquivo ZIP inválido ou excede limites permitidos.';
+const INVALID_REACT_VITE_ZIP_ERROR_CODE = 'INVALID_REACT_VITE_ZIP';
 const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 8 * 1024 * 1024);
 const MAX_MONGO_SOURCE_BYTES = Number(process.env.MAX_MONGO_SOURCE_BYTES || 3 * 1024 * 1024);
 const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
@@ -710,8 +723,7 @@ async function loadProject(req, res, next) {
     return next();
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 }
@@ -745,42 +757,147 @@ const reactViteUpload = multer({
   },
   limits: {
     files: 1,
+    fileSize: MAX_REACT_VITE_ZIP_BYTES,
   },
 });
 
 function runReactViteUpload(req, res, next) {
-  reactViteUpload.single('file')(req, res, (error) => {
+  reactViteUpload.single('file')(req, res, async (error) => {
     if (!error) {
       return next();
     }
 
+    if (req.reactViteBuildDir) {
+      await fs.rm(req.reactViteBuildDir, { recursive: true, force: true }).catch(() => {});
+    }
+
     return res.status(400).json({
-      message: 'Upload inválido.',
-      error: error.message,
+      message: INVALID_REACT_VITE_ZIP_MESSAGE,
     });
   });
 }
 
+function createInvalidReactViteZipError() {
+  const error = new Error(INVALID_REACT_VITE_ZIP_MESSAGE);
+  error.code = INVALID_REACT_VITE_ZIP_ERROR_CODE;
+  return error;
+}
+
+function isZipSymlink(entry) {
+  const unixFileType = ((entry.attr >>> 16) & 0o170000);
+  return unixFileType === 0o120000;
+}
+
+function resolveZipEntryPath(destinationRoot, entryName) {
+  const normalizedEntryName = String(entryName || '').replace(/\\/g, '/');
+
+  if (
+    !normalizedEntryName ||
+    normalizedEntryName.includes('\0') ||
+    normalizedEntryName.startsWith('/') ||
+    /^[a-z]:\//i.test(normalizedEntryName)
+  ) {
+    throw createInvalidReactViteZipError();
+  }
+
+  const targetPath = path.resolve(destinationRoot, normalizedEntryName);
+
+  if (targetPath === destinationRoot || !targetPath.startsWith(`${destinationRoot}${path.sep}`)) {
+    throw createInvalidReactViteZipError();
+  }
+
+  return targetPath;
+}
+
 async function extractZipSafely(zipPath, destinationDir) {
-  const zip = new AdmZip(zipPath);
   const destinationRoot = path.resolve(destinationDir);
+  let zip;
+
+  try {
+    zip = new AdmZip(zipPath);
+  } catch (error) {
+    throw createInvalidReactViteZipError();
+  }
+
+  let entries;
+
+  try {
+    entries = zip.getEntries();
+  } catch (error) {
+    throw createInvalidReactViteZipError();
+  }
+
+  if (!entries.length || entries.length > MAX_REACT_VITE_ZIP_ENTRIES) {
+    throw createInvalidReactViteZipError();
+  }
+
+  let totalUncompressedBytes = 0;
+  let fileEntries = 0;
+
+  for (const entry of entries) {
+    resolveZipEntryPath(destinationRoot, entry.entryName);
+
+    if (isZipSymlink(entry)) {
+      throw createInvalidReactViteZipError();
+    }
+
+    if (entry.isDirectory) {
+      continue;
+    }
+
+    fileEntries += 1;
+    const uncompressedBytes = Number(entry.header.size);
+    const compressedBytes = Number(entry.header.compressedSize);
+
+    if (
+      !Number.isSafeInteger(uncompressedBytes) ||
+      !Number.isSafeInteger(compressedBytes) ||
+      uncompressedBytes < 0 ||
+      compressedBytes < 0 ||
+      uncompressedBytes > MAX_REACT_VITE_ENTRY_BYTES ||
+      totalUncompressedBytes + uncompressedBytes > MAX_REACT_VITE_UNCOMPRESSED_BYTES ||
+      (uncompressedBytes > 0 && uncompressedBytes / Math.max(compressedBytes, 1) > MAX_REACT_VITE_COMPRESSION_RATIO)
+    ) {
+      throw createInvalidReactViteZipError();
+    }
+
+    totalUncompressedBytes += uncompressedBytes;
+  }
+
+  if (!fileEntries) {
+    throw createInvalidReactViteZipError();
+  }
 
   await fs.mkdir(destinationRoot, { recursive: true });
+  let extractedBytes = 0;
 
-  for (const entry of zip.getEntries()) {
-    const targetPath = path.resolve(destinationRoot, entry.entryName);
-
-    if (targetPath !== destinationRoot && !targetPath.startsWith(`${destinationRoot}${path.sep}`)) {
-      throw new Error(`ZIP contém caminho inválido: ${entry.entryName}`);
-    }
+  for (const entry of entries) {
+    const targetPath = resolveZipEntryPath(destinationRoot, entry.entryName);
 
     if (entry.isDirectory) {
       await fs.mkdir(targetPath, { recursive: true });
       continue;
     }
 
+    let data;
+
+    try {
+      data = entry.getData();
+    } catch (error) {
+      throw createInvalidReactViteZipError();
+    }
+
+    if (
+      data.length !== Number(entry.header.size) ||
+      data.length > MAX_REACT_VITE_ENTRY_BYTES ||
+      extractedBytes + data.length > MAX_REACT_VITE_UNCOMPRESSED_BYTES
+    ) {
+      throw createInvalidReactViteZipError();
+    }
+
+    extractedBytes += data.length;
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
-    await fs.writeFile(targetPath, entry.getData());
+    await fs.writeFile(targetPath, data, { mode: 0o600 });
   }
 }
 
@@ -1751,8 +1868,7 @@ router.get('/change-requests', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar change requests.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1790,8 +1906,7 @@ router.get('/projects', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar projetos.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -1868,8 +1983,7 @@ router.get('/projects/:id/files', requireAdmin, validateProjectId, async (req, r
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao listar arquivos do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2002,8 +2116,7 @@ router.get('/projects/:id/files/content', requireAdmin, validateProjectId, async
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao ler arquivo do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2032,8 +2145,7 @@ router.get('/projects/:id/change-requests', requireAdmin, validateProjectId, asy
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar change requests do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2093,8 +2205,7 @@ router.get('/projects/:id/connectors', requireAdmin, validateProjectId, async (r
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar conectores do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2133,8 +2244,7 @@ router.patch(
       });
     } catch (error) {
       return res.status(500).json({
-        message: 'Erro ao atualizar status do change request.',
-        error: error.message,
+        message: 'Erro interno do servidor.',
       });
     }
   }
@@ -2167,8 +2277,7 @@ router.get('/projects/:id/versions', requireAdmin, validateProjectId, async (req
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar versões do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2201,8 +2310,7 @@ router.get('/projects/:id/messages', requireAdmin, validateProjectId, async (req
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar mensagens do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2211,11 +2319,12 @@ router.post(
   '/projects/:id/react-vite',
   requireAdmin,
   validateProjectId,
+  reactViteUploadRateLimit,
   loadProject,
   runReactViteUpload,
   async (req, res) => {
     if (!req.file) {
-      return res.status(400).json({ message: 'Campo file é obrigatório.' });
+      return res.status(400).json({ message: INVALID_REACT_VITE_ZIP_MESSAGE });
     }
 
     const project = req.project;
@@ -2370,6 +2479,11 @@ router.post(
         connectorInjection,
       });
     } catch (error) {
+      if (error?.code === INVALID_REACT_VITE_ZIP_ERROR_CODE) {
+        await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+        return res.status(400).json({ message: INVALID_REACT_VITE_ZIP_MESSAGE });
+      }
+
       const errorLogs = redactBuildLogs(
         [logs, error.message].filter(Boolean).join('\n'),
         temporaryFrontendEnvRedactionValues
@@ -2383,10 +2497,12 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        message: 'Erro ao gerar build React/Vite.',
-        build,
+        message: 'Erro interno do servidor.',
+        build: {
+          ...withAbsoluteBuildUrls(req, build),
+          logs: '',
+        },
         connectorInjection,
-        error: redactBuildLogs(error.message, temporaryFrontendEnvRedactionValues),
       });
     }
   }
@@ -2412,14 +2528,12 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
   } catch (error) {
     if (error.name === 'ValidationError') {
       return res.status(400).json({
-        message: 'Build inválido.',
-        error: error.message,
+        message: 'Requisição inválida.',
       });
     }
 
     return res.status(500).json({
-      message: 'Erro ao criar build do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2468,8 +2582,7 @@ router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async 
     }
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao verificar build do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2493,8 +2606,7 @@ router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, 
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao buscar builds do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2529,8 +2641,7 @@ router.patch('/projects/:id/build-mode', requireAdmin, validateProjectId, async 
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao atualizar modo de build do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2652,8 +2763,7 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao atualizar projeto manualmente.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
@@ -2714,8 +2824,7 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
     });
   } catch (error) {
     return res.status(500).json({
-      message: 'Erro ao atualizar status do projeto.',
-      error: error.message,
+      message: 'Erro interno do servidor.',
     });
   }
 });
