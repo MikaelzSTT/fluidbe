@@ -20,6 +20,8 @@ dotenv.config();
 const app = express();
 
 const PUBLIC_BUILDS_DIR = path.join(__dirname, 'public', 'builds');
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://apps.askfluid.now').replace(/\/+$/, '');
+const PUBLIC_APP_HOST = new URL(PUBLIC_BASE_URL).hostname.toLowerCase();
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -83,6 +85,50 @@ function getArtifactContentType(artifact, fallbackPath) {
   }
 
   return storedContentType;
+}
+
+function isEmbeddableBuildRoute(req) {
+  const pathname = req.path || '';
+
+  // Published pages and build artifacts are intentionally embedded by the
+  // Fluid frontend, which can be hosted on a different origin.
+  return pathname.startsWith('/builds/') || /^\/p\/[^/]+\/?$/.test(pathname);
+}
+
+function isPublicAppHost(req) {
+  return String(req.hostname || '').toLowerCase() === PUBLIC_APP_HOST;
+}
+
+function publicAppsOnly(req, res, next) {
+  if (!isPublicAppHost(req)) {
+    return next();
+  }
+
+  const pathname = req.path || '';
+
+  if (pathname === '/' || /^\/p\/[^/]+\/?$/.test(pathname) || pathname.startsWith('/builds/')) {
+    return next();
+  }
+
+  return res.sendStatus(404);
+}
+
+function securityHeaders(req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader(
+    'Permissions-Policy',
+    'accelerometer=(), gyroscope=(), magnetometer=(), payment=(), usb=()'
+  );
+
+  // Do not send a global CSP here. Published builds contain generated HTML,
+  // scripts, styles, and third-party resources whose requirements vary per
+  // project. A restrictive policy at this layer would break valid builds.
+  if (!isEmbeddableBuildRoute(req)) {
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  }
+
+  next();
 }
 
 function resolvePublicBuildIndexPath(buildUrl) {
@@ -374,6 +420,8 @@ async function loadPublishedHtml(project) {
 
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
+app.use(securityHeaders);
+app.use(publicAppsOnly);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
@@ -440,6 +488,10 @@ mongoose
   });
 
 app.get('/', (req, res) => {
+  if (isPublicAppHost(req)) {
+    return res.sendStatus(404);
+  }
+
   res.json({
     message: 'FLUIDBE backend rodando',
     database: 'conectada',

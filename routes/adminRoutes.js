@@ -52,8 +52,7 @@ const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL ||
-  process.env.BACKEND_PUBLIC_URL ||
-  'https://fluidbe.onrender.com';
+  'https://apps.askfluid.now';
 const BUILD_FIELDS = [
   'type',
   'status',

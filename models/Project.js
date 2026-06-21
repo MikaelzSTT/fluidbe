@@ -2,8 +2,7 @@ const mongoose = require('mongoose');
 
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL ||
-  process.env.BACKEND_PUBLIC_URL ||
-  'https://fluidbe.onrender.com';
+  'https://apps.askfluid.now';
 
 const projectSchema = new mongoose.Schema(
   {
