@@ -42,6 +42,7 @@ const CONTENT_TYPES = {
 const allowedOrigins = [
   'https://askfluid.now',
   'https://www.askfluid.now',
+  'https://apps.askfluid.now',
   'https://fluid-web-static.onrender.com',
   'http://localhost:3000',
   'http://localhost:5173'
