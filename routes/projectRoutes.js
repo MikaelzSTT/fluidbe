@@ -3,6 +3,7 @@ const fs = require('fs/promises');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const BuildJob = require('../models/BuildJob');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const authMiddleware = require('../middleware/authMiddleware');
@@ -706,6 +707,42 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
   };
 }
 
+function getLegacyBuildJobStatus(projectBuildStatus) {
+  switch (projectBuildStatus) {
+    case 'failed':
+      return 'failed';
+    case 'in_progress':
+      return 'running';
+    case 'draft':
+    case 'done':
+      return 'succeeded';
+    default:
+      return 'queued';
+  }
+}
+
+function buildStatusError(projectBuild, buildJob) {
+  const failed = buildJob
+    ? ['failed', 'timed_out', 'cancelled'].includes(buildJob.status)
+    : projectBuild.status === 'failed';
+
+  if (!failed) {
+    return null;
+  }
+
+  if (buildJob) {
+    return {
+      code: buildJob.errorCode || null,
+      message: buildJob.errorMessage || 'Build falhou.',
+    };
+  }
+
+  return {
+    code: null,
+    message: 'Build falhou.',
+  };
+}
+
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const projects = await Project.find({ userId: req.userId }).sort({
@@ -1014,6 +1051,58 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });
+  }
+});
+
+router.get('/:projectId/builds/:buildId/status', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, buildId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(projectId) || !mongoose.Types.ObjectId.isValid(buildId)) {
+      return res.status(400).json({ message: 'ID de projeto ou build inválido.' });
+    }
+
+    const project = await Project.findOne({
+      _id: projectId,
+      userId: req.userId,
+    }).select('_id');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const projectBuild = await ProjectBuild.findOne({
+      _id: buildId,
+      projectId: project._id,
+    }).select('status previewUrl buildUrl distUrl buildJobId');
+
+    if (!projectBuild) {
+      return res.status(404).json({ message: 'Build não encontrado.' });
+    }
+
+    const buildJobQuery = projectBuild.buildJobId
+      ? { _id: projectBuild.buildJobId, projectBuildId: projectBuild._id }
+      : { projectBuildId: projectBuild._id };
+    const buildJob = await BuildJob.findOne(buildJobQuery)
+      .sort({ createdAt: -1 })
+      .select('status errorCode errorMessage');
+    const previewUrl = toAbsoluteBackendUrl(
+      req,
+      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.distUrl || ''
+    );
+    const projectBuildStatus = projectBuild.status;
+    const jobStatus = buildJob ? buildJob.status : getLegacyBuildJobStatus(projectBuildStatus);
+
+    return res.json({
+      buildId: String(projectBuild._id),
+      projectBuildStatus,
+      jobStatus,
+      previewReady: ['draft', 'done'].includes(projectBuildStatus) && Boolean(previewUrl),
+      previewUrl,
+      error: buildStatusError(projectBuild, buildJob),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro interno do servidor.' });
   }
 });
 

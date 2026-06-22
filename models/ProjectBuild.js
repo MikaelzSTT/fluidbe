@@ -12,6 +12,13 @@ const projectBuildSchema = new mongoose.Schema(
       index: true,
     },
 
+    buildJobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'BuildJob',
+      default: null,
+      index: true,
+    },
+
     type: {
       type: String,
       enum: BUILD_TYPES,
