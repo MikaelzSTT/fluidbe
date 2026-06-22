@@ -1,6 +1,8 @@
 const express = require('express');
 const fsSync = require('fs');
 const fs = require('fs/promises');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
@@ -15,12 +17,18 @@ const ConnectorSecret = require('../models/ConnectorSecret');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
+  collectConnectorInjectionBuildFiles,
+  createTemporaryFrontendEnv,
+  resolveProjectConnectorInjection,
+} = require('../utils/connectorInjection');
+const {
   buildProjectArtifactFileTree,
   resolveProjectArtifactFile,
   resolveProjectFileRoot: resolveSharedProjectFileRoot,
 } = require('../utils/projectFiles');
 
 const router = express.Router();
+const execFileAsync = promisify(execFile);
 const reactViteUploadRateLimit = createRateLimit({
   windowMs: 60 * 60 * 1000,
   max: 3,
@@ -40,6 +48,7 @@ const MAX_MONGO_ARTIFACT_BYTES = Number(process.env.MAX_MONGO_ARTIFACT_BYTES || 
 const MAX_MONGO_SOURCE_BYTES = Number(process.env.MAX_MONGO_SOURCE_BYTES || 3 * 1024 * 1024);
 const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
 const MAX_PROJECT_FILE_TREE_ENTRIES = Number(process.env.MAX_PROJECT_FILE_TREE_ENTRIES || 5000);
+const BUILD_WORKER_ENABLED = process.env.BUILD_WORKER_ENABLED === 'true';
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
@@ -91,6 +100,10 @@ const SOURCE_SNAPSHOT_IGNORED_DIRS = new Set([
   'coverage',
   'dist',
   'node_modules',
+]);
+const SUBPROCESS_ENV_ALLOWLIST = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TEMP', 'TMP', 'NODE_ENV', 'CI',
+  'NPM_CONFIG_CACHE', 'npm_config_cache', 'NPM_CONFIG_PRODUCTION', 'npm_config_production',
 ]);
 const SENSITIVE_ENV_NAME_PATTERN =
   /(SECRET|TOKEN|PASSWORD|PASS|PRIVATE|KEY|CREDENTIAL|MONGODB|MONGO|DATABASE_URL|DB_URL|OPENAI|STRIPE|JWT|CONNECTOR|RESEND|TWILIO|SHOPIFY|AUTH)/i;
@@ -1309,6 +1322,231 @@ async function validateReactViteProject(appRoot) {
   }
 }
 
+async function runNpmCommand(args, cwd, options = {}) {
+  const redactionValues = getCommandRedactionValues(options);
+  try {
+    const result = await execFileAsync('npm', args, {
+      cwd, env: buildSubprocessEnv(options), maxBuffer: 20 * 1024 * 1024, timeout: 15 * 60 * 1000,
+    });
+    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
+  } catch (error) {
+    throw new Error(formatBuildCommandFailure('npm', args, error, redactionValues));
+  }
+}
+
+async function runNpxCommand(args, cwd, options = {}) {
+  const redactionValues = getCommandRedactionValues(options);
+  try {
+    const result = await execFileAsync('npx', args, {
+      cwd, env: buildSubprocessEnv(options), maxBuffer: 20 * 1024 * 1024, timeout: 15 * 60 * 1000,
+    });
+    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
+  } catch (error) {
+    throw new Error(formatBuildCommandFailure('npx', args, error, redactionValues));
+  }
+}
+
+async function readPackageJson(appRoot) {
+  return JSON.parse(await fs.readFile(path.join(appRoot, 'package.json'), 'utf8'));
+}
+
+function buildScriptContainsTscBuild(packageJson) {
+  return typeof packageJson?.scripts?.build === 'string' && /\btsc\b/.test(packageJson.scripts.build);
+}
+
+function looksLikeTypecheckFailure(logs) {
+  return [/\btsc\b/i, /\btsc\s+-b\b/i, /\btsc\s+--build\b/i, /\btypescript\b/i, /\bTS\d{4}\b/, /type\s+checking/i, /vue-tsc/i]
+    .some((pattern) => pattern.test(logs || ''));
+}
+
+function formatBuildCommandFailure(command, args, error, redactionValues = []) {
+  const code = Number(error?.code);
+  const exitCode = Number.isInteger(code) ? code : 'unknown';
+  return redactBuildLogs([
+    `[command failed: ${command} ${args.join(' ')}; exit code ${exitCode}]`,
+    error?.stdout, error?.stderr, error?.message,
+  ].filter(Boolean).join('\n'), redactionValues);
+}
+
+function buildSubprocessEnv(options = {}) {
+  const env = {};
+  SUBPROCESS_ENV_ALLOWLIST.forEach((name) => {
+    if (typeof process.env[name] === 'string') env[name] = process.env[name];
+  });
+  Object.entries(options.env || {}).forEach(([name, value]) => {
+    if (SUBPROCESS_ENV_ALLOWLIST.has(name) && value != null) env[name] = String(value);
+  });
+  Object.entries(options.frontendEnv || {}).forEach(([name, value]) => {
+    if (/^VITE_[A-Za-z0-9_]+$/.test(name) && value != null) env[name] = String(value);
+  });
+  env.CI = 'true';
+  return env;
+}
+
+function getCommandRedactionValues(options = {}) {
+  return Object.values(options.frontendEnv || {}).filter((value) => typeof value === 'string' && value.length >= 6);
+}
+
+async function runReactViteBuild(appRoot, options = {}) {
+  const packageJson = await readPackageJson(appRoot);
+  try {
+    return await runNpmCommand(['run', 'build'], appRoot, options);
+  } catch (error) {
+    if (!buildScriptContainsTscBuild(packageJson) && !looksLikeTypecheckFailure(error.message)) throw error;
+    const fallbackLog = [error.message, 'Fallback aplicado: npx vite build sem typecheck.'].filter(Boolean).join('\n');
+    try {
+      return [fallbackLog, await runNpxCommand(['vite', 'build'], appRoot, options)].filter(Boolean).join('\n');
+    } catch (fallbackError) {
+      throw new Error([fallbackLog, fallbackError.message].filter(Boolean).join('\n'));
+    }
+  }
+}
+
+function stripJsonComments(json) {
+  let result = ''; let inString = false; let escaped = false;
+  for (let index = 0; index < json.length; index += 1) {
+    const char = json[index]; const next = json[index + 1];
+    if (inString) { result += char; escaped = !escaped && char === '\\'; if (!escaped && char === '"') inString = false; else if (char !== '\\') escaped = false; continue; }
+    if (char === '"') { inString = true; result += char; continue; }
+    if (char === '/' && next === '/') { while (index < json.length && json[index] !== '\n') index += 1; result += '\n'; continue; }
+    if (char === '/' && next === '*') { index += 2; while (index < json.length && !(json[index] === '*' && json[index + 1] === '/')) { result += json[index] === '\n' ? '\n' : ' '; index += 1; } index += 1; continue; }
+    result += char;
+  }
+  return result;
+}
+
+function parseTsconfig(rawConfig) {
+  try { return JSON.parse(rawConfig); } catch (error) {
+    return JSON.parse(stripJsonComments(rawConfig).replace(/,(\s*[}\]])/g, '$1'));
+  }
+}
+
+async function findTsconfigFiles(rootDir) {
+  const matches = []; const entries = await fs.readdir(rootDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) matches.push(...(await findTsconfigFiles(entryPath)));
+    else if (entry.isFile() && /^tsconfig.*\.json$/i.test(entry.name)) matches.push(entryPath);
+  }
+  return matches;
+}
+
+async function applyTsconfigDeprecationFix(appRoot) {
+  const fixedPaths = [];
+  for (const tsconfigPath of await findTsconfigFiles(appRoot)) {
+    const config = parseTsconfig(await fs.readFile(tsconfigPath, 'utf8'));
+    config.compilerOptions = config.compilerOptions && typeof config.compilerOptions === 'object' ? config.compilerOptions : {};
+    if (String(config.compilerOptions.moduleResolution).toLowerCase() === 'node10') config.compilerOptions.moduleResolution = 'bundler';
+    config.compilerOptions.ignoreDeprecations = '6.0';
+    await fs.writeFile(tsconfigPath, `${JSON.stringify(config, null, 2)}\n`);
+    fixedPaths.push(path.relative(appRoot, tsconfigPath));
+  }
+  return fixedPaths;
+}
+
+async function ensureViteRelativeBase(appRoot) {
+  for (const filename of ['vite.config.js', 'vite.config.mjs', 'vite.config.ts', 'vite.config.mts']) {
+    const configPath = path.join(appRoot, filename);
+    if (!(await pathExists(configPath))) continue;
+    const raw = await fs.readFile(configPath, 'utf8');
+    let updated = raw;
+    if (!/base\s*:\s*(['"`])\.\/\1/.test(raw)) {
+      if (/base\s*:\s*(['"`])[^'"`]*\1/.test(raw)) updated = raw.replace(/base\s*:\s*(['"`])[^'"`]*\1/, "base: './'");
+      else if (/defineConfig\s*\(\s*\{/.test(raw)) updated = raw.replace(/defineConfig\s*\(\s*\{/, "defineConfig({\n  base: './',");
+      else if (/export\s+default\s+\{/.test(raw)) updated = raw.replace(/export\s+default\s+\{/, "export default {\n  base: './',");
+    }
+    if (updated !== raw) { await fs.writeFile(configPath, updated); return filename; }
+    return null;
+  }
+  return null;
+}
+
+async function fixDistIndexAssetPaths(distDir) {
+  const indexPath = path.join(distDir, 'index.html');
+  if (!(await pathExists(indexPath))) throw new Error('Build concluído sem gerar dist/index.html.');
+  const html = await fs.readFile(indexPath, 'utf8');
+  const fixed = html.replaceAll('src="/assets/', 'src="./assets/').replaceAll("src='/assets/", "src='./assets/")
+    .replaceAll('href="/assets/', 'href="./assets/').replaceAll("href='/assets/", "href='./assets/")
+    .replaceAll('url(/assets/', 'url(./assets/').replaceAll('url("/assets/', 'url("./assets/').replaceAll("url('/assets/", "url('./assets/");
+  if (fixed !== html) { await fs.writeFile(indexPath, fixed); return true; }
+  return false;
+}
+
+async function runLegacyReactViteBuild(req, res, project, buildDir, extractDir) {
+  const timestamp = req.reactViteBuildTimestamp;
+  let logs = '';
+  let temporaryFrontendEnvRedactionValues = [];
+  let connectorInjection = {
+    requiredEnvVars: [], frontendEnvVars: [], backendEnvVars: [], resolvedConnectors: [],
+    unresolvedConnectors: [], injectionPlan: [], blockedEnvVars: [], unresolvedBackendEnvVars: [],
+  };
+
+  try {
+    const appRoot = await findReactViteRoot(extractDir);
+    await validateReactViteProject(appRoot);
+    try {
+      const buildFiles = await collectConnectorInjectionBuildFiles(appRoot);
+      connectorInjection = await resolveProjectConnectorInjection(project._id, buildFiles);
+      logs += `${formatConnectorInjectionLog(connectorInjection)}\n`;
+    } catch (error) {
+      logs += `Connector injection plan unavailable: ${error.message}\n`;
+    }
+
+    const temporaryFrontendEnv = await createTemporaryFrontendEnv({
+      projectId: project._id, projectDir: appRoot, injectionPlan: connectorInjection.injectionPlan,
+    });
+    temporaryFrontendEnvRedactionValues = Object.values(temporaryFrontendEnv.envValues || {});
+    if (temporaryFrontendEnv.injectedEnvVars.length > 0) {
+      logs += `Frontend env vars injected: ${temporaryFrontendEnv.injectedEnvVars.join(', ')}\n`;
+    }
+    try {
+      const installEnv = { NODE_ENV: 'development', NPM_CONFIG_PRODUCTION: 'false' };
+      logs += `${await runNpmCommand(['install', '--include=dev'], appRoot, { env: installEnv })}\n`;
+      logs += `${await runNpmCommand(['install', 'react', 'react-dom'], appRoot, { env: installEnv })}\n`;
+      logs += `${await runNpmCommand(['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'], appRoot, { env: installEnv })}\n`;
+      for (const fixedPath of await applyTsconfigDeprecationFix(appRoot)) logs += `Auto-fix TS5107 aplicado em: ${fixedPath}\n`;
+      const viteConfigFixed = await ensureViteRelativeBase(appRoot);
+      if (viteConfigFixed) logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
+      logs += await runReactViteBuild(appRoot, { frontendEnv: temporaryFrontendEnv.envValues });
+    } finally {
+      await temporaryFrontendEnv.cleanup();
+    }
+
+    const distDir = path.join(appRoot, 'dist');
+    if (!(await pathExists(distDir))) throw new Error('Build concluído sem gerar a pasta dist.');
+    if (await fixDistIndexAssetPaths(distDir)) logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
+    const previewUrl = `/builds/${project._id}/${timestamp}/index.html`;
+    const fullHtml = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
+    const artifactSnapshot = await collectBuildArtifactFiles(distDir);
+    const sourceSnapshot = await collectProjectSourceFiles(appRoot);
+    if (!artifactSnapshot.complete) logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
+    if (!sourceSnapshot.complete) logs += `\nAviso: source excedeu ${MAX_MONGO_SOURCE_BYTES} bytes; ${sourceSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
+    const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
+    await fs.mkdir(publicBuildDir, { recursive: true });
+    await fs.cp(distDir, publicBuildDir, { recursive: true });
+    const build = await ProjectBuild.create({
+      projectId: project._id, type: 'react_vite', status: 'draft', distUrl: previewUrl, previewUrl,
+      buildUrl: previewUrl, deployUrl: previewUrl, fullHtml, artifactFiles: artifactSnapshot.files,
+      sourceFiles: sourceSnapshot.files, sourceZipUrl: '',
+      logs: [redactBuildLogs(logs, temporaryFrontendEnvRedactionValues), 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
+    });
+    await Project.findByIdAndUpdate(project._id, {
+      status: 'in_progress', generation_status: 'in_progress', generationStatus: 'in_progress', reactVite: true,
+      'metadata.lastBuildAt': new Date(),
+    }, { runValidators: true });
+    return res.status(201).json({ success: true, build: withAbsoluteBuildUrls(req, build), previewUrl: toAbsoluteBackendUrl(req, previewUrl), connectorInjection });
+  } catch (error) {
+    const build = await ProjectBuild.create({
+      projectId: project._id, type: 'react_vite', status: 'failed',
+      logs: redactBuildLogs([logs, error.message].filter(Boolean).join('\n'), temporaryFrontendEnvRedactionValues),
+    });
+    return res.status(500).json({
+      success: false, message: 'Erro interno do servidor.',
+      build: { ...withAbsoluteBuildUrls(req, build), logs: '' }, connectorInjection,
+    });
+  }
+}
+
 function formatConnectorInjectionLog(resolution) {
   if (!resolution || !Array.isArray(resolution.requiredEnvVars)) {
     return '';
@@ -2233,8 +2471,13 @@ router.post(
     try {
       await extractZipSafely(sourceZipPath, extractDir);
 
+      if (!BUILD_WORKER_ENABLED) {
+        return runLegacyReactViteBuild(req, res, project, buildDir, extractDir);
+      }
+
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
+
       sourceGridFsFile = await uploadReactViteSourceZip(
         sourceZipPath,
         project._id,
@@ -2292,6 +2535,9 @@ router.post(
       }
 
       if (error?.code === INVALID_REACT_VITE_ZIP_ERROR_CODE) {
+        if (!BUILD_WORKER_ENABLED) {
+          await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+        }
         return res.status(400).json({ message: INVALID_REACT_VITE_ZIP_MESSAGE });
       }
 
@@ -2300,7 +2546,9 @@ router.post(
         message: 'Erro interno do servidor.',
       });
     } finally {
-      await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+      if (BUILD_WORKER_ENABLED) {
+        await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 );
@@ -2627,3 +2875,18 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
 });
 
 module.exports = router;
+module.exports.reactViteBuildHelpers = {
+  applyTsconfigDeprecationFix,
+  collectBuildArtifactFiles,
+  collectProjectSourceFiles,
+  ensureViteRelativeBase,
+  extractZipSafely,
+  findReactViteRoot,
+  fixDistIndexAssetPaths,
+  formatConnectorInjectionLog,
+  redactBuildLogs,
+  runNpmCommand,
+  runReactViteBuild,
+  runNpxCommand,
+  validateReactViteProject,
+};
