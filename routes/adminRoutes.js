@@ -1,24 +1,19 @@
 const express = require('express');
+const fsSync = require('fs');
 const fs = require('fs/promises');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
 const AdmZip = require('adm-zip');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const BuildJob = require('../models/BuildJob');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
-const {
-  collectConnectorInjectionBuildFiles,
-  createTemporaryFrontendEnv,
-  resolveProjectConnectorInjection,
-} = require('../utils/connectorInjection');
 const {
   buildProjectArtifactFileTree,
   resolveProjectArtifactFile,
@@ -31,8 +26,6 @@ const reactViteUploadRateLimit = createRateLimit({
   max: 3,
   keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
 });
-const execFileAsync = promisify(execFile);
-
 const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
@@ -98,22 +91,6 @@ const SOURCE_SNAPSHOT_IGNORED_DIRS = new Set([
   'coverage',
   'dist',
   'node_modules',
-]);
-const SUBPROCESS_ENV_ALLOWLIST = new Set([
-  'PATH',
-  'HOME',
-  'USER',
-  'LOGNAME',
-  'SHELL',
-  'TMPDIR',
-  'TEMP',
-  'TMP',
-  'NODE_ENV',
-  'CI',
-  'NPM_CONFIG_CACHE',
-  'npm_config_cache',
-  'NPM_CONFIG_PRODUCTION',
-  'npm_config_production',
 ]);
 const SENSITIVE_ENV_NAME_PATTERN =
   /(SECRET|TOKEN|PASSWORD|PASS|PRIVATE|KEY|CREDENTIAL|MONGODB|MONGO|DATABASE_URL|DB_URL|OPENAI|STRIPE|JWT|CONNECTOR|RESEND|TWILIO|SHOPIFY|AUTH)/i;
@@ -900,6 +877,58 @@ async function extractZipSafely(zipPath, destinationDir) {
   }
 }
 
+async function uploadReactViteSourceZip(zipPath, projectId, originalName) {
+  if (!mongoose.connection.db) {
+    throw new Error('Banco de dados indisponível.');
+  }
+
+  const bucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
+    bucketName: 'react_vite_sources',
+  });
+  const uploadStream = bucket.openUploadStream(`${projectId}-${Date.now()}.zip`, {
+    contentType: 'application/zip',
+    metadata: {
+      projectId: String(projectId),
+      originalName: String(originalName || 'source.zip'),
+      type: 'react_vite',
+    },
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const sourceStream = fsSync.createReadStream(zipPath);
+      let settled = false;
+
+      const finish = (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      };
+
+      sourceStream.on('error', finish);
+      uploadStream.on('error', finish);
+      uploadStream.on('finish', () => finish());
+      sourceStream.pipe(uploadStream);
+    });
+  } catch (error) {
+    await bucket.delete(uploadStream.id).catch(() => {});
+    throw error;
+  }
+
+  return {
+    bucket,
+    fileId: uploadStream.id,
+  };
+}
+
 async function pathExists(targetPath) {
   try {
     await fs.access(targetPath);
@@ -1280,65 +1309,6 @@ async function validateReactViteProject(appRoot) {
   }
 }
 
-async function runNpmCommand(args, cwd, options = {}) {
-  const redactionValues = getCommandRedactionValues(options);
-
-  try {
-    const result = await execFileAsync('npm', args, {
-      cwd,
-      env: buildSubprocessEnv(options),
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: 15 * 60 * 1000,
-    });
-
-    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
-  } catch (error) {
-    throw new Error(formatBuildCommandFailure('npm', args, error, redactionValues));
-  }
-}
-
-async function runNpxCommand(args, cwd, options = {}) {
-  const redactionValues = getCommandRedactionValues(options);
-
-  try {
-    const result = await execFileAsync('npx', args, {
-      cwd,
-      env: buildSubprocessEnv(options),
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: 15 * 60 * 1000,
-    });
-
-    return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
-  } catch (error) {
-    throw new Error(formatBuildCommandFailure('npx', args, error, redactionValues));
-  }
-}
-
-async function readPackageJson(appRoot) {
-  const packageJsonPath = path.join(appRoot, 'package.json');
-  const rawPackageJson = await fs.readFile(packageJsonPath, 'utf8');
-
-  return JSON.parse(rawPackageJson);
-}
-
-function buildScriptContainsTscBuild(packageJson) {
-  const buildScript = packageJson?.scripts?.build;
-
-  return typeof buildScript === 'string' && /\btsc\b/.test(buildScript);
-}
-
-function looksLikeTypecheckFailure(logs) {
-  return [
-    /\btsc\b/i,
-    /\btsc\s+-b\b/i,
-    /\btsc\s+--build\b/i,
-    /\btypescript\b/i,
-    /\bTS\d{4}\b/,
-    /type\s+checking/i,
-    /vue-tsc/i,
-  ].some((pattern) => pattern.test(logs || ''));
-}
-
 function formatConnectorInjectionLog(resolution) {
   if (!resolution || !Array.isArray(resolution.requiredEnvVars)) {
     return '';
@@ -1497,80 +1467,6 @@ function redactBuildLogs(logs, extraSensitiveValues = []) {
   });
 
   return redacted;
-}
-
-function formatBuildCommandFailure(command, args, error, redactionValues = []) {
-  const numericExitCode = Number(error?.code);
-  const exitCode = Number.isInteger(numericExitCode) ? numericExitCode : 'unknown';
-  const failureSummary = `[command failed: ${command} ${args.join(' ')}; exit code ${exitCode}]`;
-  const logs = [failureSummary, error?.stdout, error?.stderr, error?.message]
-    .filter(Boolean)
-    .join('\n');
-
-  return redactBuildLogs(logs, redactionValues);
-}
-
-function buildSubprocessEnv(options = {}) {
-  const env = {};
-
-  SUBPROCESS_ENV_ALLOWLIST.forEach((name) => {
-    if (typeof process.env[name] === 'string') {
-      env[name] = process.env[name];
-    }
-  });
-
-  Object.entries(options.env || {}).forEach(([name, value]) => {
-    if (SUBPROCESS_ENV_ALLOWLIST.has(name) && value !== undefined && value !== null) {
-      env[name] = String(value);
-    }
-  });
-
-  Object.entries(options.frontendEnv || {}).forEach(([name, value]) => {
-    if (/^VITE_[A-Za-z0-9_]+$/.test(name) && value !== undefined && value !== null) {
-      env[name] = String(value);
-    }
-  });
-
-  env.CI = 'true';
-
-  return env;
-}
-
-function getCommandRedactionValues(options = {}) {
-  return Object.values(options.frontendEnv || {})
-    .filter((value) => typeof value === 'string' && value.length >= 6);
-}
-
-async function runViteBuildWithoutTypecheck(appRoot, options = {}) {
-  return runNpxCommand(['vite', 'build'], appRoot, options);
-}
-
-async function runFallbackViteBuild(appRoot, precedingLogs = '', options = {}) {
-  const fallbackLog = [precedingLogs, 'Fallback aplicado: npx vite build sem typecheck.']
-    .filter(Boolean)
-    .join('\n');
-
-  try {
-    return [fallbackLog, await runViteBuildWithoutTypecheck(appRoot, options)]
-      .filter(Boolean)
-      .join('\n');
-  } catch (error) {
-    throw new Error([fallbackLog, error.message].filter(Boolean).join('\n'));
-  }
-}
-
-async function runReactViteBuild(appRoot, options = {}) {
-  const packageJson = await readPackageJson(appRoot);
-
-  try {
-    return await runNpmCommand(['run', 'build'], appRoot, options);
-  } catch (error) {
-    if (!buildScriptContainsTscBuild(packageJson) && !looksLikeTypecheckFailure(error.message)) {
-      throw error;
-    }
-
-    return runFallbackViteBuild(appRoot, error.message, options);
-  }
 }
 
 function stripJsonComments(json) {
@@ -2327,135 +2223,39 @@ router.post(
     }
 
     const project = req.project;
-    const timestamp = req.reactViteBuildTimestamp;
     const buildDir = req.reactViteBuildDir;
     const sourceZipPath = req.file.path;
     const extractDir = path.join(buildDir, 'source');
-    let logs = '';
-    let temporaryFrontendEnvRedactionValues = [];
-    let connectorInjection = {
-      requiredEnvVars: [],
-      frontendEnvVars: [],
-      backendEnvVars: [],
-      resolvedConnectors: [],
-      unresolvedConnectors: [],
-      injectionPlan: [],
-      blockedEnvVars: [],
-      unresolvedBackendEnvVars: [],
-    };
+    let sourceGridFsFile = null;
+    let build = null;
+    let job = null;
 
     try {
       await extractZipSafely(sourceZipPath, extractDir);
 
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
-      try {
-        const connectorInjectionBuildFiles = await collectConnectorInjectionBuildFiles(appRoot);
-        connectorInjection = await resolveProjectConnectorInjection(
-          project._id,
-          connectorInjectionBuildFiles
-        );
-        logs += `${formatConnectorInjectionLog(connectorInjection)}\n`;
-      } catch (connectorInjectionError) {
-        logs += `Connector injection plan unavailable: ${connectorInjectionError.message}\n`;
-      }
+      sourceGridFsFile = await uploadReactViteSourceZip(
+        sourceZipPath,
+        project._id,
+        req.file.originalname
+      );
 
-      const developmentInstallEnv = {
-        NODE_ENV: 'development',
-        NPM_CONFIG_PRODUCTION: 'false',
-      };
-
-      const temporaryFrontendEnv = await createTemporaryFrontendEnv({
-        projectId: project._id,
-        projectDir: appRoot,
-        injectionPlan: connectorInjection.injectionPlan,
-      });
-      temporaryFrontendEnvRedactionValues = Object.values(temporaryFrontendEnv.envValues || {});
-
-      if (temporaryFrontendEnv.injectedEnvVars.length > 0) {
-        logs += `Frontend env vars injected: ${temporaryFrontendEnv.injectedEnvVars.join(', ')}\n`;
-      }
-
-      try {
-        logs += await runNpmCommand(['install', '--include=dev'], appRoot, {
-          env: developmentInstallEnv,
-        });
-        logs += '\n';
-
-        logs += await runNpmCommand(['install', 'react', 'react-dom'], appRoot, {
-          env: developmentInstallEnv,
-        });
-        logs += '\n';
-
-        logs += await runNpmCommand(
-          ['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'],
-          appRoot,
-          {
-            env: developmentInstallEnv,
-          }
-        );
-        logs += '\n';
-
-        const fixedTsconfigPaths = await applyTsconfigDeprecationFix(appRoot);
-        for (const fixedTsconfigPath of fixedTsconfigPaths) {
-          logs += `Auto-fix TS5107 aplicado em: ${fixedTsconfigPath}\n`;
-        }
-
-        const viteConfigFixed = await ensureViteRelativeBase(appRoot);
-        if (viteConfigFixed) {
-          logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
-        }
-
-        logs += await runReactViteBuild(appRoot, {
-          frontendEnv: temporaryFrontendEnv.envValues,
-        });
-      } finally {
-        await temporaryFrontendEnv.cleanup();
-      }
-
-      const distDir = path.join(appRoot, 'dist');
-
-      if (!(await pathExists(distDir))) {
-        throw new Error('Build concluído sem gerar a pasta dist.');
-      }
-
-      if (await fixDistIndexAssetPaths(distDir)) {
-        logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
-      }
-
-      const distIndexPath = path.join(distDir, 'index.html');
-      const fullHtml = await fs.readFile(distIndexPath, 'utf8');
-      const artifactSnapshot = await collectBuildArtifactFiles(distDir);
-      const sourceSnapshot = await collectProjectSourceFiles(appRoot);
-
-      if (!artifactSnapshot.complete) {
-        logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
-      }
-
-      if (!sourceSnapshot.complete) {
-        logs += `\nAviso: source excedeu ${MAX_MONGO_SOURCE_BYTES} bytes; ${sourceSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
-      }
-
-      const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
-      await fs.mkdir(publicBuildDir, { recursive: true });
-      await fs.cp(distDir, publicBuildDir, { recursive: true });
-
-      const previewUrl = `/builds/${project._id}/${timestamp}/index.html`;
-      const redactedLogs = redactBuildLogs(logs, temporaryFrontendEnvRedactionValues);
-      const build = await ProjectBuild.create({
+      build = await ProjectBuild.create({
         projectId: project._id,
         type: 'react_vite',
-        status: 'draft',
-        distUrl: previewUrl,
-        previewUrl,
-        buildUrl: previewUrl,
-        deployUrl: previewUrl,
-        fullHtml,
-        artifactFiles: artifactSnapshot.files,
-        sourceFiles: sourceSnapshot.files,
-        sourceZipUrl: '',
-        logs: [redactedLogs, 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
+        status: 'in_progress',
+        logs: 'React/Vite build enfileirado.',
       });
+      job = await BuildJob.create({
+        type: 'react_vite',
+        projectId: project._id,
+        projectBuildId: build._id,
+        sourceGridFsFileId: sourceGridFsFile.fileId,
+        status: 'queued',
+      });
+      build.buildJobId = job._id;
+      await build.save();
 
       await Project.findByIdAndUpdate(
         project._id,
@@ -2471,38 +2271,36 @@ router.post(
         }
       );
 
-      return res.status(201).json({
+      return res.status(202).json({
         success: true,
         build: withAbsoluteBuildUrls(req, build),
-        previewUrl: toAbsoluteBackendUrl(req, previewUrl),
-        connectorInjection,
+        buildId: String(build._id),
+        jobId: String(job._id),
+        status: 'queued',
       });
     } catch (error) {
-      if (error?.code === INVALID_REACT_VITE_ZIP_ERROR_CODE) {
-        await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
-        return res.status(400).json({ message: INVALID_REACT_VITE_ZIP_MESSAGE });
+      if (job) {
+        await BuildJob.deleteOne({ _id: job._id }).catch(() => {});
       }
 
-      const errorLogs = redactBuildLogs(
-        [logs, error.message].filter(Boolean).join('\n'),
-        temporaryFrontendEnvRedactionValues
-      );
-      const build = await ProjectBuild.create({
-        projectId: project._id,
-        type: 'react_vite',
-        status: 'failed',
-        logs: errorLogs,
-      });
+      if (build) {
+        await ProjectBuild.deleteOne({ _id: build._id }).catch(() => {});
+      }
+
+      if (sourceGridFsFile) {
+        await sourceGridFsFile.bucket.delete(sourceGridFsFile.fileId).catch(() => {});
+      }
+
+      if (error?.code === INVALID_REACT_VITE_ZIP_ERROR_CODE) {
+        return res.status(400).json({ message: INVALID_REACT_VITE_ZIP_MESSAGE });
+      }
 
       return res.status(500).json({
         success: false,
         message: 'Erro interno do servidor.',
-        build: {
-          ...withAbsoluteBuildUrls(req, build),
-          logs: '',
-        },
-        connectorInjection,
       });
+    } finally {
+      await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 );
