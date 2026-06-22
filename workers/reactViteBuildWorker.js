@@ -82,7 +82,7 @@ async function claimNextJob() {
       $set: { status: 'claimed', claimedBy: WORKER_ID, leaseUntil },
       $inc: { attempt: 1 },
     },
-    { new: true, sort: { queuedAt: 1, _id: 1 } }
+    { returnDocument: 'after', sort: { queuedAt: 1, _id: 1 } }
   );
 }
 
@@ -97,7 +97,7 @@ async function markRunning(job) {
         leaseUntil: new Date(now.getTime() + LEASE_MS),
       },
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
 
   return result;
@@ -192,7 +192,7 @@ async function runBuildPipeline(job, workspace) {
           logs: [redactBuildLogs(logs, temporaryFrontendEnvRedactionValues), 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
         },
       },
-      { new: true, runValidators: true }
+      { returnDocument: 'after', runValidators: true }
     );
     if (!build) throw new Error('ProjectBuild não encontrado para o BuildJob.');
 
