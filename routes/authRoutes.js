@@ -9,11 +9,31 @@ router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    if (!name || !email || !password) {
+    if (
+      typeof name !== 'string' ||
+      !name.trim() ||
+      typeof email !== 'string' ||
+      !email.trim() ||
+      typeof password !== 'string' ||
+      !password
+    ) {
       return res.status(400).json({ message: 'Preencha todos os campos.' });
     }
 
-    const userExists = await User.findOne({ email });
+    const normalizedEmail = email.trim();
+    const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+
+    if (!emailIsValid) {
+      return res.status(400).json({ message: 'Informe um e-mail válido.' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        message: 'A senha deve ter pelo menos 8 caracteres.',
+      });
+    }
+
+    const userExists = await User.findOne({ email: normalizedEmail });
 
     if (userExists) {
       return res.status(400).json({ message: 'Este e-mail já está cadastrado.' });
@@ -23,7 +43,7 @@ router.post('/register', async (req, res) => {
 
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
     });
 
