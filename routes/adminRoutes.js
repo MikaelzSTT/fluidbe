@@ -389,6 +389,55 @@ function validateObjectIdParam(paramName, message) {
   };
 }
 
+function getLegacyBuildJobStatus(projectBuildStatus) {
+  switch (projectBuildStatus) {
+    case 'failed':
+      return 'failed';
+    case 'in_progress':
+      return 'running';
+    case 'draft':
+    case 'done':
+      return 'succeeded';
+    default:
+      return 'queued';
+  }
+}
+
+function buildStatusError(projectBuild, buildJob) {
+  const failed = buildJob
+    ? ['failed', 'timed_out', 'cancelled'].includes(buildJob.status)
+    : projectBuild.status === 'failed';
+
+  if (!failed) {
+    return null;
+  }
+
+  if (buildJob) {
+    return {
+      code: buildJob.errorCode || null,
+      message: buildJob.errorMessage || 'Build falhou.',
+    };
+  }
+
+  return {
+    code: null,
+    message: 'Build falhou.',
+  };
+}
+
+function isValidBuildPreviewUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch (error) {
+    return false;
+  }
+}
+
 function resolvePublicBuildIndexPath(buildUrl) {
   if (typeof buildUrl !== 'string') {
     return null;
@@ -2582,6 +2631,60 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
     });
   }
 });
+
+router.get(
+  '/projects/:projectId/builds/:buildId/status',
+  requireAdmin,
+  validateObjectIdParam('projectId', 'ID de projeto inválido.'),
+  validateObjectIdParam('buildId', 'ID de build inválido.'),
+  async (req, res) => {
+    try {
+      const { projectId, buildId } = req.params;
+      const projectBuild = await ProjectBuild.findOne({
+        _id: buildId,
+        projectId,
+      }).select('status previewUrl buildUrl distUrl buildJobId');
+
+      if (!projectBuild) {
+        return res.status(404).json({ message: 'Build não encontrado.' });
+      }
+
+      let buildJob = null;
+
+      if (projectBuild.buildJobId) {
+        buildJob = await BuildJob.findOne({
+          _id: projectBuild.buildJobId,
+          projectBuildId: projectBuild._id,
+        }).select('status errorCode errorMessage');
+      }
+
+      if (!buildJob) {
+        buildJob = await BuildJob.findOne({ projectBuildId: projectBuild._id })
+          .sort({ createdAt: -1 })
+          .select('status errorCode errorMessage');
+      }
+
+      const previewUrl = toAbsoluteBackendUrl(
+        req,
+        projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.distUrl || ''
+      );
+      const projectBuildStatus = projectBuild.status;
+      const jobStatus = buildJob ? buildJob.status : getLegacyBuildJobStatus(projectBuildStatus);
+
+      return res.json({
+        buildId: String(projectBuild._id),
+        projectBuildStatus,
+        jobStatus,
+        previewReady:
+          ['draft', 'done'].includes(projectBuildStatus) && isValidBuildPreviewUrl(previewUrl),
+        previewUrl,
+        error: buildStatusError(projectBuild, buildJob),
+      });
+    } catch (error) {
+      return res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+  }
+);
 
 router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async (req, res) => {
   try {
