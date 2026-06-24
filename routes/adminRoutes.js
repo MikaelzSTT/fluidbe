@@ -425,19 +425,6 @@ function buildStatusError(projectBuild, buildJob) {
   };
 }
 
-function isValidBuildPreviewUrl(value) {
-  if (typeof value !== 'string' || !value.trim()) {
-    return false;
-  }
-
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch (error) {
-    return false;
-  }
-}
-
 function resolvePublicBuildIndexPath(buildUrl) {
   if (typeof buildUrl !== 'string') {
     return null;
@@ -534,6 +521,55 @@ async function hasMongoBuildFallback(buildUrl) {
           build.artifactFiles.some((file) => (file.relativePath || file.path) === 'index.html'))
       )
   );
+}
+
+function getCanonicalBuildPreviewUrl(projectId, projectBuild) {
+  const buildUrls = [
+    projectBuild.previewUrl,
+    projectBuild.buildUrl,
+    projectBuild.deployUrl,
+    projectBuild.distUrl,
+  ];
+
+  for (const buildUrl of buildUrls) {
+    const parsedUrl = parsePublicBuildUrl(buildUrl);
+
+    if (parsedUrl && parsedUrl.projectId === String(projectId)) {
+      return parsedUrl.indexBuildUrl;
+    }
+  }
+
+  return '';
+}
+
+async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
+  const indexBuildUrl = getCanonicalBuildPreviewUrl(projectId, projectBuild);
+
+  if (!indexBuildUrl) {
+    return '';
+  }
+
+  const indexPath = resolvePublicBuildIndexPath(indexBuildUrl);
+
+  if (indexPath) {
+    try {
+      const indexStats = await fs.stat(indexPath);
+
+      if (indexStats.isFile()) {
+        return toAbsoluteBackendUrl(req, indexBuildUrl);
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+
+  if (await hasMongoBuildFallback(indexBuildUrl)) {
+    return toAbsoluteBackendUrl(req, indexBuildUrl);
+  }
+
+  return '';
 }
 
 async function collectBuildArtifactFiles(distDir) {
@@ -2643,7 +2679,7 @@ router.get(
       const projectBuild = await ProjectBuild.findOne({
         _id: buildId,
         projectId,
-      }).select('status previewUrl buildUrl distUrl buildJobId');
+      }).select('status previewUrl buildUrl deployUrl distUrl buildJobId');
 
       if (!projectBuild) {
         return res.status(404).json({ message: 'Build não encontrado.' });
@@ -2664,10 +2700,7 @@ router.get(
           .select('status errorCode errorMessage');
       }
 
-      const previewUrl = toAbsoluteBackendUrl(
-        req,
-        projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.distUrl || ''
-      );
+      const previewUrl = await getServableBuildPreviewUrl(req, projectId, projectBuild);
       const projectBuildStatus = projectBuild.status;
       const jobStatus = buildJob ? buildJob.status : getLegacyBuildJobStatus(projectBuildStatus);
 
@@ -2675,8 +2708,7 @@ router.get(
         buildId: String(projectBuild._id),
         projectBuildStatus,
         jobStatus,
-        previewReady:
-          ['draft', 'done'].includes(projectBuildStatus) && isValidBuildPreviewUrl(previewUrl),
+        previewReady: ['draft', 'done'].includes(projectBuildStatus) && Boolean(previewUrl),
         previewUrl,
         error: buildStatusError(projectBuild, buildJob),
       });

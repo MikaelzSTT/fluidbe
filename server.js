@@ -290,7 +290,10 @@ async function authorizeBuildAccess(req, res, next) {
       return res.sendStatus(404);
     }
 
-    if (build.status === 'done' || project.isPublished === true) {
+    // A completed worker build remains in "draft" until publication. Its
+    // artifact must still be reachable by an iframe, which cannot attach the
+    // API authorization headers used by the admin client.
+    if (['draft', 'done'].includes(build.status) || project.isPublished === true) {
       return next();
     }
 
