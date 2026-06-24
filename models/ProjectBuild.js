@@ -145,6 +145,37 @@ const projectBuildSchema = new mongoose.Schema(
       default: [],
     },
 
+    sourceSummary: {
+      type: String,
+      default: '',
+    },
+
+    indexedFiles: {
+      type: [
+        {
+          _id: false,
+          path: {
+            type: String,
+            required: true,
+          },
+          kind: {
+            type: String,
+            required: true,
+          },
+          size: {
+            type: Number,
+            required: true,
+            min: 0,
+          },
+          excerpt: {
+            type: String,
+            default: '',
+          },
+        },
+      ],
+      default: [],
+    },
+
     artifactFilesSource: {
       type: [
         {
