@@ -182,6 +182,17 @@ const projectSchema = new mongoose.Schema(
       default: '',
     },
 
+    deployUrl: {
+      type: String,
+      default: '',
+    },
+
+    latestPublishedBuildId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ProjectBuild',
+      default: null,
+    },
+
     reactVite: {
       type: Boolean,
       default: false,

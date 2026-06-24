@@ -187,14 +187,37 @@ async function runBuildPipeline(job, workspace) {
       { _id: job.projectBuildId, projectId: job.projectId },
       {
         $set: {
-          status: 'draft', distUrl: previewUrl, previewUrl, buildUrl: previewUrl, deployUrl: previewUrl,
+          distUrl: previewUrl, previewUrl, buildUrl: previewUrl, deployUrl: previewUrl,
           fullHtml, artifactFiles: artifactSnapshot.files, sourceFiles: sourceSnapshot.files, sourceZipUrl: '',
           logs: [redactBuildLogs(logs, temporaryFrontendEnvRedactionValues), 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
         },
       },
       { returnDocument: 'after', runValidators: true }
     );
-    if (!build) throw new Error('ProjectBuild não encontrado para o BuildJob.');
+    if (!build) {
+      throw new Error('ProjectBuild não encontrado para o BuildJob.');
+    }
+
+    if (build.status === 'in_progress') {
+      const transitionedBuild = await ProjectBuild.findOneAndUpdate(
+        { _id: build._id, projectId: job.projectId, status: 'in_progress' },
+        { $set: { status: 'draft' } },
+        { returnDocument: 'after', runValidators: true }
+      );
+
+      if (!transitionedBuild) {
+        const currentBuild = await ProjectBuild.findOne({
+          _id: job.projectBuildId,
+          projectId: job.projectId,
+        }).select('status');
+
+        if (!currentBuild || currentBuild.status !== 'done') {
+          throw new Error('ProjectBuild mudou de estado antes da conclusão do worker.');
+        }
+      }
+    } else if (build.status !== 'done') {
+      throw new Error(`ProjectBuild está em estado inesperado: ${build.status}.`);
+    }
 
     await bucket.delete(job.sourceGridFsFileId);
     sourceZipDeleted = true;
@@ -205,7 +228,7 @@ async function runBuildPipeline(job, workspace) {
   } catch (error) {
     const message = redactBuildLogs([logs, error.message].filter(Boolean).join('\n'), temporaryFrontendEnvRedactionValues);
     await ProjectBuild.updateOne(
-      { _id: job.projectBuildId, projectId: job.projectId },
+      { _id: job.projectBuildId, projectId: job.projectId, status: { $ne: 'done' } },
       { $set: { status: 'failed', logs: message } },
       { runValidators: true }
     ).catch(() => {});

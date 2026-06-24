@@ -213,7 +213,7 @@ function withAbsoluteProjectBuildUrls(req, document) {
       ? document.toObject({ getters: true, virtuals: true })
       : { ...document };
 
-  for (const field of ['distUrl', 'previewUrl', 'buildUrl']) {
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
     payload[field] = toAbsoluteBackendUrl(req, payload[field]);
   }
 
@@ -291,6 +291,26 @@ async function applyPublicationFields(project, update) {
     publishedAt,
     url: `${PUBLIC_BASE_URL}/p/${slug}`,
   });
+}
+
+function applyPublishedBuildFields(build, update) {
+  const publishedBuild =
+    typeof build.toObject === 'function'
+      ? build.toObject({ getters: true, virtuals: true })
+      : build;
+
+  update.reactVite = build.type === 'react_vite';
+  update.build = publishedBuild;
+  update.latestPublishedBuildId = build._id;
+  update.distUrl = build.distUrl || '';
+  update.previewUrl = build.previewUrl || '';
+  update.buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '';
+  update.deployUrl = build.deployUrl || build.buildUrl || build.previewUrl || build.distUrl || '';
+
+  if (build.fullHtml) {
+    update.fullHtml = build.fullHtml;
+    update.latestFullHtml = build.fullHtml;
+  }
 }
 
 function requireAdmin(req, res, next) {
@@ -2024,7 +2044,9 @@ function pickBuildPayload(body) {
 async function applyLatestPendingBuild(projectId, update) {
   const latestPendingBuild = await ProjectBuild.findOne({
     projectId,
-    status: { $in: ['draft', 'in_progress'] },
+    // Legacy publication paths cannot target a build explicitly. Never promote
+    // a worker build that is still running; new callers must use /publish.
+    status: 'draft',
   }).sort({
     createdAt: -1,
     updatedAt: -1,
@@ -2036,26 +2058,7 @@ async function applyLatestPendingBuild(projectId, update) {
 
   latestPendingBuild.status = 'done';
   await latestPendingBuild.save();
-  const publishedBuild = latestPendingBuild.toObject({
-    getters: true,
-    virtuals: true,
-  });
-
-  update.reactVite = latestPendingBuild.type === 'react_vite';
-  update.build = publishedBuild;
-  update.distUrl = latestPendingBuild.distUrl || '';
-  update.previewUrl = latestPendingBuild.previewUrl || '';
-  update.buildUrl =
-    latestPendingBuild.buildUrl ||
-    latestPendingBuild.deployUrl ||
-    latestPendingBuild.previewUrl ||
-    latestPendingBuild.distUrl ||
-    '';
-
-  if (latestPendingBuild.fullHtml) {
-    update.fullHtml = latestPendingBuild.fullHtml;
-    update.latestFullHtml = latestPendingBuild.fullHtml;
-  }
+  applyPublishedBuildFields(latestPendingBuild, update);
 }
 
 router.get('/change-requests', requireAdmin, async (req, res) => {
@@ -2667,6 +2670,125 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
     });
   }
 });
+
+router.post(
+  '/projects/:projectId/builds/:buildId/publish',
+  requireAdmin,
+  validateObjectIdParam('projectId', 'ID de projeto inválido.'),
+  validateObjectIdParam('buildId', 'ID de build inválido.'),
+  async (req, res) => {
+    try {
+      const { projectId, buildId } = req.params;
+      const project = await Project.findById(projectId);
+
+      if (!project) {
+        return res.status(404).json({ message: 'Projeto não encontrado.' });
+      }
+
+      const projectBuild = await ProjectBuild.findOne({
+        _id: buildId,
+        projectId: project._id,
+      });
+
+      if (!projectBuild) {
+        return res.status(404).json({ message: 'Build não encontrado.' });
+      }
+
+      if (projectBuild.status === 'done') {
+        return res.status(409).json({
+          message: 'Build já está publicado.',
+          code: 'BUILD_ALREADY_PUBLISHED',
+        });
+      }
+
+      if (projectBuild.status !== 'draft') {
+        return res.status(409).json({
+          message: 'Apenas builds concluídos e em draft podem ser publicados.',
+          code: 'BUILD_NOT_READY_FOR_PUBLICATION',
+          buildStatus: projectBuild.status,
+        });
+      }
+
+      let buildJob = null;
+
+      if (projectBuild.buildJobId) {
+        buildJob = await BuildJob.findOne({
+          _id: projectBuild.buildJobId,
+          projectBuildId: projectBuild._id,
+          projectId: project._id,
+        }).select('status');
+
+        if (!buildJob) {
+          return res.status(409).json({
+            message: 'BuildJob vinculado não foi encontrado para este build.',
+            code: 'BUILD_JOB_LINK_INVALID',
+          });
+        }
+      } else {
+        buildJob = await BuildJob.findOne({
+          projectBuildId: projectBuild._id,
+          projectId: project._id,
+        })
+          .sort({ createdAt: -1 })
+          .select('status');
+      }
+
+      if (buildJob && buildJob.status !== 'succeeded') {
+        return res.status(409).json({
+          message: 'O build worker ainda não concluiu este build com sucesso.',
+          code: 'BUILD_JOB_NOT_SUCCEEDED',
+          jobStatus: buildJob.status,
+        });
+      }
+
+      const previewUrl = await getServableBuildPreviewUrl(req, projectId, projectBuild);
+
+      if (!previewUrl) {
+        return res.status(409).json({
+          message: 'Artifact index.html do build não está disponível para publicação.',
+          code: 'BUILD_ARTIFACT_NOT_AVAILABLE',
+        });
+      }
+
+      const publishedBuild = await ProjectBuild.findOneAndUpdate(
+        {
+          _id: projectBuild._id,
+          projectId: project._id,
+          status: 'draft',
+        },
+        { $set: { status: 'done' } },
+        { new: true, runValidators: true }
+      );
+
+      if (!publishedBuild) {
+        return res.status(409).json({
+          message: 'O estado do build mudou antes da publicação. Atualize e tente novamente.',
+          code: 'BUILD_STATUS_CHANGED',
+        });
+      }
+
+      const update = {};
+      applyPublishedBuildFields(publishedBuild, update);
+      applyWizardStatus(update, 'done');
+      await applyPublicationFields(project, update);
+      update['metadata.lastBuildAt'] = new Date();
+
+      const publishedProject = await Project.findByIdAndUpdate(project._id, update, {
+        new: true,
+        runValidators: true,
+      });
+
+      return res.json({
+        success: true,
+        project: withAbsoluteProjectBuildUrls(req, publishedProject),
+        build: withAbsoluteBuildUrls(req, publishedBuild),
+        previewUrl,
+      });
+    } catch (error) {
+      return res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+  }
+);
 
 router.get(
   '/projects/:projectId/builds/:buildId/status',
