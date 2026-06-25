@@ -7,6 +7,7 @@ const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
+const { createSourceContext } = require('../utils/sourceContext');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
@@ -198,12 +199,27 @@ function scoreIndexedFile(file, terms) {
 }
 
 function buildProjectCodeContext(build, message) {
-  if (!build || (!build.sourceSummary && !Array.isArray(build.indexedFiles))) {
+  if (!build) {
     return '';
   }
 
-  const indexedFiles = Array.isArray(build.indexedFiles)
-    ? build.indexedFiles.filter((file) => file && typeof file.path === 'string')
+  let contextBuild = build;
+  const hasSummary = Boolean(String(build.sourceSummary || '').trim());
+  const hasIndexedFiles = Array.isArray(build.indexedFiles) && build.indexedFiles.length > 0;
+
+  if (!hasSummary && !hasIndexedFiles && Array.isArray(build.sourceFiles) && build.sourceFiles.length > 0) {
+    contextBuild = {
+      ...build,
+      ...createSourceContext(build.sourceFiles),
+    };
+  }
+
+  if (!contextBuild.sourceSummary && !Array.isArray(contextBuild.indexedFiles)) {
+    return '';
+  }
+
+  const indexedFiles = Array.isArray(contextBuild.indexedFiles)
+    ? contextBuild.indexedFiles.filter((file) => file && typeof file.path === 'string')
     : [];
   const terms = getCodeContextTerms(message);
   const rankedFiles = indexedFiles
@@ -217,7 +233,7 @@ function buildProjectCodeContext(build, message) {
     .filter(({ file }) => String(file.excerpt || '').trim())
     .slice(0, MAX_CODE_CONTEXT_EXCERPTS)
     .map(({ file }) => `Arquivo: ${file.path}\n${String(file.excerpt).slice(0, MAX_CODE_CONTEXT_EXCERPT_CHARS)}`);
-  const summary = String(build.sourceSummary || '').trim().slice(0, MAX_CODE_CONTEXT_SUMMARY_CHARS);
+  const summary = String(contextBuild.sourceSummary || '').trim().slice(0, MAX_CODE_CONTEXT_SUMMARY_CHARS);
 
   if (!summary && listedFiles.length === 0 && excerpts.length === 0) {
     return '';
@@ -974,7 +990,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
         status: { $in: ['draft', 'done'] },
       })
         .sort({ createdAt: -1, _id: -1 })
-        .select(VISUAL_CONTEXT_ENABLED ? 'sourceSummary indexedFiles previewUrl' : 'sourceSummary indexedFiles')
+        .select(VISUAL_CONTEXT_ENABLED ? 'sourceSummary indexedFiles sourceFiles previewUrl' : 'sourceSummary indexedFiles sourceFiles')
         .lean();
       projectCodeContext = buildProjectCodeContext(latestBuild, trimmedMessage);
       projectVisualContext = reserveProjectVisualContext(latestBuild);

@@ -26,6 +26,7 @@ const {
   resolveProjectArtifactFile,
   resolveProjectFileRoot: resolveSharedProjectFileRoot,
 } = require('../utils/projectFiles');
+const { createSourceContext } = require('../utils/sourceContext');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -1624,6 +1625,7 @@ async function runLegacyReactViteBuild(req, res, project, buildDir, extractDir) 
     const fullHtml = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
     const artifactSnapshot = await collectBuildArtifactFiles(distDir);
     const sourceSnapshot = await collectProjectSourceFiles(appRoot);
+    const sourceContext = createSourceContext(sourceSnapshot.files);
     if (!artifactSnapshot.complete) logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
     if (!sourceSnapshot.complete) logs += `\nAviso: source excedeu ${MAX_MONGO_SOURCE_BYTES} bytes; ${sourceSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
     const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
@@ -1632,7 +1634,8 @@ async function runLegacyReactViteBuild(req, res, project, buildDir, extractDir) 
     const build = await ProjectBuild.create({
       projectId: project._id, type: 'react_vite', status: 'draft', distUrl: previewUrl, previewUrl,
       buildUrl: previewUrl, deployUrl: previewUrl, fullHtml, artifactFiles: artifactSnapshot.files,
-      sourceFiles: sourceSnapshot.files, sourceZipUrl: '',
+      sourceFiles: sourceSnapshot.files, sourceSummary: sourceContext.sourceSummary,
+      indexedFiles: sourceContext.indexedFiles, sourceZipUrl: '',
       logs: [redactBuildLogs(logs, temporaryFrontendEnvRedactionValues), 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
     });
     await Project.findByIdAndUpdate(project._id, {
