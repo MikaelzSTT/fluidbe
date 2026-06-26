@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const authMiddleware = require('../middleware/authMiddleware');
 const User = require('../models/User');
 const { serializeUser, signAuthToken } = require('../utils/auth');
 
@@ -96,6 +97,31 @@ function withGoogleProvider(user) {
   user.providers = Array.from(new Set([...providers, 'google']));
 }
 
+function normalizeRequiredString(value, maxLength) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed || trimmed.length > maxLength) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+async function findAuthenticatedUser(req, res) {
+  const user = await User.findById(req.userId);
+
+  if (!user) {
+    res.status(401).json({ message: 'Usuário não encontrado.' });
+    return null;
+  }
+
+  return user;
+}
+
 router.get('/google', (req, res) => {
   const config = getGoogleOAuthConfig();
 
@@ -112,6 +138,60 @@ router.get('/google', (req, res) => {
   authUrl.searchParams.set('prompt', 'select_account');
 
   return res.redirect(authUrl.toString());
+});
+
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    return res.json({ user: serializeUser(user) });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.patch('/onboarding', authMiddleware, async (req, res) => {
+  try {
+    const theme = normalizeRequiredString(req.body.theme, 64);
+    const displayName = normalizeRequiredString(req.body.displayName, 80);
+    const role = normalizeRequiredString(req.body.role, 120);
+    const goal = normalizeRequiredString(req.body.goal, 160);
+
+    if (!theme || !displayName || !role || !goal) {
+      return res.status(400).json({
+        message: 'Informe theme, displayName, role e goal válidos.',
+      });
+    }
+
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    user.preferences = {
+      theme,
+      displayName,
+      role,
+      goal,
+      completedAt: new Date(),
+    };
+    user.onboardingComplete = true;
+
+    await user.save();
+
+    return res.json({ user: serializeUser(user) });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
 });
 
 router.get('/google/callback', async (req, res) => {

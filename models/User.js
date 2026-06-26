@@ -45,6 +45,33 @@ const userSchema = new mongoose.Schema(
       enum: ['local', 'google'],
       default: ['local'],
     },
+
+    onboardingComplete: {
+      type: Boolean,
+      default: false,
+    },
+
+    preferences: {
+      theme: {
+        type: String,
+        trim: true,
+      },
+      displayName: {
+        type: String,
+        trim: true,
+      },
+      role: {
+        type: String,
+        trim: true,
+      },
+      goal: {
+        type: String,
+        trim: true,
+      },
+      completedAt: {
+        type: Date,
+      },
+    },
   },
   { timestamps: true }
 );
