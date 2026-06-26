@@ -18,7 +18,32 @@ const userSchema = new mongoose.Schema(
 
     password: {
       type: String,
-      required: true,
+      required: function requirePasswordForLocalUser() {
+        return !Array.isArray(this.providers) || this.providers.includes('local');
+      },
+    },
+
+    googleId: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+    },
+
+    avatar: {
+      type: String,
+      trim: true,
+    },
+
+    emailVerified: {
+      type: Boolean,
+      default: false,
+    },
+
+    providers: {
+      type: [String],
+      enum: ['local', 'google'],
+      default: ['local'],
     },
   },
   { timestamps: true }
