@@ -50,6 +50,8 @@ const MAX_MONGO_SOURCE_BYTES = Number(process.env.MAX_MONGO_SOURCE_BYTES || 3 * 
 const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
 const MAX_PROJECT_FILE_TREE_ENTRIES = Number(process.env.MAX_PROJECT_FILE_TREE_ENTRIES || 5000);
 const BUILD_WORKER_ENABLED = process.env.BUILD_WORKER_ENABLED === 'true';
+const SECURITY_SCAN_MAX_FINDINGS = 50;
+const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
@@ -294,6 +296,51 @@ async function applyPublicationFields(project, update) {
   });
 }
 
+function sanitizeOptionalText(value, maxLength = null) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = String(value || '').trim();
+  return maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+function buildPublishMetadataUpdate(body) {
+  const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(body || {}, 'visibility')) {
+    const visibility = String(body.visibility || '').trim();
+
+    if (visibility !== 'public') {
+      const error = new Error('Visibility inválida.');
+      error.statusCode = 400;
+      error.payload = {
+        message: 'Visibility inválida.',
+        allowedVisibility: ['public'],
+      };
+      throw error;
+    }
+
+    update.visibility = 'public';
+  }
+
+  if (body && typeof body.seo === 'object' && !Array.isArray(body.seo)) {
+    const seoFields = {
+      title: sanitizeOptionalText(body.seo.title, 60),
+      description: sanitizeOptionalText(body.seo.description, 160),
+      socialImage: sanitizeOptionalText(body.seo.socialImage),
+    };
+
+    Object.entries(seoFields).forEach(([field, value]) => {
+      if (value !== undefined) {
+        update[`seo.${field}`] = value;
+      }
+    });
+  }
+
+  return update;
+}
+
 function applyPublishedBuildFields(build, update) {
   const publishedBuild =
     typeof build.toObject === 'function'
@@ -443,6 +490,200 @@ function buildStatusError(projectBuild, buildJob) {
   return {
     code: null,
     message: 'Build falhou.',
+  };
+}
+
+function getSecurityScanLine(content, index) {
+  return String(content || '').slice(0, index).split('\n').length;
+}
+
+function redactSecurityPreview(value) {
+  const compact = String(value || '').replace(/\s+/g, ' ').trim();
+
+  if (!compact) {
+    return '';
+  }
+
+  if (compact.length <= 12) {
+    return '[REDACTED]';
+  }
+
+  return `${compact.slice(0, 8)}...${compact.slice(-4)}`;
+}
+
+function decodeBuildFileContent(file) {
+  if (!file || typeof file.content !== 'string') {
+    return '';
+  }
+
+  if (file.encoding === 'base64') {
+    try {
+      return Buffer.from(file.content, 'base64').toString('utf8');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  return file.content;
+}
+
+function collectSecurityScanInputs(projectBuild) {
+  const inputs = [];
+  const addInput = (file, content) => {
+    if (content === undefined || content === null) {
+      return;
+    }
+
+    const text = String(content);
+
+    if (!text) {
+      return;
+    }
+
+    inputs.push({
+      file: file || 'unknown',
+      content: text.slice(0, SECURITY_SCAN_MAX_TEXT_CHARS),
+    });
+  };
+  const addFileInputs = (files, sourceLabel) => {
+    (Array.isArray(files) ? files : []).forEach((file, index) => {
+      const filePath = file.relativePath || file.path || `${sourceLabel}[${index}]`;
+      addInput(filePath, decodeBuildFileContent(file));
+    });
+  };
+
+  addInput('fullHtml', projectBuild.fullHtml);
+  addInput('html', projectBuild.html);
+  addInput('css', projectBuild.css);
+  addInput('js', projectBuild.js);
+  addFileInputs(projectBuild.artifactFiles, 'artifactFiles');
+  addFileInputs(projectBuild.sourceFiles, 'sourceFiles');
+  addFileInputs(projectBuild.artifactFilesSource, 'artifactFilesSource');
+
+  (Array.isArray(projectBuild.indexedFiles) ? projectBuild.indexedFiles : []).forEach((file, index) => {
+    addInput(file.path || `indexedFiles[${index}]`, file.content || file.excerpt);
+  });
+
+  return inputs;
+}
+
+function addSecurityFinding(findings, finding) {
+  if (findings.length >= SECURITY_SCAN_MAX_FINDINGS) {
+    return;
+  }
+
+  findings.push(finding);
+}
+
+function scanSecurityPattern({ findings, input, pattern, severity, type, message }) {
+  let match;
+
+  pattern.lastIndex = 0;
+
+  while ((match = pattern.exec(input.content)) && findings.length < SECURITY_SCAN_MAX_FINDINGS) {
+    addSecurityFinding(findings, {
+      severity,
+      type,
+      message,
+      file: input.file || 'unknown',
+      line: getSecurityScanLine(input.content, match.index),
+      preview: redactSecurityPreview(match[0]),
+    });
+
+    if (match[0].length === 0) {
+      pattern.lastIndex += 1;
+    }
+  }
+}
+
+function looksLikeEnvFileContent(content) {
+  const envLikeLines = String(content || '')
+    .split('\n')
+    .filter((line) => /^\s*[A-Z][A-Z0-9_]{2,}\s*=/.test(line));
+  const sensitiveEnvLines = envLikeLines.filter((line) => (
+    /(?:SECRET|TOKEN|PASSWORD|PRIVATE|API_KEY|DATABASE_URL|MONGODB_URI|STRIPE|SUPABASE|OPENAI|AWS)/.test(line)
+  ));
+
+  return sensitiveEnvLines.length >= 1 && envLikeLines.length >= 2;
+}
+
+function scanBuildSecurity(projectBuild) {
+  const findings = [];
+  const criticalPatterns = [
+    { type: 'private_key', message: 'Private key marker found.', pattern: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/g },
+    { type: 'secret', message: 'OpenAI-style secret key found.', pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g },
+    { type: 'connection_string', message: 'MongoDB connection string found.', pattern: /mongodb(?:\+srv)?:\/\/[^\s'"<>]+/gi },
+    { type: 'token', message: 'Long token-like secret found near a sensitive label.', pattern: /\b(?:token|secret|api[_-]?key)\b\s*[:=]\s*["']?([A-Za-z0-9._~+/-]{32,})["']?/gi },
+  ];
+  const warningPatterns = [
+    { type: 'secret', message: 'Generic API_KEY assignment found.', pattern: /\bAPI_KEY\s*=/gi },
+    { type: 'secret', message: 'SECRET assignment found.', pattern: /\bSECRET\s*=/gi },
+    { type: 'token', message: 'TOKEN assignment found.', pattern: /\bTOKEN\s*=/gi },
+    { type: 'secret', message: 'PASSWORD assignment found.', pattern: /\bPASSWORD\s*=/gi },
+    { type: 'secret', message: 'Supabase service role reference found.', pattern: /\bSUPABASE_SERVICE_ROLE\b/gi },
+    { type: 'secret', message: 'Stripe secret key reference found.', pattern: /\bSTRIPE_SECRET_KEY\b/gi },
+    { type: 'token', message: 'GitHub token reference found.', pattern: /\bGITHUB_TOKEN\b/gi },
+    { type: 'secret', message: 'Google client secret reference found.', pattern: /\bGOOGLE_CLIENT_SECRET\b/gi },
+    { type: 'secret', message: 'AWS access key reference found.', pattern: /\bAWS_ACCESS_KEY_ID\b/gi },
+    { type: 'secret', message: 'AWS secret access key reference found.', pattern: /\bAWS_SECRET_ACCESS_KEY\b/gi },
+  ];
+
+  for (const input of collectSecurityScanInputs(projectBuild)) {
+    const basename = path.posix.basename(String(input.file || '').replace(/\\/g, '/')).toLowerCase();
+
+    if (basename === '.env' || basename.startsWith('.env.') || looksLikeEnvFileContent(input.content)) {
+      addSecurityFinding(findings, {
+        severity: 'critical',
+        type: 'env_file',
+        message: 'Environment file content included in build content.',
+        file: input.file || 'unknown',
+        line: null,
+        preview: redactSecurityPreview(input.file),
+      });
+    }
+
+    for (const scan of criticalPatterns) {
+      scanSecurityPattern({
+        findings,
+        input,
+        severity: 'critical',
+        type: scan.type,
+        message: scan.message,
+        pattern: scan.pattern,
+      });
+    }
+
+    for (const scan of warningPatterns) {
+      scanSecurityPattern({
+        findings,
+        input,
+        severity: 'warning',
+        type: scan.type,
+        message: scan.message,
+        pattern: scan.pattern,
+      });
+    }
+
+    if (findings.length >= SECURITY_SCAN_MAX_FINDINGS) {
+      break;
+    }
+  }
+
+  const hasCritical = findings.some((finding) => finding.severity === 'critical');
+  const hasWarning = findings.some((finding) => finding.severity === 'warning');
+  const status = hasCritical ? 'blocked' : hasWarning ? 'warning' : 'passed';
+  const score = status === 'blocked' ? 0 : status === 'warning' ? 70 : 100;
+  const summary = status === 'blocked'
+    ? 'Critical security findings were detected. Review before publishing.'
+    : status === 'warning'
+      ? 'Potential sensitive references were detected. Review before publishing.'
+      : 'No obvious sensitive build content was detected.';
+
+  return {
+    status,
+    score,
+    summary,
+    findings,
   };
 }
 
@@ -2682,6 +2923,7 @@ router.post(
   async (req, res) => {
     try {
       const { projectId, buildId } = req.params;
+      const publishMetadataUpdate = buildPublishMetadataUpdate(req.body);
       const project = await Project.findById(projectId);
 
       if (!project) {
@@ -2770,7 +3012,7 @@ router.post(
         });
       }
 
-      const update = {};
+      const update = { ...publishMetadataUpdate };
       applyPublishedBuildFields(publishedBuild, update);
       applyWizardStatus(update, 'done');
       await applyPublicationFields(project, update);
@@ -2788,6 +3030,10 @@ router.post(
         previewUrl,
       });
     } catch (error) {
+      if (error.statusCode && error.payload) {
+        return res.status(error.statusCode).json(error.payload);
+      }
+
       return res.status(500).json({ message: 'Erro interno do servidor.' });
     }
   }
@@ -2837,6 +3083,38 @@ router.get(
         previewUrl,
         error: buildStatusError(projectBuild, buildJob),
       });
+    } catch (error) {
+      return res.status(500).json({ message: 'Erro interno do servidor.' });
+    }
+  }
+);
+
+router.get(
+  '/projects/:projectId/builds/:buildId/security-scan',
+  requireAdmin,
+  validateObjectIdParam('projectId', 'ID de projeto inválido.'),
+  validateObjectIdParam('buildId', 'ID de build inválido.'),
+  async (req, res) => {
+    try {
+      const { projectId, buildId } = req.params;
+      const project = await Project.findById(projectId).select('_id');
+
+      if (!project) {
+        return res.status(404).json({ message: 'Projeto não encontrado.' });
+      }
+
+      const projectBuild = await ProjectBuild.findOne({
+        _id: buildId,
+        projectId: project._id,
+      }).select(
+        'fullHtml html css js artifactFiles sourceFiles artifactFilesSource indexedFiles'
+      );
+
+      if (!projectBuild) {
+        return res.status(404).json({ message: 'Build não encontrado.' });
+      }
+
+      return res.json(scanBuildSecurity(projectBuild));
     } catch (error) {
       return res.status(500).json({ message: 'Erro interno do servidor.' });
     }

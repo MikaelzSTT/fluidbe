@@ -188,6 +188,100 @@ function rewriteBuildAssetPaths(html, buildUrl) {
     .replaceAll("url('./assets/", `url('${buildBasePath}assets/`);
 }
 
+function escapeHtmlAttribute(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('"', '&quot;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+function getPublishedSeo(project) {
+  const seo = project?.seo || {};
+  const title = String(seo.title || project?.name || project?.title || 'Fluid App').trim().slice(0, 60) || 'Fluid App';
+  const description = String(seo.description || project?.prompt || project?.description || 'Built with Fluid').trim().slice(0, 160) || 'Built with Fluid';
+  const socialImage = String(seo.socialImage || '').trim();
+
+  return {
+    title,
+    description,
+    socialImage,
+  };
+}
+
+function getPublishedProjectUrl(project) {
+  const slug = String(project?.slug || '').trim();
+  return slug ? `${PUBLIC_BASE_URL}/p/${encodeURIComponent(slug)}` : PUBLIC_BASE_URL;
+}
+
+function getMetaTagMatcher(attributeName, attributeValue) {
+  return new RegExp(
+    `<meta\\b(?=[^>]*\\s${attributeName}=["']${attributeValue}["'])[^>]*>`,
+    'gi'
+  );
+}
+
+function injectTagIntoHead(html, tag) {
+  if (/<head\b[^>]*>/i.test(html)) {
+    return html.replace(/<head\b[^>]*>/i, (headTag) => `${headTag}\n${tag}`);
+  }
+
+  const headBlock = `<head>\n${tag}\n</head>`;
+
+  if (/<html\b[^>]*>/i.test(html)) {
+    return html.replace(/<html\b[^>]*>/i, (htmlTag) => `${htmlTag}\n${headBlock}`);
+  }
+
+  return `${headBlock}\n${html}`;
+}
+
+function upsertHeadTag(html, matcher, tag) {
+  return injectTagIntoHead(html.replace(matcher, ''), tag);
+}
+
+function removeHeadTag(html, matcher) {
+  return html.replace(matcher, '');
+}
+
+function injectPublishedSeo(html, project) {
+  if (typeof html !== 'string' || !html) {
+    return html || '';
+  }
+
+  const seo = getPublishedSeo(project);
+  const title = escapeHtmlAttribute(seo.title);
+  const description = escapeHtmlAttribute(seo.description);
+  const socialImage = escapeHtmlAttribute(seo.socialImage);
+  const publicUrl = escapeHtmlAttribute(getPublishedProjectUrl(project));
+  const twitterCard = socialImage ? 'summary_large_image' : 'summary';
+  let updatedHtml = html;
+
+  updatedHtml = upsertHeadTag(updatedHtml, /<title\b[^>]*>[\s\S]*?<\/title>/gi, `<title>${title}</title>`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('name', 'description'), `<meta name="description" content="${description}">`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:title'), `<meta property="og:title" content="${title}">`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:description'), `<meta property="og:description" content="${description}">`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:type'), '<meta property="og:type" content="website">');
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:url'), `<meta property="og:url" content="${publicUrl}">`);
+
+  if (socialImage) {
+    updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:image'), `<meta property="og:image" content="${socialImage}">`);
+  } else {
+    updatedHtml = removeHeadTag(updatedHtml, getMetaTagMatcher('property', 'og:image'));
+  }
+
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('name', 'twitter:card'), `<meta name="twitter:card" content="${twitterCard}">`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('name', 'twitter:title'), `<meta name="twitter:title" content="${title}">`);
+  updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('name', 'twitter:description'), `<meta name="twitter:description" content="${description}">`);
+
+  if (socialImage) {
+    updatedHtml = upsertHeadTag(updatedHtml, getMetaTagMatcher('name', 'twitter:image'), `<meta name="twitter:image" content="${socialImage}">`);
+  } else {
+    updatedHtml = removeHeadTag(updatedHtml, getMetaTagMatcher('name', 'twitter:image'));
+  }
+
+  return updatedHtml;
+}
+
 function parseBuildRequestPath(requestPath) {
   let pathname;
 
@@ -454,7 +548,7 @@ app.get('/p/:slug', async (req, res) => {
       return res.status(404).send('Projeto não encontrado.');
     }
 
-    const html = await loadPublishedHtml(project);
+    const html = injectPublishedSeo(await loadPublishedHtml(project), project);
 
     if (!html) {
       return res.status(404).send('Projeto não encontrado.');

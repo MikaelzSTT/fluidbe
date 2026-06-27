@@ -40,6 +40,29 @@ const projectSchema = new mongoose.Schema(
       default: false,
     },
 
+    visibility: {
+      type: String,
+      enum: ['public'],
+      default: 'public',
+    },
+
+    seo: {
+      title: {
+        type: String,
+        trim: true,
+        maxlength: 60,
+      },
+      description: {
+        type: String,
+        trim: true,
+        maxlength: 160,
+      },
+      socialImage: {
+        type: String,
+        trim: true,
+      },
+    },
+
     description: {
       type: String,
       default: '',
