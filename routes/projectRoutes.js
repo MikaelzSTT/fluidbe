@@ -24,6 +24,10 @@ const {
   resolveProjectFilePath,
   resolveProjectFileRoot,
 } = require('../utils/projectFiles');
+const {
+  publishProjectBuild,
+  scanBuildSecurity,
+} = require('../utils/projectPublication');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -1102,6 +1106,96 @@ router.get('/:projectId/builds/:buildId/status', authMiddleware, async (req, res
       error: buildStatusError(projectBuild, buildJob),
     });
   } catch (error) {
+    return res.status(500).json({ message: 'Erro interno do servidor.' });
+  }
+});
+
+router.get('/:projectId/builds/:buildId/security-scan', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, buildId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(projectId) || !mongoose.Types.ObjectId.isValid(buildId)) {
+      return res.status(400).json({ message: 'ID de projeto ou build inválido.' });
+    }
+
+    const project = await Project.findOne({
+      _id: projectId,
+      userId: req.userId,
+    }).select('_id');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const projectBuild = await ProjectBuild.findOne({
+      _id: buildId,
+      projectId: project._id,
+    }).select(
+      'fullHtml html css js artifactFiles sourceFiles artifactFilesSource indexedFiles'
+    );
+
+    if (!projectBuild) {
+      return res.status(404).json({ message: 'Build não encontrado.' });
+    }
+
+    return res.json(scanBuildSecurity(projectBuild));
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro interno do servidor.' });
+  }
+});
+
+router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, res) => {
+  try {
+    const { projectId, buildId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(projectId) || !mongoose.Types.ObjectId.isValid(buildId)) {
+      return res.status(400).json({ message: 'ID de projeto ou build inválido.' });
+    }
+
+    const project = await Project.findOne({
+      _id: projectId,
+      userId: req.userId,
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    const projectBuild = await ProjectBuild.findOne({
+      _id: buildId,
+      projectId: project._id,
+    });
+
+    if (!projectBuild) {
+      return res.status(404).json({ message: 'Build não encontrado.' });
+    }
+
+    const {
+      publishedProject,
+      build,
+      previewUrl,
+      publicUrl,
+      deployUrl,
+    } = await publishProjectBuild({
+      req,
+      project,
+      projectBuild,
+      body: req.body,
+    });
+
+    return res.json({
+      success: true,
+      project: withAbsoluteProjectBuildUrls(req, publishedProject),
+      build,
+      previewUrl,
+      publicUrl,
+      deployUrl,
+    });
+  } catch (error) {
+    if (error.statusCode && error.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+
     return res.status(500).json({ message: 'Erro interno do servidor.' });
   }
 });

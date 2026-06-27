@@ -27,6 +27,11 @@ const {
   resolveProjectFileRoot: resolveSharedProjectFileRoot,
 } = require('../utils/projectFiles');
 const { createSourceContext } = require('../utils/sourceContext');
+const {
+  publishProjectBuild: publishProjectBuildShared,
+  scanBuildSecurity: scanBuildSecurityShared,
+  withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
+} = require('../utils/projectPublication');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -2923,7 +2928,6 @@ router.post(
   async (req, res) => {
     try {
       const { projectId, buildId } = req.params;
-      const publishMetadataUpdate = buildPublishMetadataUpdate(req.body);
       const project = await Project.findById(projectId);
 
       if (!project) {
@@ -2939,95 +2943,26 @@ router.post(
         return res.status(404).json({ message: 'Build não encontrado.' });
       }
 
-      if (projectBuild.status === 'done') {
-        return res.status(409).json({
-          message: 'Build já está publicado.',
-          code: 'BUILD_ALREADY_PUBLISHED',
-        });
-      }
-
-      if (projectBuild.status !== 'draft') {
-        return res.status(409).json({
-          message: 'Apenas builds concluídos e em draft podem ser publicados.',
-          code: 'BUILD_NOT_READY_FOR_PUBLICATION',
-          buildStatus: projectBuild.status,
-        });
-      }
-
-      let buildJob = null;
-
-      if (projectBuild.buildJobId) {
-        buildJob = await BuildJob.findOne({
-          _id: projectBuild.buildJobId,
-          projectBuildId: projectBuild._id,
-          projectId: project._id,
-        }).select('status');
-
-        if (!buildJob) {
-          return res.status(409).json({
-            message: 'BuildJob vinculado não foi encontrado para este build.',
-            code: 'BUILD_JOB_LINK_INVALID',
-          });
-        }
-      } else {
-        buildJob = await BuildJob.findOne({
-          projectBuildId: projectBuild._id,
-          projectId: project._id,
-        })
-          .sort({ createdAt: -1 })
-          .select('status');
-      }
-
-      if (buildJob && buildJob.status !== 'succeeded') {
-        return res.status(409).json({
-          message: 'O build worker ainda não concluiu este build com sucesso.',
-          code: 'BUILD_JOB_NOT_SUCCEEDED',
-          jobStatus: buildJob.status,
-        });
-      }
-
-      const previewUrl = await getServableBuildPreviewUrl(req, projectId, projectBuild);
-
-      if (!previewUrl) {
-        return res.status(409).json({
-          message: 'Artifact index.html do build não está disponível para publicação.',
-          code: 'BUILD_ARTIFACT_NOT_AVAILABLE',
-        });
-      }
-
-      const publishedBuild = await ProjectBuild.findOneAndUpdate(
-        {
-          _id: projectBuild._id,
-          projectId: project._id,
-          status: 'draft',
-        },
-        { $set: { status: 'done' } },
-        { new: true, runValidators: true }
-      );
-
-      if (!publishedBuild) {
-        return res.status(409).json({
-          message: 'O estado do build mudou antes da publicação. Atualize e tente novamente.',
-          code: 'BUILD_STATUS_CHANGED',
-        });
-      }
-
-      const update = { ...publishMetadataUpdate };
-      applyPublishedBuildFields(publishedBuild, update);
-      applyWizardStatus(update, 'done');
-      await applyPublicationFields(project, update);
-      update['metadata.lastBuildAt'] = new Date();
-
-      const publishedProject = await Project.findByIdAndUpdate(project._id, update, {
-        new: true,
-        runValidators: true,
+      const {
+        publishedProject,
+        publishedBuild,
+        previewUrl,
+        publicUrl,
+        deployUrl,
+      } = await publishProjectBuildShared({
+        req,
+        project,
+        projectBuild,
+        body: req.body,
       });
 
       return res.json({
         success: true,
         project: withAbsoluteProjectBuildUrls(req, publishedProject),
-        build: withAbsoluteBuildUrls(req, publishedBuild),
+        build: withAbsoluteBuildUrlsShared(req, publishedBuild),
         previewUrl,
+        publicUrl,
+        deployUrl,
       });
     } catch (error) {
       if (error.statusCode && error.payload) {
@@ -3114,7 +3049,7 @@ router.get(
         return res.status(404).json({ message: 'Build não encontrado.' });
       }
 
-      return res.json(scanBuildSecurity(projectBuild));
+      return res.json(scanBuildSecurityShared(projectBuild));
     } catch (error) {
       return res.status(500).json({ message: 'Erro interno do servidor.' });
     }
