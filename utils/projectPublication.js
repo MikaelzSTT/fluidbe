@@ -83,6 +83,16 @@ function applyWizardStatus(update, value) {
   update.status = value;
 }
 
+function idsEqual(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftId = left._id || left;
+  const rightId = right._id || right;
+  return String(leftId) === String(rightId);
+}
+
 function slugifyProjectTitle(value) {
   return String(value || '')
     .normalize('NFD')
@@ -530,6 +540,34 @@ function scanBuildSecurity(projectBuild) {
 
 async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publishMetadataUpdate = buildPublishMetadataUpdate(body);
+  const isLatestPublishedBuild = idsEqual(project.latestPublishedBuildId, projectBuild._id);
+  const isAlreadyPublishedBuild =
+    project.isPublished === true && (isLatestPublishedBuild || projectBuild.status === 'done');
+
+  if (isAlreadyPublishedBuild) {
+    const hasMetadataUpdate = Object.keys(publishMetadataUpdate).length > 0;
+    const publishedProject = hasMetadataUpdate
+      ? await Project.findByIdAndUpdate(project._id, publishMetadataUpdate, {
+        new: true,
+        runValidators: true,
+      })
+      : project;
+    const publicUrl = publishedProject.publicUrl || (publishedProject.deploy && publishedProject.deploy.url) || '';
+    const previewUrl = toAbsoluteBackendUrl(
+      req,
+      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.deployUrl || projectBuild.distUrl || ''
+    );
+
+    return {
+      alreadyPublished: true,
+      publishedProject,
+      publishedBuild: projectBuild,
+      previewUrl,
+      publicUrl,
+      deployUrl: publicUrl,
+      build: withAbsoluteBuildUrls(req, projectBuild),
+    };
+  }
 
   if (projectBuild.status === 'done') {
     throw createHttpError(409, {
@@ -617,6 +655,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publicUrl = publishedProject.publicUrl || (publishedProject.deploy && publishedProject.deploy.url) || '';
 
   return {
+    alreadyPublished: false,
     publishedProject,
     publishedBuild,
     previewUrl,

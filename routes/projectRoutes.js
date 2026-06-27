@@ -1171,6 +1171,7 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
     }
 
     const {
+      alreadyPublished,
       publishedProject,
       build,
       previewUrl,
@@ -1185,6 +1186,7 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
 
     return res.json({
       success: true,
+      ...(alreadyPublished ? { alreadyPublished } : {}),
       project: withAbsoluteProjectBuildUrls(req, publishedProject),
       build,
       previewUrl,

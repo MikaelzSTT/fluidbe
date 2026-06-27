@@ -2944,6 +2944,7 @@ router.post(
       }
 
       const {
+        alreadyPublished,
         publishedProject,
         publishedBuild,
         previewUrl,
@@ -2958,6 +2959,7 @@ router.post(
 
       return res.json({
         success: true,
+        ...(alreadyPublished ? { alreadyPublished } : {}),
         project: withAbsoluteProjectBuildUrls(req, publishedProject),
         build: withAbsoluteBuildUrlsShared(req, publishedBuild),
         previewUrl,
