@@ -198,7 +198,7 @@ function escapeHtmlAttribute(value) {
 
 function getPublishedSeo(project) {
   const seo = project?.seo || {};
-  const title = String(seo.title || project?.name || project?.title || 'Fluid App').trim().slice(0, 60) || 'Fluid App';
+  const title = String(seo.title || project?.appName || project?.name || project?.title || 'Fluid App').trim().slice(0, 60) || 'Fluid App';
   const description = String(seo.description || project?.prompt || project?.description || 'Built with Fluid').trim().slice(0, 160) || 'Built with Fluid';
   const socialImage = String(seo.socialImage || '').trim();
 

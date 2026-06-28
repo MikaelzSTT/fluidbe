@@ -5,6 +5,7 @@ const fs = require('fs/promises');
 const { pipeline } = require('stream/promises');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
+const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const BuildJob = require('../models/BuildJob');
 const {
@@ -13,6 +14,7 @@ const {
   resolveProjectConnectorInjection,
 } = require('../utils/connectorInjection');
 const { createSourceContext } = require('../utils/sourceContext');
+const { generateFallbackAppName } = require('../utils/projectNaming');
 const { reactViteBuildHelpers } = require('../routes/adminRoutes');
 
 dotenv.config();
@@ -209,6 +211,18 @@ async function runBuildPipeline(job, workspace) {
     );
     if (!build) {
       throw new Error('ProjectBuild não encontrado para o BuildJob.');
+    }
+
+    const project = await Project.findById(job.projectId).select('appName appNameLocked prompt name title description');
+    if (project && (!project.appName || project.appNameLocked !== true)) {
+      const appName = generateFallbackAppName(project, project.prompt, build);
+      if (appName) {
+        await Project.updateOne(
+          { _id: project._id, appNameLocked: { $ne: true } },
+          { $set: { appName, appNameSource: 'generated' } },
+          { runValidators: true }
+        );
+      }
     }
 
     if (build.status === 'in_progress') {

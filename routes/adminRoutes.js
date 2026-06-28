@@ -32,6 +32,11 @@ const {
   scanBuildSecurity: scanBuildSecurityShared,
   withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
 } = require('../utils/projectPublication');
+const {
+  generateFallbackAppName,
+  normalizeAppName,
+  slugifyAppName,
+} = require('../utils/projectNaming');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -260,16 +265,13 @@ function applyLoadingStatus(update) {
 }
 
 function slugifyProjectTitle(value) {
-  return String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'projeto';
+  return slugifyAppName(value || 'projeto');
 }
 
 async function buildUniqueProjectSlug(project, title) {
-  const baseSlug = slugifyProjectTitle(title || project.title || project.name || project.prompt);
+  const appName = normalizeAppName(project.appName)
+    || generateFallbackAppName(project, project.prompt, project.build);
+  const baseSlug = slugifyProjectTitle(appName || title || project.title || project.name || project.prompt);
   let slug = baseSlug;
   let suffix = 2;
 
@@ -287,7 +289,18 @@ async function buildUniqueProjectSlug(project, title) {
 }
 
 async function applyPublicationFields(project, update) {
-  const slug = update.slug || project.slug || (await buildUniqueProjectSlug(project, update.title || update.name));
+  const appName = normalizeAppName(update.appName || project.appName)
+    || generateFallbackAppName(project, project.prompt, update.build || project.build);
+  if (!project.appNameLocked && appName && !project.appName) {
+    update.appName = appName;
+    update.appNameSource = 'generated';
+  }
+
+  const projectForSlug = {
+    ...(typeof project.toObject === 'function' ? project.toObject() : project),
+    appName,
+  };
+  const slug = update.slug || project.slug || (await buildUniqueProjectSlug(projectForSlug, update.title || update.name));
   const publishedAt = new Date();
 
   update.slug = slug;

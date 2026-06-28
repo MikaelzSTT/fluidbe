@@ -28,6 +28,11 @@ const {
   publishProjectBuild,
   scanBuildSecurity,
 } = require('../utils/projectPublication');
+const {
+  extractExplicitAppName,
+  generateFallbackAppName,
+  normalizeAppName,
+} = require('../utils/projectNaming');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -763,27 +768,38 @@ router.get('/', authMiddleware, async (req, res) => {
 
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { name, description, status, prompt, type, settings, requiredConnectors } = req.body;
+    const { name, title, description, status, prompt, type, settings, requiredConnectors } = req.body;
 
     if (!name) {
       return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
     }
 
+    const namingPrompt = [
+      prompt,
+      name ? `nome ${name}` : '',
+      title ? `nome ${title}` : '',
+    ].filter(Boolean).join(' ');
+    const explicitAppName = extractExplicitAppName(namingPrompt);
+    const appName = explicitAppName || generateFallbackAppName({ name, description, prompt }, prompt);
+
     const project = await Project.create({
-  userId: req.userId,
-  name,
-  description,
-  status,
-  prompt,
-  type,
-  settings,
-  requiredConnectors: detectInitialRequiredConnectors({
-    name,
-    description,
-    prompt,
-    requiredConnectors,
-  }),
-});
+      userId: req.userId,
+      name,
+      description,
+      status,
+      prompt,
+      type,
+      settings,
+      appName: normalizeAppName(appName) || undefined,
+      appNameSource: explicitAppName ? 'user' : 'generated',
+      appNameLocked: Boolean(explicitAppName),
+      requiredConnectors: detectInitialRequiredConnectors({
+        name,
+        description,
+        prompt,
+        requiredConnectors,
+      }),
+    });
     return res.status(201).json({
       message: 'Projeto criado com sucesso.',
       project,

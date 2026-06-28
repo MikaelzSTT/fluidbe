@@ -24,6 +24,24 @@ const projectSchema = new mongoose.Schema(
       trim: true,
     },
 
+    appName: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 24,
+    },
+
+    appNameSource: {
+      type: String,
+      enum: ['user', 'generated', 'manual', 'unknown'],
+      default: 'unknown',
+    },
+
+    appNameLocked: {
+      type: Boolean,
+      default: false,
+    },
+
     slug: {
       type: String,
       trim: true,
