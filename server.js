@@ -10,6 +10,7 @@ const projectRoutes = require('./routes/projectRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
+const billingRoutes = require('./routes/billingRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
@@ -522,6 +523,8 @@ app.use(securityHeaders);
 app.use(publicAppsOnly);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+app.use('/api', apiRateLimit);
+app.use('/api/billing', billingRoutes);
 app.use(express.json());
 app.use('/builds', authorizeBuildAccess, express.static(PUBLIC_BUILDS_DIR));
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
@@ -559,7 +562,6 @@ app.get('/p/:slug', async (req, res) => {
     return res.status(500).send('Erro ao carregar projeto publicado.');
   }
 });
-app.use('/api', apiRateLimit);
 app.use('/api/auth/login', loginRateLimit);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);

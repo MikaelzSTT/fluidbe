@@ -51,6 +51,37 @@ const userSchema = new mongoose.Schema(
       default: false,
     },
 
+    plan: {
+      type: String,
+      enum: ['free', 'pro'],
+      default: 'free',
+    },
+
+    stripeCustomerId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
+    stripeSubscriptionId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
+    subscriptionStatus: {
+      type: String,
+      trim: true,
+    },
+
+    subscriptionCurrentPeriodEnd: {
+      type: Date,
+    },
+
+    billingUpdatedAt: {
+      type: Date,
+    },
+
     preferences: {
       theme: {
         type: String,
