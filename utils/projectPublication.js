@@ -148,6 +148,33 @@ async function applyPublicationFields(project, update) {
   });
 }
 
+function buildUnpublishUpdate() {
+  return {
+    isPublished: false,
+    publish: false,
+    publishedAt: null,
+    'deploy.isPublished': false,
+    'deploy.url': '',
+    'deploy.publishedAt': null,
+  };
+}
+
+async function unpublishActiveProjectsForUser(userId) {
+  if (!userId) {
+    return { matchedCount: 0, modifiedCount: 0 };
+  }
+
+  return Project.updateMany(
+    {
+      userId,
+      isPublished: true,
+    },
+    {
+      $set: buildUnpublishUpdate(),
+    }
+  );
+}
+
 function sanitizeOptionalText(value, maxLength = null) {
   if (value === undefined) {
     return undefined;
@@ -682,9 +709,11 @@ module.exports = {
   applyPublishedBuildFields,
   applyPublicationFields,
   buildPublishMetadataUpdate,
+  buildUnpublishUpdate,
   getServableBuildPreviewUrl,
   publishProjectBuild,
   scanBuildSecurity,
   toAbsoluteBackendUrl,
+  unpublishActiveProjectsForUser,
   withAbsoluteBuildUrls,
 };

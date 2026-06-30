@@ -6,6 +6,7 @@ const ProjectBuild = require('../models/ProjectBuild');
 const BuildJob = require('../models/BuildJob');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
+const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
@@ -69,6 +70,15 @@ const CONNECTOR_STATUS_TONES = {
   connected: 'green',
   skipped: 'gray',
   error: 'red',
+};
+const PRO_REQUIRED_PUBLISH_RESPONSE = {
+  code: 'PRO_REQUIRED',
+  message: 'Upgrade to Fluid Pro to publish projects.',
+};
+const PUBLISHED_PROJECT_LIMIT = 3;
+const PUBLISHED_PROJECT_LIMIT_RESPONSE = {
+  code: 'PUBLISHED_PROJECT_LIMIT_REACHED',
+  message: 'You reached your limit of 3 active published projects.',
 };
 const CONNECTOR_RULES = [
   {
@@ -1168,6 +1178,16 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
       return res.status(400).json({ message: 'ID de projeto ou build inválido.' });
     }
 
+    const user = await User.findById(req.userId).select('plan');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (user.plan !== 'pro') {
+      return res.status(403).json(PRO_REQUIRED_PUBLISH_RESPONSE);
+    }
+
     const project = await Project.findOne({
       _id: projectId,
       userId: req.userId,
@@ -1184,6 +1204,17 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
 
     if (!projectBuild) {
       return res.status(404).json({ message: 'Build não encontrado.' });
+    }
+
+    if (project.isPublished !== true) {
+      const activePublishedProjectCount = await Project.countDocuments({
+        userId: req.userId,
+        isPublished: true,
+      });
+
+      if (activePublishedProjectCount >= PUBLISHED_PROJECT_LIMIT) {
+        return res.status(403).json(PUBLISHED_PROJECT_LIMIT_RESPONSE);
+      }
     }
 
     const {

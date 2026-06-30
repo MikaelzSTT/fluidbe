@@ -2,6 +2,7 @@ const express = require('express');
 const Stripe = require('stripe');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
+const { unpublishActiveProjectsForUser } = require('../utils/projectPublication');
 
 const router = express.Router();
 
@@ -49,6 +50,14 @@ function planForSubscriptionStatus(status) {
   return status === 'active' || status === 'trialing' ? 'pro' : 'free';
 }
 
+async function unpublishIfPlanIsFree(user) {
+  if (!user || user.plan !== 'free') {
+    return;
+  }
+
+  await unpublishActiveProjectsForUser(user._id);
+}
+
 async function findCurrentUser(req, res) {
   const user = await User.findById(req.userId);
 
@@ -88,7 +97,7 @@ async function updateUserFromSubscription(subscription) {
     update.subscriptionCurrentPeriodEnd = periodEnd;
   }
 
-  return User.findOneAndUpdate(
+  const user = await User.findOneAndUpdate(
     {
       $or: [
         ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
@@ -99,6 +108,10 @@ async function updateUserFromSubscription(subscription) {
     { $set: update },
     { new: true }
   );
+
+  await unpublishIfPlanIsFree(user);
+
+  return user;
 }
 
 async function updateUserFromCheckoutSession(session, stripe) {
@@ -119,7 +132,7 @@ async function updateUserFromCheckoutSession(session, stripe) {
     return updateUserFromSubscription(subscription);
   }
 
-  return User.findOneAndUpdate(
+  const user = await User.findOneAndUpdate(
     {
       $or: [
         ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
@@ -135,6 +148,10 @@ async function updateUserFromCheckoutSession(session, stripe) {
     },
     { new: true }
   );
+
+  await unpublishIfPlanIsFree(user);
+
+  return user;
 }
 
 async function updateUserFromInvoice(invoice, status) {
@@ -150,7 +167,7 @@ async function updateUserFromInvoice(invoice, status) {
     return null;
   }
 
-  return User.findOneAndUpdate(
+  const user = await User.findOneAndUpdate(
     {
       $or: [
         ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
@@ -169,6 +186,10 @@ async function updateUserFromInvoice(invoice, status) {
     },
     { new: true }
   );
+
+  await unpublishIfPlanIsFree(user);
+
+  return user;
 }
 
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
