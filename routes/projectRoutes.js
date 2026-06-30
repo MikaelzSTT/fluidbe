@@ -71,15 +71,27 @@ const CONNECTOR_STATUS_TONES = {
   skipped: 'gray',
   error: 'red',
 };
-const PRO_REQUIRED_PUBLISH_RESPONSE = {
-  code: 'PRO_REQUIRED',
-  message: 'Upgrade to Fluid Pro to publish projects.',
+const PUBLISHED_PROJECT_LIMITS = {
+  free: 0,
+  pro: 3,
+  business: 10,
 };
-const PUBLISHED_PROJECT_LIMIT = 3;
-const PUBLISHED_PROJECT_LIMIT_RESPONSE = {
-  code: 'PUBLISHED_PROJECT_LIMIT_REACHED',
-  message: 'You reached your limit of 3 active published projects.',
-};
+
+function getPublishedProjectLimit(plan) {
+  return PUBLISHED_PROJECT_LIMITS[plan] || PUBLISHED_PROJECT_LIMITS.free;
+}
+
+function buildPublishedProjectLimitResponse({ currentPlan, publishedLimit, activePublishedCount }) {
+  return {
+    code: 'PUBLISHED_PROJECT_LIMIT_REACHED',
+    message: publishedLimit > 0
+      ? `You reached your limit of ${publishedLimit} active published projects.`
+      : 'Upgrade your Fluid plan to publish projects.',
+    currentPlan,
+    publishedLimit,
+    activePublishedCount,
+  };
+}
 const CONNECTOR_RULES = [
   {
     provider: 'stripe',
@@ -1184,10 +1196,6 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    if (user.plan !== 'pro') {
-      return res.status(403).json(PRO_REQUIRED_PUBLISH_RESPONSE);
-    }
-
     const project = await Project.findOne({
       _id: projectId,
       userId: req.userId,
@@ -1207,13 +1215,19 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
     }
 
     if (project.isPublished !== true) {
+      const currentPlan = user.plan || 'free';
+      const publishedLimit = getPublishedProjectLimit(currentPlan);
       const activePublishedProjectCount = await Project.countDocuments({
         userId: req.userId,
         isPublished: true,
       });
 
-      if (activePublishedProjectCount >= PUBLISHED_PROJECT_LIMIT) {
-        return res.status(403).json(PUBLISHED_PROJECT_LIMIT_RESPONSE);
+      if (activePublishedProjectCount >= publishedLimit) {
+        return res.status(403).json(buildPublishedProjectLimitResponse({
+          currentPlan,
+          publishedLimit,
+          activePublishedCount: activePublishedProjectCount,
+        }));
       }
     }
 

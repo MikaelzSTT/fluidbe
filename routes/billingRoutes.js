@@ -21,7 +21,10 @@ function getStripeClient() {
 function getBillingConfig() {
   return {
     stripe: getStripeClient(),
-    priceId: process.env.STRIPE_PRO_PRICE_ID,
+    priceIds: {
+      pro: process.env.STRIPE_PRO_PRICE_ID,
+      business: process.env.STRIPE_BUSINESS_PRICE_ID,
+    },
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   };
 }
@@ -46,8 +49,48 @@ function subscriptionPeriodEnd(subscription) {
   return periodEnd ? new Date(periodEnd * 1000) : undefined;
 }
 
-function planForSubscriptionStatus(status) {
-  return status === 'active' || status === 'trialing' ? 'pro' : 'free';
+function isActiveSubscriptionStatus(status) {
+  return status === 'active' || status === 'trialing';
+}
+
+function getPriceIdsFromSubscription(subscription) {
+  return (subscription.items?.data || [])
+    .map((item) => item.price?.id || item.plan?.id)
+    .filter(Boolean);
+}
+
+function getPriceIdsFromInvoice(invoice) {
+  return (invoice.lines?.data || [])
+    .map((line) => line.price?.id || line.plan?.id)
+    .filter(Boolean);
+}
+
+function planForPriceIds(priceIds, fallbackPlan = 'pro') {
+  if (process.env.STRIPE_BUSINESS_PRICE_ID && priceIds.includes(process.env.STRIPE_BUSINESS_PRICE_ID)) {
+    return 'business';
+  }
+
+  if (process.env.STRIPE_PRO_PRICE_ID && priceIds.includes(process.env.STRIPE_PRO_PRICE_ID)) {
+    return 'pro';
+  }
+
+  return fallbackPlan;
+}
+
+function planForSubscription(subscription) {
+  if (!isActiveSubscriptionStatus(subscription.status)) {
+    return 'free';
+  }
+
+  return planForPriceIds(getPriceIdsFromSubscription(subscription), 'pro');
+}
+
+function planForInvoiceStatus(status, invoice) {
+  if (!isActiveSubscriptionStatus(status)) {
+    return 'free';
+  }
+
+  return planForPriceIds(getPriceIdsFromInvoice(invoice), 'pro');
 }
 
 async function unpublishIfPlanIsFree(user) {
@@ -82,7 +125,7 @@ async function updateUserFromSubscription(subscription) {
   }
 
   const update = {
-    plan: planForSubscriptionStatus(subscription.status),
+    plan: planForSubscription(subscription),
     subscriptionStatus: subscription.status,
     stripeSubscriptionId,
     billingUpdatedAt: new Date(),
@@ -180,7 +223,7 @@ async function updateUserFromInvoice(invoice, status) {
         ...(stripeCustomerId ? { stripeCustomerId } : {}),
         ...(stripeSubscriptionId ? { stripeSubscriptionId } : {}),
         subscriptionStatus: status,
-        plan: planForSubscriptionStatus(status),
+        plan: planForInvoiceStatus(status, invoice),
         billingUpdatedAt: new Date(),
       },
     },
@@ -235,6 +278,8 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   }
 });
 
+router.use(express.json());
+
 router.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await findCurrentUser(req, res);
@@ -251,7 +296,14 @@ router.get('/me', authMiddleware, async (req, res) => {
 });
 
 router.post('/checkout', authMiddleware, async (req, res) => {
-  const { stripe, priceId } = getBillingConfig();
+  const { stripe, priceIds } = getBillingConfig();
+  const requestedPlan = String(req.body?.plan || req.body?.targetPlan || 'pro').toLowerCase();
+
+  if (!['pro', 'business'].includes(requestedPlan)) {
+    return res.status(400).json({ message: 'Invalid billing plan.' });
+  }
+
+  const priceId = priceIds[requestedPlan];
 
   if (!stripe || !priceId) {
     return res.status(503).json({ message: 'Stripe checkout is not configured.' });
@@ -295,10 +347,12 @@ router.post('/checkout', authMiddleware, async (req, res) => {
       cancel_url: `${frontendUrl}/pricing?billing=cancelled`,
       metadata: {
         userId: String(user._id),
+        plan: requestedPlan,
       },
       subscription_data: {
         metadata: {
           userId: String(user._id),
+          plan: requestedPlan,
         },
       },
     });
