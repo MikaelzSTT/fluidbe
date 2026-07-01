@@ -11,7 +11,11 @@ const GENERIC_WORDS = new Set([
   'landing',
   'dashboard',
   'portal',
+  'project',
+  'projeto',
 ]);
+
+const NAME_STOP_WORD_PATTERN = /\s+(?:for|para|que|with|com|and|e|where|onde|that|which|depois|after|usando|using|tipo|like)\b/i;
 
 function stripHtml(value) {
   return String(value || '')
@@ -46,6 +50,22 @@ function normalizeAppName(name) {
   return cleaned.slice(0, 24).trim().replace(/[\s._&-]+$/g, '') || null;
 }
 
+function normalizeProjectTitle(name) {
+  const cleaned = decodeBasicEntities(name)
+    .replace(/[<>[\]{}()]/g, ' ')
+    .replace(/[“”‘’"']/g, '')
+    .replace(/[^\p{L}\p{N}&._ -]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[\s._&-]+|[\s._&-]+$/g, '');
+
+  if (!cleaned) {
+    return null;
+  }
+
+  return cleaned.slice(0, 28).trim().replace(/[\s._&-]+$/g, '') || null;
+}
+
 function looksLikeAppName(value) {
   const name = normalizeAppName(value);
   if (!name) {
@@ -74,7 +94,10 @@ function extractExplicitAppName(prompt) {
     /\b(?:called|named)\s+["'“”‘’]?([A-Z0-9][\p{L}\p{N}&._ -]{1,40})/iu,
     /\bwith\s+the\s+name\s+["'“”‘’]?([A-Z0-9][\p{L}\p{N}&._ -]{1,40})/iu,
     /\bcom\s+o\s+nome\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
+    /\bcom\s+nome\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
+    /\bchamad[oa]\s+de\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
     /\bchamad[oa]\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
+    /\bnomead[oa]\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
     /\bnome\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
     /\bse\s+chama\s+["'“”‘’]?([\p{L}0-9][\p{L}\p{N}&._ -]{1,40})/iu,
   ];
@@ -85,7 +108,7 @@ function extractExplicitAppName(prompt) {
       continue;
     }
 
-    const candidate = String(match[1] || '').split(/\s+(?:for|para|que|with|com|and|e)\b/i)[0];
+    const candidate = String(match[1] || '').split(NAME_STOP_WORD_PATTERN)[0];
     const name = normalizeAppName(candidate);
     if (looksLikeAppName(name)) {
       return name;
@@ -93,6 +116,11 @@ function extractExplicitAppName(prompt) {
   }
 
   return null;
+}
+
+function extractExplicitProjectName(prompt) {
+  const name = extractExplicitAppName(prompt);
+  return normalizeProjectTitle(name);
 }
 
 function collectBrandCandidatesFromHtml(html) {
@@ -123,16 +151,32 @@ function keywordFallbackName(text) {
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
 
+  if (/\b(carro|carros|auto|autos|automovel|automoveis|veiculo|veiculos|vehicle|vehicles|car|cars|drive|drives)\b/.test(normalized)) {
+    if (/\b(venda|vendas|sell|sale|sales|marketplace|loja|shop|store|comprar|compra|buy)\b/.test(normalized)) {
+      return 'CarMarket';
+    }
+
+    return 'AutoHub';
+  }
+
   if (/\b(academy|academies|gym|gyms|academia|academias|fitness|treino|treinos|workout|workouts)\b/.test(normalized)) {
     return normalized.includes('academia') || normalized.includes('gym') ? 'GymFlow' : 'FitPilot';
   }
 
-  if (/\b(ride|rides|delivery|deliveries|mobility|mobilidade|corrida|entrega)\b/.test(normalized)) {
+  if (/\b(delivery|deliveries|entrega|entregas|food|comida|restaurante|restaurant|meal|meals|lanche|lanches)\b/.test(normalized)) {
+    return 'QuickBite';
+  }
+
+  if (/\b(ride|rides|mobility|mobilidade|corrida|corridas|uber|motorista|driver|taxi)\b/.test(normalized)) {
     return 'RideFlow';
   }
 
+  if (/\b(roupa|roupas|moda|fashion|outfit|outfits|vestuario|clothing|apparel|feminina|feminino)\b/.test(normalized)) {
+    return 'StyleFlow';
+  }
+
   if (/\b(marketplace|shop|store|ecommerce|e-commerce|loja|venda|commerce)\b/.test(normalized)) {
-    return 'MarketPilot';
+    return 'ShopFlow';
   }
 
   if (/\b(finance|financial|invoice|invoices|financa|financeiro|fatura|cobranca|ledger)\b/.test(normalized)) {
@@ -173,6 +217,14 @@ function generateFallbackAppName(project, prompt, build) {
   return normalizeAppName(keywordFallbackName(sourceText));
 }
 
+function generateFallbackProjectName(prompt) {
+  return normalizeProjectTitle(keywordFallbackName(prompt)) || 'LaunchPilot';
+}
+
+function getProjectTitleFromPrompt(prompt) {
+  return extractExplicitProjectName(prompt) || generateFallbackProjectName(prompt);
+}
+
 function slugifyAppName(name) {
   return String(name || '')
     .normalize('NFD')
@@ -186,7 +238,11 @@ function slugifyAppName(name) {
 
 module.exports = {
   extractExplicitAppName,
+  extractExplicitProjectName,
   generateFallbackAppName,
+  generateFallbackProjectName,
+  getProjectTitleFromPrompt,
   normalizeAppName,
+  normalizeProjectTitle,
   slugifyAppName,
 };

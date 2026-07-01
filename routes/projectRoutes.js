@@ -31,7 +31,9 @@ const {
 } = require('../utils/projectPublication');
 const {
   extractExplicitAppName,
+  extractExplicitProjectName,
   generateFallbackAppName,
+  getProjectTitleFromPrompt,
   normalizeAppName,
 } = require('../utils/projectNaming');
 
@@ -796,27 +798,26 @@ router.post('/', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
     }
 
-    const namingPrompt = [
-      prompt,
-      name ? `nome ${name}` : '',
-      title ? `nome ${title}` : '',
-    ].filter(Boolean).join(' ');
-    const explicitAppName = extractExplicitAppName(namingPrompt);
-    const appName = explicitAppName || generateFallbackAppName({ name, description, prompt }, prompt);
+    const titlePrompt = [prompt, description, title, name].filter(Boolean).join(' ');
+    const explicitProjectName = extractExplicitProjectName(titlePrompt);
+    const projectTitle = getProjectTitleFromPrompt(titlePrompt);
+    const explicitAppName = extractExplicitAppName(titlePrompt);
+    const appName = explicitAppName || normalizeAppName(projectTitle) || generateFallbackAppName({ name: projectTitle, description, prompt }, prompt);
 
     const project = await Project.create({
       userId: req.userId,
-      name,
+      name: projectTitle,
+      title: projectTitle,
       description,
       status,
       prompt,
       type,
       settings,
       appName: normalizeAppName(appName) || undefined,
-      appNameSource: explicitAppName ? 'user' : 'generated',
-      appNameLocked: Boolean(explicitAppName),
+      appNameSource: explicitProjectName ? 'user' : 'generated',
+      appNameLocked: Boolean(explicitProjectName),
       requiredConnectors: detectInitialRequiredConnectors({
-        name,
+        name: projectTitle,
         description,
         prompt,
         requiredConnectors,
