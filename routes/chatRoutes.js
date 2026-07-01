@@ -710,12 +710,35 @@ function normalizeBuildIntentText(value) {
     .trim();
 }
 
-function hasFirstPromptHistory(history) {
+function getPriorHistoryItems(history, currentMessage = '') {
   if (!Array.isArray(history)) {
-    return false;
+    return [];
   }
 
-  return history.map(normalizeHistoryItem).filter(Boolean).length > 0;
+  const items = history.map(normalizeHistoryItem).filter(Boolean);
+  const normalizedCurrentMessage = normalizeBuildIntentText(currentMessage);
+
+  if (!normalizedCurrentMessage) {
+    return items;
+  }
+
+  const currentMessageIndex = items
+    .map((item, index) => ({ item, index }))
+    .reverse()
+    .find(({ item }) =>
+      item.role === 'user' &&
+      normalizeBuildIntentText(item.content) === normalizedCurrentMessage
+    )?.index;
+
+  if (currentMessageIndex === undefined) {
+    return items;
+  }
+
+  return items.filter((_, index) => index !== currentMessageIndex);
+}
+
+function hasFirstPromptHistory(history, currentMessage = '') {
+  return getPriorHistoryItems(history, currentMessage).length > 0;
 }
 
 function isVagueCreationPrompt(normalizedText) {
@@ -751,7 +774,7 @@ function isGreetingPrompt(normalizedText) {
 }
 
 function isCompleteFirstBuildPrompt(message, history, project) {
-  if (project || hasFirstPromptHistory(history)) {
+  if (project || hasFirstPromptHistory(history, message)) {
     return false;
   }
 
@@ -975,11 +998,15 @@ async function getFallbackChatReply({
 async function getAiReply({
   message, history, project, projectCodeContext = '', projectVisualContext = '',
 }) {
-  const previousMessages = Array.isArray(history)
-    ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
-    : [];
+  const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
   const firstPromptBuildNow = isCompleteFirstBuildPrompt(message, history, project);
+
+  console.info('[chat] detectedBuildNow', {
+    detectedBuildNow: firstPromptBuildNow,
+    hasProject: Boolean(project),
+    hasPriorHistory: hasFirstPromptHistory(history, message),
+  });
 
   if (firstPromptBuildNow) {
     const detectedRequiredConnectors = detectRequiredConnectors({
@@ -1021,7 +1048,7 @@ async function getAiReply({
       throw new Error('Decisao invalida da IA.');
     }
 
-    const firstPromptNoContext = !project && !hasFirstPromptHistory(history);
+    const firstPromptNoContext = !project && !hasFirstPromptHistory(history, message);
     const normalizedBuildText = firstPromptNoContext ? normalizeBuildIntentText(message) : '';
 
     if (firstPromptNoContext && action === 'wizard' && isVagueCreationPrompt(normalizedBuildText)) {
@@ -1213,7 +1240,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
       }
     }
 
-    return res.json({
+    const responsePayload = {
       success: true,
       reply: aiReply.reply,
       mode: aiReply.mode || CHAT_MODE,
@@ -1225,7 +1252,16 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
       options: aiReply.options || [],
       requiredConnectors,
       changeRequest,
+    };
+
+    console.info('[chat] mode before response', {
+      mode: responsePayload.mode,
+      status: responsePayload.status,
+      generationStatus: responsePayload.generationStatus,
     });
+    console.info('[chat] final response payload', responsePayload);
+
+    return res.json(responsePayload);
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
