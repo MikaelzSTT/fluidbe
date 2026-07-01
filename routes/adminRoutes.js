@@ -32,11 +32,6 @@ const {
   scanBuildSecurity: scanBuildSecurityShared,
   withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
 } = require('../utils/projectPublication');
-const {
-  generateFallbackAppName,
-  normalizeAppName,
-  slugifyAppName,
-} = require('../utils/projectNaming');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -65,9 +60,6 @@ const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
-const PUBLIC_BASE_URL =
-  process.env.PUBLIC_BASE_URL ||
-  'https://apps.askfluid.now';
 const BUILD_FIELDS = [
   'type',
   'status',
@@ -264,56 +256,6 @@ function applyLoadingStatus(update) {
   mergeDeployUpdate(update, { isPublished: false });
 }
 
-function slugifyProjectTitle(value) {
-  return slugifyAppName(value || 'projeto');
-}
-
-async function buildUniqueProjectSlug(project, title) {
-  const appName = normalizeAppName(project.appName)
-    || generateFallbackAppName(project, project.prompt, project.build);
-  const baseSlug = slugifyProjectTitle(appName || title || project.title || project.name || project.prompt);
-  let slug = baseSlug;
-  let suffix = 2;
-
-  while (
-    await Project.exists({
-      _id: { $ne: project._id },
-      slug,
-    })
-  ) {
-    slug = `${baseSlug}-${suffix}`;
-    suffix += 1;
-  }
-
-  return slug;
-}
-
-async function applyPublicationFields(project, update) {
-  const appName = normalizeAppName(update.appName || project.appName)
-    || generateFallbackAppName(project, project.prompt, update.build || project.build);
-  if (!project.appNameLocked && appName && !project.appName) {
-    update.appName = appName;
-    update.appNameSource = 'generated';
-  }
-
-  const projectForSlug = {
-    ...(typeof project.toObject === 'function' ? project.toObject() : project),
-    appName,
-  };
-  const slug = update.slug || project.slug || (await buildUniqueProjectSlug(projectForSlug, update.title || update.name));
-  const publishedAt = new Date();
-
-  update.slug = slug;
-  update.isPublished = true;
-  update.publishedAt = publishedAt;
-  update.publish = true;
-  mergeDeployUpdate(update, {
-    isPublished: true,
-    publishedAt,
-    url: `${PUBLIC_BASE_URL}/p/${slug}`,
-  });
-}
-
 function sanitizeOptionalText(value, maxLength = null) {
   if (value === undefined) {
     return undefined;
@@ -376,6 +318,25 @@ function applyPublishedBuildFields(build, update) {
   if (build.fullHtml) {
     update.fullHtml = build.fullHtml;
     update.latestFullHtml = build.fullHtml;
+  }
+}
+
+function removePublicPublishFields(update) {
+  delete update.isPublished;
+  delete update.publishedAt;
+  delete update.publish;
+  delete update['deploy.isPublished'];
+  delete update['deploy.url'];
+  delete update['deploy.publishedAt'];
+
+  if (update.deploy && typeof update.deploy === 'object' && !Array.isArray(update.deploy)) {
+    delete update.deploy.isPublished;
+    delete update.deploy.url;
+    delete update.deploy.publishedAt;
+
+    if (Object.keys(update.deploy).length === 0) {
+      delete update.deploy;
+    }
   }
 }
 
@@ -3267,18 +3228,16 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       }
     }
 
-    if (publish !== undefined) {
-      update.publish = publish === true;
+    const shouldMarkDone = requestedStatus === 'done' || publish === true;
 
-      if (publish === true) {
-        await applyLatestPendingBuild(req.params.id, update);
-        applyWizardStatus(update, 'done');
-        update['metadata.lastBuildAt'] = new Date();
-      }
+    if (publish === true) {
+      applyWizardStatus(update, 'done');
     }
 
-    if (requestedStatus === 'done' || publish === true) {
-      await applyPublicationFields(existingProject, update);
+    if (shouldMarkDone) {
+      await applyLatestPendingBuild(req.params.id, update);
+      update['metadata.lastBuildAt'] = new Date();
+      removePublicPublishFields(update);
     }
 
     const project = await Project.findByIdAndUpdate(req.params.id, update, {
@@ -3334,8 +3293,8 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
 
     if (requestedStatus === 'done') {
       await applyLatestPendingBuild(req.params.id, update);
-      await applyPublicationFields(existingProject, update);
       update['metadata.lastBuildAt'] = new Date();
+      removePublicPublishFields(update);
     }
 
     const project = await Project.findByIdAndUpdate(
