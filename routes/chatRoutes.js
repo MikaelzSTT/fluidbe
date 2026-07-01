@@ -26,6 +26,11 @@ const MAX_CODE_CONTEXT_CHARS = 5000;
 const CODE_CONTEXT_KEYWORDS = new Set([
   'button', 'review', 'header', 'navbar', 'card', 'footer',
 ]);
+const BUILD_NOW_MODE = 'build_now';
+const WIZARD_MODE = 'wizard';
+const CLARIFY_MODE = 'clarify';
+const CHAT_MODE = 'chat';
+const BUILD_NOW_REPLY = 'Perfeito - vou começar a construir agora.';
 const CONNECTOR_RULES = [
   {
     provider: 'stripe',
@@ -694,6 +699,112 @@ function normalizeOptions(options, shouldIncludeOptions) {
   return normalizedOptions.slice(0, 4);
 }
 
+function normalizeBuildIntentText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[“”"']/g, '')
+    .replace(/[!?.,;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasFirstPromptHistory(history) {
+  if (!Array.isArray(history)) {
+    return false;
+  }
+
+  return history.map(normalizeHistoryItem).filter(Boolean).length > 0;
+}
+
+function isVagueCreationPrompt(normalizedText) {
+  return [
+    'oi',
+    'ola',
+    'hello',
+    'hi',
+    'preciso de ajuda',
+    'quero fazer um app',
+    'quero um app',
+    'quero um aplicativo',
+    'quero um site',
+    'quero criar um site',
+    'quero um marketplace',
+    'quero uma landing page',
+    'faz um app',
+    'faz um site',
+    'faz um site pra mim',
+    'faca um site pra mim',
+    'crie um marketplace',
+    'construa uma landing page',
+    'monta um saas',
+    'build an app',
+    'build a site',
+    'build a website',
+    'i need help',
+  ].includes(normalizedText);
+}
+
+function isGreetingPrompt(normalizedText) {
+  return ['oi', 'ola', 'hello', 'hi'].includes(normalizedText);
+}
+
+function isCompleteFirstBuildPrompt(message, history, project) {
+  if (project || hasFirstPromptHistory(history)) {
+    return false;
+  }
+
+  const normalizedText = normalizeBuildIntentText(message);
+
+  if (!normalizedText || isVagueCreationPrompt(normalizedText)) {
+    return false;
+  }
+
+  const hasCreationIntent = [
+    /\b(app|aplicativo|site|website|landing page|marketplace|saas|dashboard|ecommerce|e commerce|loja virtual|plataforma|web app)\b/,
+    /\b(build|create|make|crie|criar|quero|preciso|faz|faca|construa|monta|desenvolva)\b.*\b(app|aplicativo|site|website|projeto|sistema|plataforma)\b/,
+  ].some((pattern) => pattern.test(normalizedText));
+
+  if (!hasCreationIntent) {
+    return false;
+  }
+
+  const hasTopic = [
+    /\b(de|para|pra|sobre|for)\s+[a-z0-9][a-z0-9 ]{2,}/,
+    /\bfor\s+[a-z0-9][a-z0-9 ]{2,}/,
+    /\bgyms?\b/,
+    /\bconcessionaria\b/,
+    /\btenis\b/,
+    /\bsneakers?\b/,
+  ].some((pattern) => pattern.test(normalizedText));
+  const hasExplicitName = /\b(nome|name|called|chamada|chamado)\b\s*[:\-]?\s*[a-z0-9]/.test(normalizedText);
+  const featurePatterns = [
+    /\blogin\b/,
+    /\bcadastro\b/,
+    /\bvendedor\w*\b/,
+    /\bcomprar\b/,
+    /\bvender\b/,
+    /\bproduto\w*\b/,
+    /\bcheckout\b/,
+    /\bpagament\w*\b/,
+    /\bpayments?\b/,
+    /\bstripe\b/,
+    /\badmin\b/,
+    /\bdashboard\b/,
+    /\bstudent management\b/,
+    /\bgestao\b/,
+    /\bgerenciamento\b/,
+    /\bassinatura\w*\b/,
+  ];
+  const featureCount = featurePatterns.reduce(
+    (count, pattern) => count + (pattern.test(normalizedText) ? 1 : 0),
+    0
+  );
+
+  return (hasTopic && hasExplicitName) || (hasTopic && featureCount >= 2) || featureCount >= 4;
+}
+
 function normalizeSlug(value, fallback) {
   const normalized = String(value || '')
     .normalize('NFD')
@@ -854,6 +965,10 @@ async function getFallbackChatReply({
     needsClarification: false,
     options: [],
     requiredConnectors: [],
+    mode: CHAT_MODE,
+    status: null,
+    generationStatus: null,
+    generation_status: null,
   };
 }
 
@@ -864,6 +979,28 @@ async function getAiReply({
     ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
     : [];
   const projectContext = buildProjectContext(project);
+  const firstPromptBuildNow = isCompleteFirstBuildPrompt(message, history, project);
+
+  if (firstPromptBuildNow) {
+    const detectedRequiredConnectors = detectRequiredConnectors({
+      message,
+      history,
+      project,
+      scope: 'initial',
+    });
+
+    return {
+      reply: BUILD_NOW_REPLY,
+      readyForWizard: true,
+      needsClarification: false,
+      options: [],
+      requiredConnectors: detectedRequiredConnectors,
+      mode: BUILD_NOW_MODE,
+      status: 'in_progress',
+      generationStatus: 'in_progress',
+      generation_status: 'in_progress',
+    };
+  }
 
   const decisionMessages = [
     {
@@ -877,16 +1014,27 @@ async function getAiReply({
   try {
     const content = await callClaude({ messages: decisionMessages });
     const parsed = extractJson(content);
-    const action = String(parsed.action || '').trim().toLowerCase();
-    const reply = String(parsed.reply || '').trim();
+    let action = String(parsed.action || '').trim().toLowerCase();
+    let reply = String(parsed.reply || '').trim();
 
     if (!['chat', 'wizard', 'clarify'].includes(action) || !reply) {
       throw new Error('Decisao invalida da IA.');
     }
 
+    const firstPromptNoContext = !project && !hasFirstPromptHistory(history);
+    const normalizedBuildText = firstPromptNoContext ? normalizeBuildIntentText(message) : '';
+
+    if (firstPromptNoContext && action === 'wizard' && isVagueCreationPrompt(normalizedBuildText)) {
+      action = isGreetingPrompt(normalizedBuildText) ? 'chat' : 'clarify';
+      reply = action === 'clarify'
+        ? 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
+        : reply;
+    }
+
     const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
     const options = normalizeOptions(parsed.options, shouldIncludeOptions);
     const readyForWizard = action === 'wizard';
+    const buildNowFromAi = readyForWizard && firstPromptNoContext;
     const connectorScope = project ? 'edit' : 'initial';
     const detectedRequiredConnectors = readyForWizard
       ? detectRequiredConnectors({
@@ -909,6 +1057,10 @@ async function getAiReply({
       needsClarification: action === 'clarify',
       options,
       requiredConnectors,
+      mode: buildNowFromAi ? BUILD_NOW_MODE : action === 'wizard' ? WIZARD_MODE : action === 'clarify' ? CLARIFY_MODE : CHAT_MODE,
+      status: buildNowFromAi ? 'in_progress' : null,
+      generationStatus: buildNowFromAi ? 'in_progress' : null,
+      generation_status: buildNowFromAi ? 'in_progress' : null,
     };
   } catch (error) {
     if (
@@ -1040,6 +1192,8 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
           userId: req.userId,
           readyForWizard: Boolean(aiReply.readyForWizard),
           needsClarification: Boolean(aiReply.needsClarification),
+          mode: aiReply.mode || CHAT_MODE,
+          status: aiReply.status || null,
           options: aiReply.options || [],
           requiredConnectors,
         },
@@ -1052,6 +1206,8 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
           ...(changeRequest.metadata || {}),
           readyForWizard: Boolean(aiReply.readyForWizard),
           needsClarification: Boolean(aiReply.needsClarification),
+          mode: aiReply.mode || CHAT_MODE,
+          status: aiReply.status || null,
         };
         await changeRequest.save();
       }
@@ -1060,8 +1216,12 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
     return res.json({
       success: true,
       reply: aiReply.reply,
+      mode: aiReply.mode || CHAT_MODE,
       readyForWizard: aiReply.readyForWizard,
       needsClarification: Boolean(aiReply.needsClarification),
+      status: aiReply.status || null,
+      generationStatus: aiReply.generationStatus || null,
+      generation_status: aiReply.generation_status || null,
       options: aiReply.options || [],
       requiredConnectors,
       changeRequest,

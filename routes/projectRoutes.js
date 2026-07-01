@@ -78,6 +78,8 @@ const PUBLISHED_PROJECT_LIMITS = {
   pro: 3,
   business: 10,
 };
+const BUILD_NOW_MODE = 'build_now';
+const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 
 function getPublishedProjectLimit(plan) {
   return PUBLISHED_PROJECT_LIMITS[plan] || PUBLISHED_PROJECT_LIMITS.free;
@@ -606,6 +608,15 @@ function detectInitialRequiredConnectors({ name, description, prompt, requiredCo
   return detectedConnectors;
 }
 
+function isBuildNowMode(value) {
+  return String(value || '').trim().toLowerCase() === BUILD_NOW_MODE;
+}
+
+function normalizeWizardStatus(value) {
+  const normalizedStatus = String(value || '').trim().toLowerCase();
+  return WIZARD_STATUSES.includes(normalizedStatus) ? normalizedStatus : null;
+}
+
 function getBackendBaseUrl(req) {
   const configuredBaseUrl =
     process.env.BACKEND_PUBLIC_URL ||
@@ -792,12 +803,34 @@ router.get('/', authMiddleware, async (req, res) => {
 
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { name, title, description, status, prompt, type, settings, requiredConnectors } = req.body;
+    const {
+      name,
+      title,
+      description,
+      status,
+      generationStatus,
+      generation_status: generationStatusSnake,
+      prompt,
+      type,
+      settings,
+      requiredConnectors,
+      mode,
+    } = req.body;
 
     if (!name) {
       return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
     }
 
+    const buildNow = isBuildNowMode(mode) || isBuildNowMode(status);
+    const requestedWizardStatus = normalizeWizardStatus(
+      generationStatus !== undefined
+        ? generationStatus
+        : generationStatusSnake !== undefined
+          ? generationStatusSnake
+          : status
+    );
+    const projectStatus = buildNow ? 'in_progress' : status;
+    const projectGenerationStatus = buildNow ? 'in_progress' : requestedWizardStatus;
     const titlePrompt = [prompt, description, title, name].filter(Boolean).join(' ');
     const explicitProjectName = extractExplicitProjectName(titlePrompt);
     const projectTitle = await getUniqueProjectTitleForUser(req.userId, titlePrompt);
@@ -809,7 +842,9 @@ router.post('/', authMiddleware, async (req, res) => {
       name: projectTitle,
       title: projectTitle,
       description,
-      status,
+      status: projectStatus,
+      generationStatus: projectGenerationStatus || undefined,
+      generation_status: projectGenerationStatus || undefined,
       prompt,
       type,
       settings,
