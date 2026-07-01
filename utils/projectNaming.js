@@ -1,3 +1,5 @@
+const Project = require('../models/Project');
+
 const GENERIC_WORDS = new Set([
   'app',
   'application',
@@ -145,7 +147,7 @@ function collectBrandCandidatesFromHtml(html) {
   return candidates;
 }
 
-function keywordFallbackName(text) {
+function keywordFallbackNames(text) {
   const normalized = String(text || '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -153,41 +155,45 @@ function keywordFallbackName(text) {
 
   if (/\b(carro|carros|auto|autos|automovel|automoveis|veiculo|veiculos|vehicle|vehicles|car|cars|drive|drives)\b/.test(normalized)) {
     if (/\b(venda|vendas|sell|sale|sales|marketplace|loja|shop|store|comprar|compra|buy)\b/.test(normalized)) {
-      return 'CarMarket';
+      return ['CarMarket', 'AutoHub', 'DriveDeal', 'DealerFlow'];
     }
 
-    return 'AutoHub';
+    return ['AutoHub', 'DriveDeal', 'CarMarket', 'DealerFlow'];
   }
 
   if (/\b(academy|academies|gym|gyms|academia|academias|fitness|treino|treinos|workout|workouts)\b/.test(normalized)) {
-    return normalized.includes('academia') || normalized.includes('gym') ? 'GymFlow' : 'FitPilot';
+    return ['GymFlow', 'FitTrack', 'TrainHub', 'CoreSync'];
   }
 
   if (/\b(delivery|deliveries|entrega|entregas|food|comida|restaurante|restaurant|meal|meals|lanche|lanches)\b/.test(normalized)) {
-    return 'QuickBite';
+    return ['QuickBite', 'MealHub', 'OrderFlow', 'FoodPilot'];
   }
 
   if (/\b(ride|rides|mobility|mobilidade|corrida|corridas|uber|motorista|driver|taxi)\b/.test(normalized)) {
-    return 'RideFlow';
+    return ['RideFlow', 'MoveHub', 'DriverSync', 'TripPilot'];
   }
 
   if (/\b(roupa|roupas|moda|fashion|outfit|outfits|vestuario|clothing|apparel|feminina|feminino)\b/.test(normalized)) {
-    return 'StyleFlow';
+    return ['StyleFlow', 'ModaHub', 'FitLook', 'WearSync'];
   }
 
   if (/\b(marketplace|shop|store|ecommerce|e-commerce|loja|venda|commerce)\b/.test(normalized)) {
-    return 'ShopFlow';
+    return ['ShopFlow', 'StoreHub', 'MarketSync', 'SellPilot'];
   }
 
   if (/\b(finance|financial|invoice|invoices|financa|financeiro|fatura|cobranca|ledger)\b/.test(normalized)) {
-    return 'LedgerFlow';
+    return ['LedgerFlow', 'FinanceHub', 'InvoicePilot', 'CashSync'];
   }
 
   if (/\b(process|workflow|automation|automacao|fluxo|processo)\b/.test(normalized)) {
-    return 'FlowPilot';
+    return ['FlowPilot', 'TaskSync', 'ProcessHub', 'AutoFlow'];
   }
 
-  return 'LaunchPilot';
+  return ['LaunchPilot', 'ProjectHub', 'BuildFlow', 'StartPilot'];
+}
+
+function keywordFallbackName(text) {
+  return keywordFallbackNames(text)[0];
 }
 
 function generateFallbackAppName(project, prompt, build) {
@@ -225,6 +231,77 @@ function getProjectTitleFromPrompt(prompt) {
   return extractExplicitProjectName(prompt) || generateFallbackProjectName(prompt);
 }
 
+function normalizeTitleKey(title) {
+  return String(title || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+function appendTitleSuffix(baseTitle, suffix) {
+  const suffixText = ` ${suffix}`;
+  const maxBaseLength = Math.max(1, 28 - suffixText.length);
+  const normalizedBaseTitle = normalizeProjectTitle(baseTitle) || 'Project';
+  const trimmedBase = normalizedBaseTitle.slice(0, maxBaseLength).trim().replace(/[\s._&-]+$/g, '');
+  return `${trimmedBase || 'Project'}${suffixText}`;
+}
+
+function getNumericSuffixBase(title) {
+  const cleanTitle = normalizeProjectTitle(title) || 'LaunchPilot';
+  const match = cleanTitle.match(/^(.*?)(?:\s+(\d+))$/);
+  if (!match) {
+    return { baseTitle: cleanTitle, nextSuffix: 2 };
+  }
+
+  const baseTitle = normalizeProjectTitle(match[1]) || cleanTitle;
+  const nextSuffix = Math.max(2, Number(match[2]) + 1);
+  return { baseTitle, nextSuffix };
+}
+
+function chooseAvailableTitle(candidates, existingTitleKeys) {
+  const cleanCandidates = candidates
+    .map((candidate) => normalizeProjectTitle(candidate))
+    .filter(Boolean);
+
+  for (const candidate of cleanCandidates) {
+    if (!existingTitleKeys.has(normalizeTitleKey(candidate))) {
+      return candidate;
+    }
+  }
+
+  const { baseTitle, nextSuffix } = getNumericSuffixBase(cleanCandidates[0] || 'LaunchPilot');
+  for (let suffix = nextSuffix; suffix < 10000; suffix += 1) {
+    const suffixedTitle = appendTitleSuffix(baseTitle, suffix);
+    if (!existingTitleKeys.has(normalizeTitleKey(suffixedTitle))) {
+      return suffixedTitle;
+    }
+  }
+
+  return appendTitleSuffix(baseTitle, 10000);
+}
+
+async function getUniqueProjectTitleForUser(userId, prompt) {
+  const sourceText = String(prompt || '');
+  const explicitProjectName = extractExplicitProjectName(sourceText);
+  const candidates = explicitProjectName
+    ? [explicitProjectName]
+    : keywordFallbackNames(sourceText);
+
+  const existingProjects = await Project.find({ userId })
+    .select('name title')
+    .lean();
+
+  const existingTitleKeys = new Set();
+  existingProjects.forEach((project) => {
+    const nameKey = normalizeTitleKey(project && project.name);
+    const titleKey = normalizeTitleKey(project && project.title);
+    if (nameKey) existingTitleKeys.add(nameKey);
+    if (titleKey) existingTitleKeys.add(titleKey);
+  });
+
+  return chooseAvailableTitle(candidates, existingTitleKeys);
+}
+
 function slugifyAppName(name) {
   return String(name || '')
     .normalize('NFD')
@@ -241,6 +318,7 @@ module.exports = {
   extractExplicitProjectName,
   generateFallbackAppName,
   generateFallbackProjectName,
+  getUniqueProjectTitleForUser,
   getProjectTitleFromPrompt,
   normalizeAppName,
   normalizeProjectTitle,

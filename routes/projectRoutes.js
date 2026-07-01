@@ -33,7 +33,7 @@ const {
   extractExplicitAppName,
   extractExplicitProjectName,
   generateFallbackAppName,
-  getProjectTitleFromPrompt,
+  getUniqueProjectTitleForUser,
   normalizeAppName,
 } = require('../utils/projectNaming');
 
@@ -800,7 +800,7 @@ router.post('/', authMiddleware, async (req, res) => {
 
     const titlePrompt = [prompt, description, title, name].filter(Boolean).join(' ');
     const explicitProjectName = extractExplicitProjectName(titlePrompt);
-    const projectTitle = getProjectTitleFromPrompt(titlePrompt);
+    const projectTitle = await getUniqueProjectTitleForUser(req.userId, titlePrompt);
     const explicitAppName = extractExplicitAppName(titlePrompt);
     const appName = explicitAppName || normalizeAppName(projectTitle) || generateFallbackAppName({ name: projectTitle, description, prompt }, prompt);
 
