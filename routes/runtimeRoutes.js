@@ -2,9 +2,18 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
-const { requireRuntimeAuth } = require('../middleware/runtimeAuth');
+const { optionalRuntimeAuth, requireRuntimeAuth } = require('../middleware/runtimeAuth');
 const { validateRuntimeProject } = require('../middleware/runtimeProject');
 const { runtimeError } = require('../utils/runtimeErrors');
+const {
+  canCreateRuntimeDocument,
+  canDeleteRuntimeDocument,
+  canReadRuntimeCollection,
+  canReadRuntimeDocument,
+  canUpdateRuntimeDocument,
+  getRuntimeCollectionPolicy,
+  runtimeUserIsAdmin,
+} = require('../utils/runtimePolicies');
 const {
   assertSafeRuntimeBody,
   buildRuntimeEqualityFilter,
@@ -42,6 +51,7 @@ function serializeRuntimeDocument(document) {
     id: String(document._id),
     projectId: String(document.projectId),
     collection: document.collection,
+    ownerId: document.ownerId ? String(document.ownerId) : undefined,
     data: document.data || {},
     createdAt: document.createdAt,
     updatedAt: document.updatedAt,
@@ -73,6 +83,26 @@ function validateRuntimeBody(req, res, next) {
   }
 
   return next();
+}
+
+function requireRuntimeUserForPolicy(req, res, policy) {
+  if (policy.publicWrite || req.runtimeUserId) {
+    return false;
+  }
+
+  runtimeError(res, 401, 'RUNTIME_AUTH_REQUIRED', 'Runtime auth token required.');
+  return true;
+}
+
+function buildPolicyReadFilter(req, policy, filter) {
+  if (policy.ownerScopedRead && !runtimeUserIsAdmin(req)) {
+    return {
+      ...filter,
+      ownerId: req.runtimeUserId,
+    };
+  }
+
+  return filter;
 }
 
 router.use(validateRuntimeProject);
@@ -161,8 +191,14 @@ router.get('/auth/me', requireRuntimeAuth, (req, res) => {
   });
 });
 
-router.get('/collections/:collection', validateRuntimeCollection, async (req, res) => {
+router.get('/collections/:collection', validateRuntimeCollection, optionalRuntimeAuth, async (req, res) => {
   try {
+    const policy = getRuntimeCollectionPolicy(req.runtimeCollection);
+
+    if (!canReadRuntimeCollection(req, policy)) {
+      return runtimeError(res, 401, 'RUNTIME_AUTH_REQUIRED', 'Runtime auth token required.');
+    }
+
     const filter = buildRuntimeEqualityFilter(req.query);
 
     if (!filter) {
@@ -173,7 +209,7 @@ router.get('/collections/:collection', validateRuntimeCollection, async (req, re
     const documents = await runtimeFind(
       req.runtimeProjectId,
       req.runtimeCollection,
-      filter,
+      buildPolicyReadFilter(req, policy, filter),
       { limit, skip }
     );
 
@@ -195,13 +231,24 @@ router.get(
   '/collections/:collection/:id',
   validateRuntimeCollection,
   validateRuntimeDocumentId,
+  optionalRuntimeAuth,
   async (req, res) => {
     try {
+      const policy = getRuntimeCollectionPolicy(req.runtimeCollection);
+
+      if (!canReadRuntimeCollection(req, policy)) {
+        return runtimeError(res, 401, 'RUNTIME_AUTH_REQUIRED', 'Runtime auth token required.');
+      }
+
       const document = await runtimeFindOne(req.runtimeProjectId, req.runtimeCollection, {
         _id: req.params.id,
       });
 
       if (!document) {
+        return runtimeError(res, 404, 'RUNTIME_NOT_FOUND', 'Runtime document not found.');
+      }
+
+      if (!canReadRuntimeDocument(req, policy, document)) {
         return runtimeError(res, 404, 'RUNTIME_NOT_FOUND', 'Runtime document not found.');
       }
 
@@ -213,9 +260,21 @@ router.get(
   }
 );
 
-router.post('/collections/:collection', validateRuntimeCollection, validateRuntimeBody, async (req, res) => {
+router.post('/collections/:collection', validateRuntimeCollection, optionalRuntimeAuth, validateRuntimeBody, async (req, res) => {
   try {
-    const document = await runtimeCreate(req.runtimeProjectId, req.runtimeCollection, req.body);
+    const policy = getRuntimeCollectionPolicy(req.runtimeCollection);
+
+    if (!canCreateRuntimeDocument(req, policy)) {
+      return runtimeError(res, 401, 'RUNTIME_AUTH_REQUIRED', 'Runtime auth token required.');
+    }
+
+    const createOptions = {};
+
+    if (policy.assignOwnerOnCreate && req.runtimeUserId) {
+      createOptions.ownerId = req.runtimeUserId;
+    }
+
+    const document = await runtimeCreate(req.runtimeProjectId, req.runtimeCollection, req.body, createOptions);
     return res.status(201).json({ data: serializeRuntimeDocument(document) });
   } catch (error) {
     console.error('Runtime document create failed:', error);
@@ -227,19 +286,34 @@ router.patch(
   '/collections/:collection/:id',
   validateRuntimeCollection,
   validateRuntimeDocumentId,
+  optionalRuntimeAuth,
   validateRuntimeBody,
   async (req, res) => {
     try {
+      const policy = getRuntimeCollectionPolicy(req.runtimeCollection);
+
+      if (requireRuntimeUserForPolicy(req, res, policy)) {
+        return null;
+      }
+
+      const existingDocument = await runtimeFindOne(req.runtimeProjectId, req.runtimeCollection, {
+        _id: req.params.id,
+      });
+
+      if (!existingDocument) {
+        return runtimeError(res, 404, 'RUNTIME_NOT_FOUND', 'Runtime document not found.');
+      }
+
+      if (!canUpdateRuntimeDocument(req, policy, existingDocument)) {
+        return runtimeError(res, 403, 'RUNTIME_FORBIDDEN', 'Runtime document access denied.');
+      }
+
       const document = await runtimeUpdate(
         req.runtimeProjectId,
         req.runtimeCollection,
         { _id: req.params.id },
         req.body
       );
-
-      if (!document) {
-        return runtimeError(res, 404, 'RUNTIME_NOT_FOUND', 'Runtime document not found.');
-      }
 
       return res.json({ data: serializeRuntimeDocument(document) });
     } catch (error) {
@@ -253,15 +327,30 @@ router.delete(
   '/collections/:collection/:id',
   validateRuntimeCollection,
   validateRuntimeDocumentId,
+  optionalRuntimeAuth,
   async (req, res) => {
     try {
-      const document = await runtimeDelete(req.runtimeProjectId, req.runtimeCollection, {
+      const policy = getRuntimeCollectionPolicy(req.runtimeCollection);
+
+      if (requireRuntimeUserForPolicy(req, res, policy)) {
+        return null;
+      }
+
+      const existingDocument = await runtimeFindOne(req.runtimeProjectId, req.runtimeCollection, {
         _id: req.params.id,
       });
 
-      if (!document) {
+      if (!existingDocument) {
         return runtimeError(res, 404, 'RUNTIME_NOT_FOUND', 'Runtime document not found.');
       }
+
+      if (!canDeleteRuntimeDocument(req, policy, existingDocument)) {
+        return runtimeError(res, 403, 'RUNTIME_FORBIDDEN', 'Runtime document access denied.');
+      }
+
+      const document = await runtimeDelete(req.runtimeProjectId, req.runtimeCollection, {
+        _id: req.params.id,
+      });
 
       return res.json({ data: serializeRuntimeDocument(document) });
     } catch (error) {

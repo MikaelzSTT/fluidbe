@@ -23,6 +23,16 @@ function assertNoProjectOverride(value) {
   }
 }
 
+function assertNoOwnerOverride(value) {
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, 'ownerId')) {
+    throw new Error('Runtime ownerId overrides are not allowed.');
+  }
+}
+
 function scopedQuery(projectId, collection, filter = {}) {
   assertProjectId(projectId);
   assertCollection(collection);
@@ -57,6 +67,7 @@ function runtimeCreate(projectId, collection, data = {}, options = {}) {
   assertProjectId(projectId);
   assertCollection(collection);
   assertNoProjectOverride(data);
+  assertNoOwnerOverride(data);
 
   const document = {
     projectId,
@@ -77,6 +88,7 @@ function runtimeCreate(projectId, collection, data = {}, options = {}) {
 
 function runtimeUpdate(projectId, collection, filter = {}, update = {}) {
   assertNoProjectOverride(update);
+  assertNoOwnerOverride(update);
 
   const set = {};
 
