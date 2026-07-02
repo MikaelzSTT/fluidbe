@@ -1,6 +1,8 @@
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
+const { requireRuntimeAuth } = require('../middleware/runtimeAuth');
 const { validateRuntimeProject } = require('../middleware/runtimeProject');
 const { runtimeError } = require('../utils/runtimeErrors');
 const {
@@ -16,6 +18,13 @@ const {
   runtimeFindOne,
   runtimeUpdate,
 } = require('../utils/runtimeStore');
+const {
+  RUNTIME_USER_COLLECTION,
+  normalizeRuntimeEmail,
+  normalizeRuntimeRole,
+  serializeRuntimeUser,
+  signRuntimeAuthToken,
+} = require('../utils/runtimeAuth');
 
 const router = express.Router({ mergeParams: true });
 const runtimeRateLimit = createRateLimit({
@@ -68,6 +77,89 @@ function validateRuntimeBody(req, res, next) {
 
 router.use(validateRuntimeProject);
 router.use(runtimeRateLimit);
+
+router.post('/auth/register', async (req, res) => {
+  try {
+    const email = normalizeRuntimeEmail(req.body?.email);
+    const password = req.body?.password;
+    const role = normalizeRuntimeRole(req.body?.role);
+
+    if (!email) {
+      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_EMAIL', 'Invalid email.');
+    }
+
+    if (typeof password !== 'string' || password.length < 6) {
+      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_PASSWORD', 'Password must be at least 6 characters.');
+    }
+
+    if (!role) {
+      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_ROLE', 'Invalid runtime user role.');
+    }
+
+    const existingUser = await runtimeFindOne(req.runtimeProjectId, RUNTIME_USER_COLLECTION, {
+      'data.email': email,
+    });
+
+    if (existingUser) {
+      return runtimeError(res, 409, 'RUNTIME_AUTH_EMAIL_EXISTS', 'Email already registered for this project.');
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await runtimeCreate(req.runtimeProjectId, RUNTIME_USER_COLLECTION, {
+      email,
+      passwordHash,
+      role,
+      createdAt: new Date(),
+    });
+
+    return res.status(201).json({
+      user: serializeRuntimeUser(user),
+      token: signRuntimeAuthToken(user),
+    });
+  } catch (error) {
+    console.error('Runtime auth register failed:', error);
+    return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime auth request failed.');
+  }
+});
+
+router.post('/auth/login', async (req, res) => {
+  try {
+    const email = normalizeRuntimeEmail(req.body?.email);
+    const password = req.body?.password;
+
+    if (!email || typeof password !== 'string') {
+      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_CREDENTIALS', 'Invalid email or password.');
+    }
+
+    const user = await runtimeFindOne(req.runtimeProjectId, RUNTIME_USER_COLLECTION, {
+      'data.email': email,
+    });
+
+    if (!user?.data?.passwordHash) {
+      return runtimeError(res, 401, 'RUNTIME_AUTH_INVALID_CREDENTIALS', 'Invalid email or password.');
+    }
+
+    const passwordIsValid = await bcrypt.compare(password, user.data.passwordHash);
+
+    if (!passwordIsValid) {
+      return runtimeError(res, 401, 'RUNTIME_AUTH_INVALID_CREDENTIALS', 'Invalid email or password.');
+    }
+
+    return res.json({
+      user: serializeRuntimeUser(user),
+      token: signRuntimeAuthToken(user),
+    });
+  } catch (error) {
+    console.error('Runtime auth login failed:', error);
+    return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime auth request failed.');
+  }
+});
+
+router.get('/auth/me', requireRuntimeAuth, (req, res) => {
+  return res.json({
+    user: serializeRuntimeUser(req.runtimeUser),
+  });
+});
 
 router.get('/collections/:collection', validateRuntimeCollection, async (req, res) => {
   try {

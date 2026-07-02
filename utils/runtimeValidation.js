@@ -8,6 +8,7 @@ const BLOCKED_COLLECTIONS = new Set([
   'sessions',
   'projectbuilds',
   'buildjobs',
+  '_users',
 ]);
 
 const SAFE_COLLECTION_PATTERN = /^[a-z0-9_-]+$/;
@@ -34,9 +35,9 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function containsUnsafeKey(value, { blockProjectId = false } = {}) {
+function containsUnsafeKey(value, { blockOwnerId = false, blockProjectId = false } = {}) {
   if (Array.isArray(value)) {
-    return value.some((item) => containsUnsafeKey(item, { blockProjectId }));
+    return value.some((item) => containsUnsafeKey(item, { blockOwnerId, blockProjectId }));
   }
 
   if (!value || typeof value !== 'object') {
@@ -47,12 +48,13 @@ function containsUnsafeKey(value, { blockProjectId = false } = {}) {
     if (
       key.startsWith('$') ||
       key.includes('.') ||
-      (blockProjectId && key === 'projectId')
+      (blockProjectId && key === 'projectId') ||
+      (blockOwnerId && key === 'ownerId')
     ) {
       return true;
     }
 
-    return containsUnsafeKey(nestedValue, { blockProjectId });
+    return containsUnsafeKey(nestedValue, { blockOwnerId, blockProjectId });
   });
 }
 
@@ -127,7 +129,7 @@ function assertSafeRuntimeBody(body) {
     return false;
   }
 
-  return !containsUnsafeKey(body, { blockProjectId: true });
+  return !containsUnsafeKey(body, { blockOwnerId: true, blockProjectId: true });
 }
 
 module.exports = {

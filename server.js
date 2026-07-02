@@ -343,7 +343,13 @@ function getBearerUserId(req) {
   }
 
   try {
-    return jwt.verify(token, process.env.JWT_SECRET).id || null;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (!decoded.id || decoded.runtimeUserId) {
+      return null;
+    }
+
+    return decoded.id;
   } catch (error) {
     return null;
   }

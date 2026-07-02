@@ -1,4 +1,5 @@
 const RuntimeDocument = require('../models/RuntimeDocument');
+const mongoose = require('mongoose');
 
 function assertProjectId(projectId) {
   if (!projectId) {
@@ -52,16 +53,26 @@ function runtimeFindOne(projectId, collection, filter = {}) {
   return RuntimeDocument.findOne(scopedQuery(projectId, collection, filter));
 }
 
-function runtimeCreate(projectId, collection, data = {}) {
+function runtimeCreate(projectId, collection, data = {}, options = {}) {
   assertProjectId(projectId);
   assertCollection(collection);
   assertNoProjectOverride(data);
 
-  return RuntimeDocument.create({
+  const document = {
     projectId,
     collection,
     data,
-  });
+  };
+
+  if (options.ownerId) {
+    if (!mongoose.Types.ObjectId.isValid(options.ownerId)) {
+      throw new Error('Runtime ownerId is invalid.');
+    }
+
+    document.ownerId = options.ownerId;
+  }
+
+  return RuntimeDocument.create(document);
 }
 
 function runtimeUpdate(projectId, collection, filter = {}, update = {}) {
