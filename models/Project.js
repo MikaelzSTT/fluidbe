@@ -58,6 +58,11 @@ const projectSchema = new mongoose.Schema(
       default: false,
     },
 
+    runtimeEnabled: {
+      type: Boolean,
+      default: false,
+    },
+
     visibility: {
       type: String,
       enum: ['public'],

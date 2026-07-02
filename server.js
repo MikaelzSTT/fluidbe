@@ -11,6 +11,7 @@ const chatRoutes = require('./routes/chatRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
 const billingRoutes = require('./routes/billingRoutes');
+const runtimeRoutes = require('./routes/runtimeRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
@@ -568,6 +569,7 @@ app.use('/api/projects', projectRoutes);
 app.use('/api/chat', chatIpRateLimit, chatRoutes);
 app.use('/api/admin', adminRateLimit, adminRoutes);
 app.use('/api/connectors', connectorRegistryRoutes);
+app.use('/api/runtime/:projectId', runtimeRoutes);
 app.use((error, req, res, next) => {
   console.error('Erro não tratado na requisição:', error);
 
