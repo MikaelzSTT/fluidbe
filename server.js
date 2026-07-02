@@ -102,6 +102,10 @@ function isPublicAppHost(req) {
   return String(req.hostname || '').toLowerCase() === PUBLIC_APP_HOST;
 }
 
+function isPublicRuntimeApiRoute(pathname) {
+  return pathname === '/api/runtime' || pathname.startsWith('/api/runtime/');
+}
+
 function publicAppsOnly(req, res, next) {
   if (!isPublicAppHost(req)) {
     return next();
@@ -109,7 +113,12 @@ function publicAppsOnly(req, res, next) {
 
   const pathname = req.path || '';
 
-  if (pathname === '/' || /^\/p\/[^/]+\/?$/.test(pathname) || pathname.startsWith('/builds/')) {
+  if (
+    pathname === '/'
+    || /^\/p\/[^/]+\/?$/.test(pathname)
+    || pathname.startsWith('/builds/')
+    || isPublicRuntimeApiRoute(pathname)
+  ) {
     return next();
   }
 
