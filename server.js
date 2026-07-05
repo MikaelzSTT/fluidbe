@@ -48,11 +48,15 @@ const allowedOrigins = [
   'https://apps.askfluid.now',
   'https://fluid-web-static.onrender.com',
   'http://localhost:3000',
-  'http://localhost:5173'
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
 ];
 const corsOptions = {
   origin: allowedOrigins,
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-key'],
+  optionsSuccessStatus: 204
 };
 const apiRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
@@ -111,6 +115,19 @@ function isPublicAuthApiRoute(pathname) {
   return pathname === '/api/auth' || pathname.startsWith('/api/auth/');
 }
 
+function isPublicFrontendApiRoute(pathname) {
+  return (
+    isPublicAuthApiRoute(pathname)
+    || pathname === '/api/projects'
+    || pathname.startsWith('/api/projects/')
+    || pathname === '/api/chat'
+    || pathname.startsWith('/api/chat/')
+    || pathname === '/api/billing'
+    || pathname.startsWith('/api/billing/')
+    || isPublicRuntimeApiRoute(pathname)
+  );
+}
+
 function publicAppsOnly(req, res, next) {
   if (!isPublicAppHost(req)) {
     return next();
@@ -122,8 +139,7 @@ function publicAppsOnly(req, res, next) {
     pathname === '/'
     || /^\/p\/[^/]+\/?$/.test(pathname)
     || pathname.startsWith('/builds/')
-    || isPublicRuntimeApiRoute(pathname)
-    || isPublicAuthApiRoute(pathname)
+    || isPublicFrontendApiRoute(pathname)
   ) {
     return next();
   }
@@ -542,9 +558,9 @@ async function loadPublishedHtml(project) {
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
 app.use(securityHeaders);
-app.use(publicAppsOnly);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+app.use(publicAppsOnly);
 app.use('/api', apiRateLimit);
 app.use('/api/billing', billingRoutes);
 app.use(express.json());
