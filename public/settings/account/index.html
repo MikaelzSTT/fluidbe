@@ -314,6 +314,11 @@
 
   <script>
     const SETTINGS_CACHE_KEY = 'fluidAccountSettings';
+    const PRODUCTION_APP_ORIGINS = new Set([
+      'https://askfluid.now',
+      'https://www.askfluid.now',
+    ]);
+    const PRODUCTION_API_ORIGIN = 'https://apps.askfluid.now';
     const TOKEN_KEYS = [
       'fluid-token',
       'fluid.auth.token',
@@ -426,6 +431,28 @@
       }, 3200);
     }
 
+    function getApiBaseUrl() {
+      const origin = window.location.origin;
+
+      if (PRODUCTION_APP_ORIGINS.has(origin)) {
+        return PRODUCTION_API_ORIGIN;
+      }
+
+      return '';
+    }
+
+    function buildApiUrl(path) {
+      const apiBaseUrl = getApiBaseUrl();
+      return `${apiBaseUrl}${path}`;
+    }
+
+    function warnFailedRequest(url, status) {
+      console.warn('[account-settings] API request failed.', {
+        url,
+        status,
+      });
+    }
+
     function createNoTokenError() {
       const error = new Error('Sign in required.');
       error.status = 401;
@@ -454,11 +481,20 @@
       return error.message || fallback;
     }
 
+    function formatBackendSaveError(error) {
+      if (error.status) {
+        return `Backend save failed: HTTP ${error.status}`;
+      }
+
+      return formatApiError(error, 'Could not save settings.');
+    }
+
     async function requestWithToken(path, options, token) {
       let response;
+      const url = buildApiUrl(path);
 
       try {
-        response = await fetch(path, {
+        response = await fetch(url, {
           ...options,
           headers: {
             'Content-Type': 'application/json',
@@ -467,6 +503,7 @@
           },
         });
       } catch (error) {
+        warnFailedRequest(url, 'network');
         throw createNetworkError(error);
       }
 
@@ -476,6 +513,8 @@
         const error = new Error(body.message || body.code || 'Request failed.');
         error.status = response.status;
         error.code = body.code || '';
+        error.apiUrl = url;
+        warnFailedRequest(url, response.status);
         throw error;
       }
 
@@ -662,7 +701,7 @@
           return;
         }
 
-        showToast(formatApiError(error, 'Could not save profile.'), 'error');
+        showToast(formatBackendSaveError(error), 'error');
       } finally {
         button.disabled = false;
       }
@@ -688,7 +727,7 @@
           return;
         }
 
-        showToast(formatApiError(error, 'Could not save preferences.'), 'error');
+        showToast(formatBackendSaveError(error), 'error');
       } finally {
         button.disabled = false;
       }

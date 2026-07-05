@@ -107,6 +107,10 @@ function isPublicRuntimeApiRoute(pathname) {
   return pathname === '/api/runtime' || pathname.startsWith('/api/runtime/');
 }
 
+function isPublicAuthApiRoute(pathname) {
+  return pathname === '/api/auth' || pathname.startsWith('/api/auth/');
+}
+
 function publicAppsOnly(req, res, next) {
   if (!isPublicAppHost(req)) {
     return next();
@@ -119,6 +123,7 @@ function publicAppsOnly(req, res, next) {
     || /^\/p\/[^/]+\/?$/.test(pathname)
     || pathname.startsWith('/builds/')
     || isPublicRuntimeApiRoute(pathname)
+    || isPublicAuthApiRoute(pathname)
   ) {
     return next();
   }
