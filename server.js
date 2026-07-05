@@ -578,6 +578,12 @@ app.get(/^\/builds\/.+$/, async (req, res, next) => {
     return next(error);
   }
 });
+app.use('/settings/account', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 app.use(express.static(PUBLIC_DIR));
 app.get('/p/:slug', async (req, res) => {
   try {

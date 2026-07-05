@@ -453,6 +453,20 @@
       return readTokenCandidates()[0] || '';
     }
 
+    function readFluidToken() {
+      const stores = [localStorage, sessionStorage];
+
+      for (const store of stores) {
+        const token = normalizeToken(readStorageItem(store, 'fluid-token'));
+
+        if (token) {
+          return token;
+        }
+      }
+
+      return normalizeToken(readCookieValue('fluid-token'));
+    }
+
     function showToast(message, tone = 'success') {
       window.clearTimeout(toastTimer);
       toast.textContent = message;
@@ -745,14 +759,13 @@
       }
     }
 
-    async function saveSettingsSection(path, section, payload, successMessage, localMessage) {
+    async function saveSettingsSection(path, payload, successMessage) {
       const tokens = readTokenCandidates();
       const url = buildApiUrl(path);
 
       if (!tokens.length) {
         warnSaveFailure(url, null, true);
-        mergeCachedSettings(section, payload);
-        showToast(localMessage);
+        showToast('Sign in required. Please log in again.', 'error');
         return;
       }
 
@@ -766,29 +779,38 @@
       } catch (error) {
         warnSaveFailure(error.apiUrl || url, error.status || (error.network ? 'network' : null), false);
 
-        if (error.network) {
-          mergeCachedSettings(section, payload);
-          showToast(localMessage);
-          return;
-        }
-
         showToast(formatBackendSaveError(error), 'error');
       }
     }
 
     profileForm.addEventListener('submit', async (event) => {
       event.preventDefault();
+      console.log('Save profile clicked');
       const button = profileForm.querySelector('button[type="submit"]');
       button.disabled = true;
 
       try {
-        await saveSettingsSection(
-          '/api/auth/me/profile',
-          'profile',
-          collectProfilePayload(),
-          'Profile saved.',
-          'Profile saved locally.'
-        );
+        const token = readFluidToken();
+        const url = buildApiUrl('/api/auth/me/profile');
+
+        if (!token) {
+          warnSaveFailure(url, null, true);
+          showToast('Sign in required. Please log in again.', 'error');
+          return;
+        }
+
+        console.log(`Saving profile via backend: ${url}`);
+        const settings = await requestWithToken('/api/auth/me/profile', {
+          method: 'PATCH',
+          body: JSON.stringify(collectProfilePayload()),
+        }, token);
+
+        applySettings(settings);
+        console.log('Profile backend save OK');
+        showToast('Profile saved.');
+      } catch (error) {
+        warnSaveFailure(error.apiUrl || buildApiUrl('/api/auth/me/profile'), error.status || (error.network ? 'network' : null), false);
+        showToast(formatBackendSaveError(error), 'error');
       } finally {
         button.disabled = false;
       }
@@ -802,10 +824,8 @@
       try {
         await saveSettingsSection(
           '/api/auth/me/preferences',
-          'preferences',
           collectPreferencesPayload(),
-          'Preferences saved.',
-          'Preferences saved locally.'
+          'Preferences saved.'
         );
       } finally {
         button.disabled = false;
