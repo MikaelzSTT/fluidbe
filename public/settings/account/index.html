@@ -315,13 +315,31 @@
   <script>
     const SETTINGS_CACHE_KEY = 'fluidAccountSettings';
     const TOKEN_KEYS = [
+      'fluid-token',
+      'fluid.auth.token',
+      'fluid:auth:token',
       'fluidToken',
-      'fluid_token',
       'fluidAuthToken',
+      'fluid_token',
       'fluid_auth_token',
       'authToken',
       'auth_token',
       'token',
+    ];
+    const USER_KEYS = [
+      'fluid-user',
+      'fluidUser',
+      'fluid:user',
+      'fluid.auth.user',
+      'user',
+      'currentUser',
+    ];
+    const USER_TOKEN_FIELDS = [
+      'token',
+      'authToken',
+      'accessToken',
+      'jwt',
+      'idToken',
     ];
     const profileFields = ['displayName', 'username', 'bio', 'website', 'company', 'location', 'visibility'];
     const preferenceFields = ['language', 'appearance', 'soundOnComplete', 'chatSuggestions', 'autoSave', 'confirmBeforeDelete', 'compactMode'];
@@ -335,27 +353,67 @@
 
     let toastTimer = null;
 
-    function readToken() {
-      for (const key of TOKEN_KEYS) {
-        const token = localStorage.getItem(key);
+    function normalizeToken(value) {
+      if (typeof value !== 'string') {
+        return '';
+      }
 
-        if (token) {
-          return token;
+      const token = value.replace(/^Bearer\s+/i, '').trim();
+      return token && token !== 'null' && token !== 'undefined' ? token : '';
+    }
+
+    function addTokenCandidate(candidates, seen, token) {
+      const normalized = normalizeToken(token);
+
+      if (!normalized || seen.has(normalized)) {
+        return;
+      }
+
+      seen.add(normalized);
+      candidates.push(normalized);
+    }
+
+    function collectUserObjectTokens(value, candidates, seen) {
+      if (!value || typeof value !== 'object') {
+        return;
+      }
+
+      USER_TOKEN_FIELDS.forEach((field) => {
+        addTokenCandidate(candidates, seen, value[field]);
+      });
+
+      collectUserObjectTokens(value.auth, candidates, seen);
+      collectUserObjectTokens(value.session, candidates, seen);
+      collectUserObjectTokens(value.user, candidates, seen);
+    }
+
+    function readTokenCandidates() {
+      const candidates = [];
+      const seen = new Set();
+
+      for (const key of TOKEN_KEYS) {
+        addTokenCandidate(candidates, seen, localStorage.getItem(key));
+      }
+
+      for (const key of USER_KEYS) {
+        const userJson = localStorage.getItem(key);
+
+        if (!userJson) {
+          continue;
+        }
+
+        try {
+          collectUserObjectTokens(JSON.parse(userJson), candidates, seen);
+        } catch (error) {
+          console.warn('[account-settings] Ignoring unreadable auth user cache.', { key });
         }
       }
 
-      const userJson = localStorage.getItem('user') || localStorage.getItem('fluidUser');
+      return candidates;
+    }
 
-      if (!userJson) {
-        return '';
-      }
-
-      try {
-        const user = JSON.parse(userJson);
-        return user.token || user.authToken || '';
-      } catch (error) {
-        return '';
-      }
+    function readToken() {
+      return readTokenCandidates()[0] || '';
     }
 
     function showToast(message, tone = 'success') {
@@ -368,33 +426,88 @@
       }, 3200);
     }
 
-    async function apiRequest(path, options = {}) {
-      const token = readToken();
+    function createNoTokenError() {
+      const error = new Error('Sign in required.');
+      error.status = 401;
+      error.code = 'NO_AUTH_TOKEN';
+      error.noToken = true;
+      return error;
+    }
 
-      if (!token) {
-        const error = new Error('Sign in required.');
-        error.status = 401;
-        throw error;
+    function createNetworkError(error) {
+      const networkError = new Error('Backend unavailable.');
+      networkError.code = 'BACKEND_UNAVAILABLE';
+      networkError.cause = error;
+      networkError.network = true;
+      return networkError;
+    }
+
+    function formatApiError(error, fallback) {
+      if (error.status) {
+        return `HTTP ${error.status}: ${error.message || fallback}`;
       }
 
-      const response = await fetch(path, {
-        ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-          ...(options.headers || {}),
-        },
-      });
+      if (error.code) {
+        return `${error.code}: ${error.message || fallback}`;
+      }
+
+      return error.message || fallback;
+    }
+
+    async function requestWithToken(path, options, token) {
+      let response;
+
+      try {
+        response = await fetch(path, {
+          ...options,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            ...(options.headers || {}),
+          },
+        });
+      } catch (error) {
+        throw createNetworkError(error);
+      }
 
       const body = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        const error = new Error(body.message || 'Request failed.');
+        const error = new Error(body.message || body.code || 'Request failed.');
         error.status = response.status;
+        error.code = body.code || '';
         throw error;
       }
 
       return body.settings || body;
+    }
+
+    async function apiRequest(path, options = {}) {
+      const tokens = readTokenCandidates();
+
+      if (!tokens.length) {
+        throw createNoTokenError();
+      }
+
+      let lastError = null;
+
+      for (const token of tokens) {
+        try {
+          return await requestWithToken(path, options, token);
+        } catch (error) {
+          if (error.network) {
+            throw error;
+          }
+
+          lastError = error;
+
+          if (error.status !== 401) {
+            throw error;
+          }
+        }
+      }
+
+      throw lastError || createNoTokenError();
     }
 
     function getCachedSettings() {
@@ -407,6 +520,20 @@
 
     function cacheSettings(settings) {
       localStorage.setItem(SETTINGS_CACHE_KEY, JSON.stringify(settings));
+    }
+
+    function mergeCachedSettings(section, payload) {
+      const cached = getCachedSettings() || {};
+      const next = {
+        ...cached,
+        [section]: {
+          ...(cached[section] || {}),
+          ...payload,
+        },
+      };
+
+      cacheSettings(next);
+      hydrate(next);
     }
 
     function setSignInRequired() {
@@ -494,7 +621,7 @@
         hydrate(settings);
         cacheSettings(settings);
       } catch (error) {
-        if (error.status === 401) {
+        if (error.noToken || error.status === 401) {
           setSignInRequired();
           return;
         }
@@ -504,10 +631,14 @@
         if (cached) {
           hydrate(cached);
           showToast('Using saved settings from this browser.', 'error');
+          console.warn('[account-settings] Backend settings load failed; using local cache.', {
+            status: error.status,
+            code: error.code,
+          });
           return;
         }
 
-        showToast(error.message || 'Could not load settings.', 'error');
+        showToast(formatApiError(error, 'Could not load settings.'), 'error');
       }
     }
 
@@ -525,7 +656,13 @@
         cacheSettings(settings);
         showToast('Profile saved.');
       } catch (error) {
-        showToast(error.message || 'Could not save profile.', 'error');
+        if (error.noToken || error.network) {
+          mergeCachedSettings('profile', collectProfilePayload());
+          showToast('Profile saved locally.');
+          return;
+        }
+
+        showToast(formatApiError(error, 'Could not save profile.'), 'error');
       } finally {
         button.disabled = false;
       }
@@ -545,7 +682,13 @@
         cacheSettings(settings);
         showToast('Preferences saved.');
       } catch (error) {
-        showToast(error.message || 'Could not save preferences.', 'error');
+        if (error.noToken || error.network) {
+          mergeCachedSettings('preferences', collectPreferencesPayload());
+          showToast('Preferences saved locally.');
+          return;
+        }
+
+        showToast(formatApiError(error, 'Could not save preferences.'), 'error');
       } finally {
         button.disabled = false;
       }
