@@ -2,6 +2,13 @@ const jwt = require('jsonwebtoken');
 
 function serializePreferences(preferences) {
   return {
+    language: preferences?.language || 'english',
+    appearance: preferences?.appearance || 'system',
+    chatSuggestions: preferences?.chatSuggestions === undefined ? true : Boolean(preferences.chatSuggestions),
+    soundOnComplete: preferences?.soundOnComplete || 'first',
+    autoSave: preferences?.autoSave === undefined ? true : Boolean(preferences.autoSave),
+    confirmBeforeDelete: preferences?.confirmBeforeDelete === undefined ? true : Boolean(preferences.confirmBeforeDelete),
+    compactMode: preferences?.compactMode === undefined ? false : Boolean(preferences.compactMode),
     theme: preferences?.theme || null,
     displayName: preferences?.displayName || null,
     role: preferences?.role || null,

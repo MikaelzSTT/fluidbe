@@ -57,6 +57,49 @@ const userSchema = new mongoose.Schema(
       default: 'free',
     },
 
+    profile: {
+      displayName: {
+        type: String,
+        trim: true,
+        maxlength: 80,
+      },
+      username: {
+        type: String,
+        trim: true,
+        lowercase: true,
+        maxlength: 32,
+        index: {
+          unique: true,
+          sparse: true,
+        },
+      },
+      bio: {
+        type: String,
+        trim: true,
+        maxlength: 240,
+      },
+      website: {
+        type: String,
+        trim: true,
+        maxlength: 120,
+      },
+      company: {
+        type: String,
+        trim: true,
+        maxlength: 80,
+      },
+      location: {
+        type: String,
+        trim: true,
+        maxlength: 80,
+      },
+      visibility: {
+        type: String,
+        enum: ['public', 'private'],
+        default: 'public',
+      },
+    },
+
     stripeCustomerId: {
       type: String,
       trim: true,
@@ -83,6 +126,37 @@ const userSchema = new mongoose.Schema(
     },
 
     preferences: {
+      language: {
+        type: String,
+        enum: ['english', 'portuguese'],
+        default: 'english',
+      },
+      appearance: {
+        type: String,
+        enum: ['light', 'dark', 'system'],
+        default: 'system',
+      },
+      chatSuggestions: {
+        type: Boolean,
+        default: true,
+      },
+      soundOnComplete: {
+        type: String,
+        enum: ['first', 'always', 'never'],
+        default: 'first',
+      },
+      autoSave: {
+        type: Boolean,
+        default: true,
+      },
+      confirmBeforeDelete: {
+        type: Boolean,
+        default: true,
+      },
+      compactMode: {
+        type: Boolean,
+        default: false,
+      },
       theme: {
         type: String,
         trim: true,

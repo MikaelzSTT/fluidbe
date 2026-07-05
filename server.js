@@ -21,7 +21,8 @@ dotenv.config();
 
 const app = express();
 
-const PUBLIC_BUILDS_DIR = path.join(__dirname, 'public', 'builds');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_BUILDS_DIR = path.join(PUBLIC_DIR, 'builds');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://apps.askfluid.now').replace(/\/+$/, '');
 const PUBLIC_APP_HOST = new URL(PUBLIC_BASE_URL).hostname.toLowerCase();
 const CONTENT_TYPES = {
@@ -556,6 +557,7 @@ app.get(/^\/builds\/.+$/, async (req, res, next) => {
     return next(error);
   }
 });
+app.use(express.static(PUBLIC_DIR));
 app.get('/p/:slug', async (req, res) => {
   try {
     const project = await Project.findOne({

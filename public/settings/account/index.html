@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fluid Account Settings</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d8dde6;
+      --accent: #1f7a5a;
+      --danger: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1040px, calc(100% - 32px));
+      margin: 32px auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 24px;
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 28px;
+      line-height: 1.2;
+    }
+
+    h2 {
+      font-size: 18px;
+      line-height: 1.35;
+      margin-bottom: 16px;
+    }
+
+    p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .account-meta {
+      text-align: right;
+      font-size: 14px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+      gap: 20px;
+      align-items: start;
+    }
+
+    section,
+    .signin-required {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: #344054;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    input,
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: var(--text);
+      font: inherit;
+      background: #ffffff;
+    }
+
+    textarea {
+      min-height: 104px;
+      resize: vertical;
+    }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .check {
+      grid-template-columns: 18px minmax(0, 1fr);
+      align-items: center;
+      font-weight: 500;
+    }
+
+    .check input {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+    }
+
+    button {
+      width: fit-content;
+      border: 0;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #ffffff;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.65;
+    }
+
+    .toast {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      max-width: min(420px, calc(100% - 36px));
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #17202a;
+      color: #ffffff;
+      box-shadow: 0 12px 30px rgb(16 24 40 / 18%);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 160ms ease, transform 160ms ease;
+      pointer-events: none;
+    }
+
+    .toast[data-visible="true"] {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .toast[data-tone="error"] {
+      background: var(--danger);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        width: min(100% - 24px, 1040px);
+        margin: 20px auto;
+      }
+
+      header,
+      .grid,
+      .field-row {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        display: grid;
+      }
+
+      .account-meta {
+        text-align: left;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Account Settings</h1>
+        <p>Profile and workspace preferences for your Fluid account.</p>
+      </div>
+      <div class="account-meta" id="accountMeta"></div>
+    </header>
+
+    <div class="signin-required hidden" id="signinRequired">
+      <h2>Sign in required</h2>
+      <p>Sign in to sync your account settings across devices.</p>
+      <p><a href="/login.html">Go to login</a></p>
+    </div>
+
+    <div class="grid" id="settingsGrid">
+      <section>
+        <h2>Profile</h2>
+        <form id="profileForm">
+          <div class="field-row">
+            <label>
+              Display name
+              <input name="displayName" maxlength="80" autocomplete="name">
+            </label>
+            <label>
+              Username
+              <input name="username" maxlength="32" autocomplete="username" pattern="[a-z0-9_-]{3,32}">
+            </label>
+          </div>
+          <label>
+            Bio
+            <textarea name="bio" maxlength="240"></textarea>
+          </label>
+          <div class="field-row">
+            <label>
+              Website
+              <input name="website" maxlength="120" inputmode="url" autocomplete="url">
+            </label>
+            <label>
+              Company
+              <input name="company" maxlength="80" autocomplete="organization">
+            </label>
+          </div>
+          <div class="field-row">
+            <label>
+              Location
+              <input name="location" maxlength="80" autocomplete="address-level2">
+            </label>
+            <label>
+              Visibility
+              <select name="visibility">
+                <option value="public">Public</option>
+                <option value="private">Private</option>
+              </select>
+            </label>
+          </div>
+          <button type="submit">Save profile</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Preferences</h2>
+        <form id="preferencesForm">
+          <label>
+            Language
+            <select name="language">
+              <option value="english">English</option>
+              <option value="portuguese">Portuguese</option>
+            </select>
+          </label>
+          <label>
+            Appearance
+            <select name="appearance">
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="system">System</option>
+            </select>
+          </label>
+          <label>
+            Completion sound
+            <select name="soundOnComplete">
+              <option value="first">First completion</option>
+              <option value="always">Always</option>
+              <option value="never">Never</option>
+            </select>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="chatSuggestions">
+            Chat suggestions
+          </label>
+          <label class="check">
+            <input type="checkbox" name="autoSave">
+            Auto-save drafts
+          </label>
+          <label class="check">
+            <input type="checkbox" name="confirmBeforeDelete">
+            Confirm before delete
+          </label>
+          <label class="check">
+            <input type="checkbox" name="compactMode">
+            Compact mode
+          </label>
+          <button type="submit">Save preferences</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const SETTINGS_CACHE_KEY = 'fluidAccountSettings';
+    const TOKEN_KEYS = [
+      'fluidToken',
+      'fluid_token',
+      'fluidAuthToken',
+      'fluid_auth_token',
+      'authToken',
+      'auth_token',
+      'token',
+    ];
+    const profileFields = ['displayName', 'username', 'bio', 'website', 'company', 'location', 'visibility'];
+    const preferenceFields = ['language', 'appearance', 'soundOnComplete', 'chatSuggestions', 'autoSave', 'confirmBeforeDelete', 'compactMode'];
+
+    const profileForm = document.getElementById('profileForm');
+    const preferencesForm = document.getElementById('preferencesForm');
+    const signinRequired = document.getElementById('signinRequired');
+    const settingsGrid = document.getElementById('settingsGrid');
+    const accountMeta = document.getElementById('accountMeta');
+    const toast = document.getElementById('toast');
+
+    let toastTimer = null;
+
+    function readToken() {
+      for (const key of TOKEN_KEYS) {
+        const token = localStorage.getItem(key);
+
+        if (token) {
+          return token;
+        }
+      }
+
+      const userJson = localStorage.getItem('user') || localStorage.getItem('fluidUser');
+
+      if (!userJson) {
+        return '';
+      }
+
+      try {
+        const user = JSON.parse(userJson);
+        return user.token || user.authToken || '';
+      } catch (error) {
+        return '';
+      }
+    }
+
+    function showToast(message, tone = 'success') {
+      window.clearTimeout(toastTimer);
+      toast.textContent = message;
+      toast.dataset.tone = tone;
+      toast.dataset.visible = 'true';
+      toastTimer = window.setTimeout(() => {
+        toast.dataset.visible = 'false';
+      }, 3200);
+    }
+
+    async function apiRequest(path, options = {}) {
+      const token = readToken();
+
+      if (!token) {
+        const error = new Error('Sign in required.');
+        error.status = 401;
+        throw error;
+      }
+
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          ...(options.headers || {}),
+        },
+      });
+
+      const body = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const error = new Error(body.message || 'Request failed.');
+        error.status = response.status;
+        throw error;
+      }
+
+      return body.settings || body;
+    }
+
+    function getCachedSettings() {
+      try {
+        return JSON.parse(localStorage.getItem(SETTINGS_CACHE_KEY) || 'null');
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function cacheSettings(settings) {
+      localStorage.setItem(SETTINGS_CACHE_KEY, JSON.stringify(settings));
+    }
+
+    function setSignInRequired() {
+      signinRequired.classList.remove('hidden');
+      settingsGrid.classList.add('hidden');
+      accountMeta.textContent = '';
+    }
+
+    function hydrate(settings) {
+      const profile = settings.profile || {};
+      const preferences = settings.preferences || {};
+
+      profileFields.forEach((field) => {
+        if (!profileForm.elements[field]) {
+          return;
+        }
+
+        profileForm.elements[field].value = profile[field] || '';
+      });
+
+      profileForm.elements.visibility.value = profile.visibility || 'public';
+
+      preferenceFields.forEach((field) => {
+        const input = preferencesForm.elements[field];
+
+        if (!input) {
+          return;
+        }
+
+        if (input.type === 'checkbox') {
+          input.checked = preferences[field] !== false;
+          return;
+        }
+
+        input.value = preferences[field] || input.querySelector('option')?.value || '';
+      });
+
+      if (preferences.compactMode === undefined) {
+        preferencesForm.elements.compactMode.checked = false;
+      }
+
+      const counts = settings.projectCounts || settings.counts || {};
+      const meta = [
+        settings.email,
+        settings.plan ? `Plan: ${settings.plan}` : '',
+        Number.isFinite(counts.published) ? `Published: ${counts.published}` : '',
+        Number.isFinite(counts.active) ? `Active: ${counts.active}` : '',
+      ].filter(Boolean);
+
+      accountMeta.textContent = meta.join(' | ');
+    }
+
+    function collectProfilePayload() {
+      return {
+        displayName: profileForm.elements.displayName.value,
+        username: profileForm.elements.username.value,
+        bio: profileForm.elements.bio.value,
+        website: profileForm.elements.website.value,
+        company: profileForm.elements.company.value,
+        location: profileForm.elements.location.value,
+        visibility: profileForm.elements.visibility.value,
+      };
+    }
+
+    function collectPreferencesPayload() {
+      return {
+        language: preferencesForm.elements.language.value,
+        appearance: preferencesForm.elements.appearance.value,
+        soundOnComplete: preferencesForm.elements.soundOnComplete.value,
+        chatSuggestions: preferencesForm.elements.chatSuggestions.checked,
+        autoSave: preferencesForm.elements.autoSave.checked,
+        confirmBeforeDelete: preferencesForm.elements.confirmBeforeDelete.checked,
+        compactMode: preferencesForm.elements.compactMode.checked,
+      };
+    }
+
+    async function loadSettings() {
+      if (!readToken()) {
+        setSignInRequired();
+        return;
+      }
+
+      try {
+        const settings = await apiRequest('/api/auth/me/settings');
+        hydrate(settings);
+        cacheSettings(settings);
+      } catch (error) {
+        if (error.status === 401) {
+          setSignInRequired();
+          return;
+        }
+
+        const cached = getCachedSettings();
+
+        if (cached) {
+          hydrate(cached);
+          showToast('Using saved settings from this browser.', 'error');
+          return;
+        }
+
+        showToast(error.message || 'Could not load settings.', 'error');
+      }
+    }
+
+    profileForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = profileForm.querySelector('button[type="submit"]');
+      button.disabled = true;
+
+      try {
+        const settings = await apiRequest('/api/auth/me/profile', {
+          method: 'PATCH',
+          body: JSON.stringify(collectProfilePayload()),
+        });
+        hydrate(settings);
+        cacheSettings(settings);
+        showToast('Profile saved.');
+      } catch (error) {
+        showToast(error.message || 'Could not save profile.', 'error');
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    preferencesForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = preferencesForm.querySelector('button[type="submit"]');
+      button.disabled = true;
+
+      try {
+        const settings = await apiRequest('/api/auth/me/preferences', {
+          method: 'PATCH',
+          body: JSON.stringify(collectPreferencesPayload()),
+        });
+        hydrate(settings);
+        cacheSettings(settings);
+        showToast('Preferences saved.');
+      } catch (error) {
+        showToast(error.message || 'Could not save preferences.', 'error');
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    loadSettings();
+  </script>
+</body>
+</html>

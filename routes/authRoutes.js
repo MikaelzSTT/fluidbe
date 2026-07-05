@@ -1,6 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const authMiddleware = require('../middleware/authMiddleware');
+const Project = require('../models/Project');
 const User = require('../models/User');
 const { serializeUser, signAuthToken } = require('../utils/auth');
 
@@ -111,6 +112,139 @@ function normalizeRequiredString(value, maxLength) {
   return trimmed;
 }
 
+const PROFILE_FIELDS = Object.freeze({
+  displayName: 80,
+  username: 32,
+  bio: 240,
+  website: 120,
+  company: 80,
+  location: 80,
+});
+const PROFILE_VISIBILITIES = new Set(['public', 'private']);
+const PREFERENCE_ENUMS = Object.freeze({
+  language: new Set(['english', 'portuguese']),
+  appearance: new Set(['light', 'dark', 'system']),
+  soundOnComplete: new Set(['first', 'always', 'never']),
+});
+const PREFERENCE_BOOLEANS = new Set([
+  'chatSuggestions',
+  'autoSave',
+  'confirmBeforeDelete',
+  'compactMode',
+]);
+
+function getObjectBody(body) {
+  return body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+}
+
+function rejectUnknownFields(body, allowedFields) {
+  const unknownFields = Object.keys(body).filter((field) => !allowedFields.includes(field));
+
+  if (unknownFields.length) {
+    return `Campos desconhecidos: ${unknownFields.join(', ')}.`;
+  }
+
+  return null;
+}
+
+function normalizeOptionalString(value, maxLength) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === null) {
+    return '';
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+
+  if (normalized.length > maxLength) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function normalizeUsername(value) {
+  const username = normalizeOptionalString(value, PROFILE_FIELDS.username);
+
+  if (username === undefined || username === '') {
+    return username;
+  }
+
+  const normalized = username.toLowerCase();
+
+  if (!/^[a-z0-9_-]{3,32}$/.test(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function serializeProfile(profile, user) {
+  return {
+    displayName: profile?.displayName || user.name || '',
+    username: profile?.username || '',
+    bio: profile?.bio || '',
+    website: profile?.website || '',
+    company: profile?.company || '',
+    location: profile?.location || '',
+    visibility: PROFILE_VISIBILITIES.has(profile?.visibility) ? profile.visibility : 'public',
+  };
+}
+
+function serializeAccountPreferences(preferences) {
+  return {
+    language: PREFERENCE_ENUMS.language.has(preferences?.language) ? preferences.language : 'english',
+    appearance: PREFERENCE_ENUMS.appearance.has(preferences?.appearance) ? preferences.appearance : 'system',
+    chatSuggestions: preferences?.chatSuggestions === undefined ? true : Boolean(preferences.chatSuggestions),
+    soundOnComplete: PREFERENCE_ENUMS.soundOnComplete.has(preferences?.soundOnComplete) ? preferences.soundOnComplete : 'first',
+    autoSave: preferences?.autoSave === undefined ? true : Boolean(preferences.autoSave),
+    confirmBeforeDelete: preferences?.confirmBeforeDelete === undefined ? true : Boolean(preferences.confirmBeforeDelete),
+    compactMode: preferences?.compactMode === undefined ? false : Boolean(preferences.compactMode),
+  };
+}
+
+async function countUserProjects(userId) {
+  const [published, active] = await Promise.all([
+    Project.countDocuments({
+      userId,
+      $or: [
+        { isPublished: true },
+        { status: 'published' },
+        { 'deploy.isPublished': true },
+      ],
+    }),
+    Project.countDocuments({
+      userId,
+      status: { $ne: 'archived' },
+    }),
+  ]);
+
+  return { published, active };
+}
+
+async function serializeAccountSettings(user, options = {}) {
+  const projectCounts = options.projectCounts || await countUserProjects(user._id);
+  const profile = serializeProfile(user.profile, user);
+
+  return {
+    id: user._id,
+    email: user.email,
+    name: user.name,
+    displayName: profile.displayName,
+    plan: user.plan || 'free',
+    projectCounts,
+    counts: projectCounts,
+    profile,
+    preferences: serializeAccountPreferences(user.preferences),
+  };
+}
+
 async function findAuthenticatedUser(req, res) {
   const user = await User.findById(req.userId);
 
@@ -149,6 +283,194 @@ router.get('/me', authMiddleware, async (req, res) => {
     }
 
     return res.json({ user: serializeUser(user) });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.get('/me/settings', authMiddleware, async (req, res) => {
+  try {
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    const settings = await serializeAccountSettings(user);
+
+    return res.json({ settings });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.patch('/me/profile', authMiddleware, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+
+    if (!body) {
+      return res.status(400).json({ message: 'Informe um perfil válido.' });
+    }
+
+    const allowedFields = [...Object.keys(PROFILE_FIELDS), 'visibility'];
+    const unknownMessage = rejectUnknownFields(body, allowedFields);
+
+    if (unknownMessage) {
+      return res.status(400).json({ message: unknownMessage });
+    }
+
+    const updates = {};
+
+    Object.entries(PROFILE_FIELDS).forEach(([field, maxLength]) => {
+      if (field === 'username') {
+        return;
+      }
+
+      const normalized = normalizeOptionalString(body[field], maxLength);
+
+      if (normalized === null) {
+        updates[field] = null;
+        return;
+      }
+
+      if (normalized !== undefined) {
+        updates[field] = normalized;
+      }
+    });
+
+    if (Object.values(updates).some((value) => value === null)) {
+      return res.status(400).json({ message: 'Informe campos de perfil válidos.' });
+    }
+
+    const username = normalizeUsername(body.username);
+
+    if (username === null) {
+      return res.status(400).json({
+        message: 'Username deve ter 3 a 32 caracteres e usar apenas letras minúsculas, números, underscore ou hífen.',
+      });
+    }
+
+    if (username !== undefined) {
+      updates.username = username;
+    }
+
+    if (body.visibility !== undefined) {
+      if (typeof body.visibility !== 'string' || !PROFILE_VISIBILITIES.has(body.visibility)) {
+        return res.status(400).json({ message: 'Visibilidade inválida.' });
+      }
+
+      updates.visibility = body.visibility;
+    }
+
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (updates.username) {
+      const usernameExists = await User.exists({
+        _id: { $ne: user._id },
+        'profile.username': updates.username,
+      });
+
+      if (usernameExists) {
+        return res.status(409).json({ message: 'Este username já está em uso.' });
+      }
+    }
+
+    if (updates.username === '') {
+      updates.username = undefined;
+    }
+
+    user.profile = {
+      ...(user.profile?.toObject ? user.profile.toObject() : user.profile || {}),
+      ...updates,
+    };
+
+    await user.save();
+
+    const settings = await serializeAccountSettings(user);
+
+    return res.json({ settings });
+  } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.['profile.username']) {
+      return res.status(409).json({ message: 'Este username já está em uso.' });
+    }
+
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.patch('/me/preferences', authMiddleware, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+
+    if (!body) {
+      return res.status(400).json({ message: 'Informe preferências válidas.' });
+    }
+
+    const allowedFields = [...Object.keys(PREFERENCE_ENUMS), ...PREFERENCE_BOOLEANS];
+    const unknownMessage = rejectUnknownFields(body, allowedFields);
+
+    if (unknownMessage) {
+      return res.status(400).json({ message: unknownMessage });
+    }
+
+    const updates = {};
+
+    Object.entries(PREFERENCE_ENUMS).forEach(([field, allowedValues]) => {
+      if (body[field] === undefined) {
+        return;
+      }
+
+      if (typeof body[field] !== 'string' || !allowedValues.has(body[field])) {
+        updates[field] = null;
+        return;
+      }
+
+      updates[field] = body[field];
+    });
+
+    PREFERENCE_BOOLEANS.forEach((field) => {
+      if (body[field] === undefined) {
+        return;
+      }
+
+      if (typeof body[field] !== 'boolean') {
+        updates[field] = null;
+        return;
+      }
+
+      updates[field] = body[field];
+    });
+
+    if (Object.values(updates).some((value) => value === null)) {
+      return res.status(400).json({ message: 'Informe preferências válidas.' });
+    }
+
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    user.preferences = {
+      ...(user.preferences?.toObject ? user.preferences.toObject() : user.preferences || {}),
+      ...updates,
+    };
+
+    await user.save();
+
+    const settings = await serializeAccountSettings(user);
+
+    return res.json({ settings });
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
