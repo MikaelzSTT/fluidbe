@@ -23,6 +23,7 @@ const app = express();
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PUBLIC_BUILDS_DIR = path.join(PUBLIC_DIR, 'builds');
+const SETTINGS_ACCOUNT_HTML_PATH = path.join(PUBLIC_DIR, 'settings', 'account', 'index.html');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://apps.askfluid.now').replace(/\/+$/, '');
 const PUBLIC_APP_HOST = new URL(PUBLIC_BASE_URL).hostname.toLowerCase();
 const CONTENT_TYPES = {
@@ -138,6 +139,7 @@ function publicAppsOnly(req, res, next) {
   if (
     pathname === '/'
     || /^\/p\/[^/]+\/?$/.test(pathname)
+    || /^\/settings\/account(?:\/|\/index\.html)?$/.test(pathname)
     || pathname.startsWith('/builds/')
     || isPublicFrontendApiRoute(pathname)
   ) {
@@ -578,11 +580,27 @@ app.get(/^\/builds\/.+$/, async (req, res, next) => {
     return next(error);
   }
 });
-app.use('/settings/account', (req, res, next) => {
+function sendSettingsAccountPage(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  next();
+  console.log('Serving settings account page backend-save-v2');
+  res.sendFile(SETTINGS_ACCOUNT_HTML_PATH);
+}
+
+app.get(['/settings/account', '/settings/account/', '/settings/account/index.html'], sendSettingsAccountPage);
+app.get('/debug/settings-build', async (req, res, next) => {
+  try {
+    const html = await fs.readFile(SETTINGS_ACCOUNT_HTML_PATH, 'utf8');
+    const oldProfileSavedLocallyText = ['Profile', 'saved', 'locally'].join(' ');
+    res.json({
+      build: 'backend-save-v2',
+      hasOldProfileSavedLocally: html.includes(oldProfileSavedLocallyText),
+      file: 'public/settings/account/index.html',
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 app.use(express.static(PUBLIC_DIR));
 app.get('/p/:slug', async (req, res) => {
