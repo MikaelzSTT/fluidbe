@@ -357,6 +357,7 @@
     const toast = document.getElementById('toast');
 
     let toastTimer = null;
+    let currentSettings = null;
 
     function normalizeToken(value) {
       if (typeof value !== 'string') {
@@ -392,25 +393,56 @@
       collectUserObjectTokens(value.user, candidates, seen);
     }
 
+    function readStorageItem(storage, key) {
+      try {
+        return storage.getItem(key);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function readCookieValue(key) {
+      const prefix = `${encodeURIComponent(key)}=`;
+      const cookie = document.cookie
+        .split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith(prefix));
+
+      if (!cookie) {
+        return '';
+      }
+
+      try {
+        return decodeURIComponent(cookie.slice(prefix.length));
+      } catch (error) {
+        return cookie.slice(prefix.length);
+      }
+    }
+
     function readTokenCandidates() {
       const candidates = [];
       const seen = new Set();
+      const stores = [localStorage, sessionStorage];
 
       for (const key of TOKEN_KEYS) {
-        addTokenCandidate(candidates, seen, localStorage.getItem(key));
+        for (const store of stores) {
+          addTokenCandidate(candidates, seen, readStorageItem(store, key));
+        }
+
+        addTokenCandidate(candidates, seen, readCookieValue(key));
       }
 
       for (const key of USER_KEYS) {
-        const userJson = localStorage.getItem(key);
+        const storedUsers = stores
+          .map((store) => readStorageItem(store, key))
+          .filter(Boolean);
 
-        if (!userJson) {
-          continue;
-        }
-
-        try {
-          collectUserObjectTokens(JSON.parse(userJson), candidates, seen);
-        } catch (error) {
-          console.warn('[account-settings] Ignoring unreadable auth user cache.', { key });
+        for (const userJson of storedUsers) {
+          try {
+            collectUserObjectTokens(JSON.parse(userJson), candidates, seen);
+          } catch (error) {
+            // Ignore unrelated browser cache entries that are not JSON user payloads.
+          }
         }
       }
 
@@ -446,10 +478,11 @@
       return `${apiBaseUrl}${path}`;
     }
 
-    function warnFailedRequest(url, status) {
-      console.warn('[account-settings] API request failed.', {
+    function warnSaveFailure(url, status, noToken) {
+      console.warn('[account-settings] Save failed.', {
         url,
         status,
+        noToken,
       });
     }
 
@@ -503,7 +536,7 @@
           },
         });
       } catch (error) {
-        warnFailedRequest(url, 'network');
+        error.apiUrl = url;
         throw createNetworkError(error);
       }
 
@@ -514,7 +547,6 @@
         error.status = response.status;
         error.code = body.code || '';
         error.apiUrl = url;
-        warnFailedRequest(url, response.status);
         throw error;
       }
 
@@ -561,6 +593,42 @@
       localStorage.setItem(SETTINGS_CACHE_KEY, JSON.stringify(settings));
     }
 
+    function syncCachedUser(settings) {
+      const displayName = settings?.profile?.displayName || settings?.displayName || settings?.name;
+
+      if (!displayName && !settings?.avatar) {
+        return;
+      }
+
+      for (const key of USER_KEYS) {
+        const userJson = readStorageItem(localStorage, key);
+
+        if (!userJson) {
+          continue;
+        }
+
+        try {
+          const user = JSON.parse(userJson);
+          const nextUser = {
+            ...user,
+            ...(displayName ? { name: displayName, displayName } : {}),
+            ...(settings.avatar ? { avatar: settings.avatar } : {}),
+          };
+
+          localStorage.setItem(key, JSON.stringify(nextUser));
+        } catch (error) {
+          // Leave unrelated non-JSON cache values untouched.
+        }
+      }
+    }
+
+    function applySettings(settings) {
+      currentSettings = settings;
+      hydrate(settings);
+      cacheSettings(settings);
+      syncCachedUser(settings);
+    }
+
     function mergeCachedSettings(section, payload) {
       const cached = getCachedSettings() || {};
       const next = {
@@ -572,6 +640,7 @@
       };
 
       cacheSettings(next);
+      currentSettings = next;
       hydrate(next);
     }
 
@@ -657,8 +726,7 @@
 
       try {
         const settings = await apiRequest('/api/auth/me/settings');
-        hydrate(settings);
-        cacheSettings(settings);
+        applySettings(settings);
       } catch (error) {
         if (error.noToken || error.status === 401) {
           setSignInRequired();
@@ -670,14 +738,41 @@
         if (cached) {
           hydrate(cached);
           showToast('Using saved settings from this browser.', 'error');
-          console.warn('[account-settings] Backend settings load failed; using local cache.', {
-            status: error.status,
-            code: error.code,
-          });
           return;
         }
 
         showToast(formatApiError(error, 'Could not load settings.'), 'error');
+      }
+    }
+
+    async function saveSettingsSection(path, section, payload, successMessage, localMessage) {
+      const tokens = readTokenCandidates();
+      const url = buildApiUrl(path);
+
+      if (!tokens.length) {
+        warnSaveFailure(url, null, true);
+        mergeCachedSettings(section, payload);
+        showToast(localMessage);
+        return;
+      }
+
+      try {
+        const settings = await apiRequest(path, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+        applySettings(settings);
+        showToast(successMessage);
+      } catch (error) {
+        warnSaveFailure(error.apiUrl || url, error.status || (error.network ? 'network' : null), false);
+
+        if (error.network) {
+          mergeCachedSettings(section, payload);
+          showToast(localMessage);
+          return;
+        }
+
+        showToast(formatBackendSaveError(error), 'error');
       }
     }
 
@@ -687,21 +782,13 @@
       button.disabled = true;
 
       try {
-        const settings = await apiRequest('/api/auth/me/profile', {
-          method: 'PATCH',
-          body: JSON.stringify(collectProfilePayload()),
-        });
-        hydrate(settings);
-        cacheSettings(settings);
-        showToast('Profile saved.');
-      } catch (error) {
-        if (error.noToken || error.network) {
-          mergeCachedSettings('profile', collectProfilePayload());
-          showToast('Profile saved locally.');
-          return;
-        }
-
-        showToast(formatBackendSaveError(error), 'error');
+        await saveSettingsSection(
+          '/api/auth/me/profile',
+          'profile',
+          collectProfilePayload(),
+          'Profile saved.',
+          'Profile saved locally.'
+        );
       } finally {
         button.disabled = false;
       }
@@ -713,21 +800,13 @@
       button.disabled = true;
 
       try {
-        const settings = await apiRequest('/api/auth/me/preferences', {
-          method: 'PATCH',
-          body: JSON.stringify(collectPreferencesPayload()),
-        });
-        hydrate(settings);
-        cacheSettings(settings);
-        showToast('Preferences saved.');
-      } catch (error) {
-        if (error.noToken || error.network) {
-          mergeCachedSettings('preferences', collectPreferencesPayload());
-          showToast('Preferences saved locally.');
-          return;
-        }
-
-        showToast(formatBackendSaveError(error), 'error');
+        await saveSettingsSection(
+          '/api/auth/me/preferences',
+          'preferences',
+          collectPreferencesPayload(),
+          'Preferences saved.',
+          'Preferences saved locally.'
+        );
       } finally {
         button.disabled = false;
       }
