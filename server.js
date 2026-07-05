@@ -26,6 +26,9 @@ const PUBLIC_BUILDS_DIR = path.join(PUBLIC_DIR, 'builds');
 const SETTINGS_ACCOUNT_HTML_PATH = path.join(PUBLIC_DIR, 'settings', 'account', 'index.html');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://apps.askfluid.now').replace(/\/+$/, '');
 const PUBLIC_APP_HOST = new URL(PUBLIC_BASE_URL).hostname.toLowerCase();
+const APPS_CUSTOM_HOST = 'apps.askfluid.now';
+const APEX_CUSTOM_HOST = 'askfluid.now';
+const PUBLIC_APP_HOSTS = new Set([PUBLIC_APP_HOST, APPS_CUSTOM_HOST, APEX_CUSTOM_HOST]);
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -105,7 +108,7 @@ function isEmbeddableBuildRoute(req) {
 }
 
 function isPublicAppHost(req) {
-  return String(req.hostname || '').toLowerCase() === PUBLIC_APP_HOST;
+  return PUBLIC_APP_HOSTS.has(String(req.hostname || '').toLowerCase());
 }
 
 function isPublicRuntimeApiRoute(pathname) {
@@ -129,23 +132,43 @@ function isPublicFrontendApiRoute(pathname) {
   );
 }
 
+function isSettingsAccountRoute(pathname) {
+  return /^\/settings\/account(?:\/|\/index\.html)?$/.test(pathname);
+}
+
+function isSettingsDebugRoute(pathname) {
+  return pathname === '/debug/settings-build';
+}
+
 function publicAppsOnly(req, res, next) {
   if (!isPublicAppHost(req)) {
     return next();
   }
 
   const pathname = req.path || '';
+  const hostname = String(req.hostname || '').toLowerCase();
+
+  if (hostname === APEX_CUSTOM_HOST) {
+    if (isSettingsAccountRoute(pathname) || isSettingsDebugRoute(pathname)) {
+      return next();
+    }
+
+    console.log('publicAppsOnly blocked', req.hostname, req.path);
+    return res.sendStatus(404);
+  }
 
   if (
     pathname === '/'
     || /^\/p\/[^/]+\/?$/.test(pathname)
-    || /^\/settings\/account(?:\/|\/index\.html)?$/.test(pathname)
+    || isSettingsAccountRoute(pathname)
+    || isSettingsDebugRoute(pathname)
     || pathname.startsWith('/builds/')
     || isPublicFrontendApiRoute(pathname)
   ) {
     return next();
   }
 
+  console.log('publicAppsOnly blocked', req.hostname, req.path);
   return res.sendStatus(404);
 }
 
