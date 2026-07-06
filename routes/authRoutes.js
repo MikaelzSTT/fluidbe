@@ -122,9 +122,17 @@ const PROFILE_FIELDS = Object.freeze({
 });
 const PROFILE_VISIBILITIES = new Set(['public', 'private']);
 const PREFERENCE_ENUMS = Object.freeze({
-  language: new Set(['english', 'portuguese']),
+  language: new Set(['english', 'portuguese', 'spanish']),
   appearance: new Set(['light', 'dark', 'system']),
   soundOnComplete: new Set(['first', 'always', 'never']),
+});
+const LANGUAGE_ALIASES = Object.freeze({
+  en: 'english',
+  pt: 'portuguese',
+  'pt-br': 'portuguese',
+  es: 'spanish',
+  'es-es': 'spanish',
+  'es-mx': 'spanish',
 });
 const PREFERENCE_BOOLEANS = new Set([
   'chatSuggestions',
@@ -183,6 +191,16 @@ function normalizeUsername(value) {
   }
 
   return normalized;
+}
+
+function normalizeAccountLanguage(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  return LANGUAGE_ALIASES[normalized] || normalized;
 }
 
 function serializeProfile(profile, user) {
@@ -430,12 +448,14 @@ router.patch('/me/preferences', authMiddleware, async (req, res) => {
         return;
       }
 
-      if (typeof body[field] !== 'string' || !allowedValues.has(body[field])) {
+      const value = field === 'language' ? normalizeAccountLanguage(body[field]) : body[field];
+
+      if (typeof value !== 'string' || !allowedValues.has(value)) {
         updates[field] = null;
         return;
       }
 
-      updates[field] = body[field];
+      updates[field] = value;
     });
 
     PREFERENCE_BOOLEANS.forEach((field) => {

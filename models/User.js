@@ -128,7 +128,7 @@ const userSchema = new mongoose.Schema(
     preferences: {
       language: {
         type: String,
-        enum: ['english', 'portuguese'],
+        enum: ['english', 'portuguese', 'spanish'],
         default: 'english',
       },
       appearance: {
