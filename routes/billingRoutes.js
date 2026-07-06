@@ -1,13 +1,88 @@
 const express = require('express');
 const Stripe = require('stripe');
 const User = require('../models/User');
+const Project = require('../models/Project');
 const authMiddleware = require('../middleware/authMiddleware');
 const { unpublishActiveProjectsForUser } = require('../utils/projectPublication');
 
 const router = express.Router();
 
+const PLAN_DETAILS = Object.freeze({
+  free: Object.freeze({
+    id: 'free',
+    name: 'Free',
+    price: 0,
+    currency: 'USD',
+    interval: null,
+    projectLimit: 3,
+    publishedProjectLimit: 0,
+    messagesLimitLabel: 'Limited',
+  }),
+  pro: Object.freeze({
+    id: 'pro',
+    name: 'Pro',
+    price: 20,
+    currency: 'USD',
+    interval: 'month',
+    projectLimit: 25,
+    publishedProjectLimit: 3,
+    messagesLimitLabel: 'Standard',
+  }),
+  business: Object.freeze({
+    id: 'business',
+    name: 'Business',
+    price: 49,
+    currency: 'USD',
+    interval: 'month',
+    projectLimit: 100,
+    publishedProjectLimit: 10,
+    messagesLimitLabel: 'Priority',
+  }),
+});
+
+const BILLING_ENV_NAMES = Object.freeze([
+  'STRIPE_SECRET_KEY',
+  'STRIPE_PRO_PRICE_ID',
+  'STRIPE_BUSINESS_PRICE_ID',
+  'STRIPE_WEBHOOK_SECRET',
+  'FRONTEND_URL',
+]);
+const loggedMissingBillingConfig = new Set();
+
 function getFrontendUrl() {
   return (process.env.FRONTEND_URL || 'https://askfluid.now').replace(/\/+$/, '');
+}
+
+function getMissingBillingEnv(requiredNames = BILLING_ENV_NAMES) {
+  return requiredNames.filter((name) => !process.env[name]);
+}
+
+function logMissingBillingConfig(context, missingNames) {
+  if (!missingNames.length) {
+    return;
+  }
+
+  const key = `${context}:${missingNames.join(',')}`;
+
+  if (loggedMissingBillingConfig.has(key)) {
+    return;
+  }
+
+  loggedMissingBillingConfig.add(key);
+  console.warn(`Stripe billing config missing for ${context}: ${missingNames.join(', ')}`);
+}
+
+function getConfigError(context, requiredNames) {
+  const missing = getMissingBillingEnv(requiredNames);
+
+  logMissingBillingConfig(context, missing);
+
+  return missing.length
+    ? {
+        message: 'Stripe billing is not configured.',
+        missing,
+      }
+    : null;
 }
 
 function getStripeClient() {
@@ -29,14 +104,84 @@ function getBillingConfig() {
   };
 }
 
-function serializeBilling(user) {
+function normalizePlanId(plan) {
+  return PLAN_DETAILS[plan] ? plan : 'free';
+}
+
+function normalizeBillingStatus(user) {
+  const planId = normalizePlanId(user.plan);
+  const status = String(user.subscriptionStatus || '').toLowerCase();
+
+  if (planId === 'free') {
+    if (status === 'past_due' || status === 'canceled') {
+      return status;
+    }
+
+    return 'inactive';
+  }
+
+  if (['active', 'trialing', 'past_due', 'canceled', 'inactive'].includes(status)) {
+    return status;
+  }
+
+  return 'active';
+}
+
+function toIsoDateOrNull(date) {
+  if (!date) {
+    return null;
+  }
+
+  const parsedDate = new Date(date);
+
+  return Number.isNaN(parsedDate.getTime()) ? null : parsedDate.toISOString();
+}
+
+async function countUserProjects(userId) {
+  const [activeProjects, publishedProjects] = await Promise.all([
+    Project.countDocuments({
+      userId,
+    }),
+    Project.countDocuments({
+      userId,
+      $or: [
+        { isPublished: true },
+        { status: 'published' },
+        { 'deploy.isPublished': true },
+      ],
+    }),
+  ]);
+
   return {
-    plan: user.plan || 'free',
-    stripeCustomerId: user.stripeCustomerId || null,
-    stripeSubscriptionId: user.stripeSubscriptionId || null,
-    subscriptionStatus: user.subscriptionStatus || null,
-    subscriptionCurrentPeriodEnd: user.subscriptionCurrentPeriodEnd || null,
-    billingUpdatedAt: user.billingUpdatedAt || null,
+    activeProjects,
+    publishedProjects,
+  };
+}
+
+async function serializeBilling(user) {
+  const planId = normalizePlanId(user.plan);
+  const planDetails = PLAN_DETAILS[planId];
+  const usageCounts = await countUserProjects(user._id);
+
+  return {
+    ok: true,
+    plan: {
+      id: planDetails.id,
+      name: planDetails.name,
+      status: normalizeBillingStatus(user),
+      price: planDetails.price,
+      currency: planDetails.currency,
+      interval: planDetails.interval,
+      currentPeriodEnd: toIsoDateOrNull(user.subscriptionCurrentPeriodEnd),
+    },
+    usage: {
+      activeProjects: usageCounts.activeProjects,
+      publishedProjects: usageCounts.publishedProjects,
+      projectLimit: planDetails.projectLimit,
+      publishedProjectLimit: planDetails.publishedProjectLimit,
+      messagesLimitLabel: planDetails.messagesLimitLabel,
+    },
+    billingHistory: [],
   };
 }
 
@@ -65,7 +210,23 @@ function getPriceIdsFromInvoice(invoice) {
     .filter(Boolean);
 }
 
-function planForPriceIds(priceIds, fallbackPlan = 'pro') {
+function invoicePeriodEnd(invoice) {
+  const periodEnd = invoice.lines?.data
+    ?.map((line) => line.period?.end)
+    .filter(Boolean)
+    .sort((a, b) => b - a)[0];
+
+  return periodEnd ? new Date(periodEnd * 1000) : undefined;
+}
+
+function logUnknownStripePrice(source, priceIds) {
+  console.warn('Stripe billing event ignored unknown price ids.', {
+    source,
+    priceCount: priceIds.length,
+  });
+}
+
+function planForPriceIds(priceIds, source) {
   if (process.env.STRIPE_BUSINESS_PRICE_ID && priceIds.includes(process.env.STRIPE_BUSINESS_PRICE_ID)) {
     return 'business';
   }
@@ -74,7 +235,8 @@ function planForPriceIds(priceIds, fallbackPlan = 'pro') {
     return 'pro';
   }
 
-  return fallbackPlan;
+  logUnknownStripePrice(source, priceIds);
+  return null;
 }
 
 function planForSubscription(subscription) {
@@ -82,7 +244,7 @@ function planForSubscription(subscription) {
     return 'free';
   }
 
-  return planForPriceIds(getPriceIdsFromSubscription(subscription), 'pro');
+  return planForPriceIds(getPriceIdsFromSubscription(subscription), 'subscription');
 }
 
 function planForInvoiceStatus(status, invoice) {
@@ -90,7 +252,7 @@ function planForInvoiceStatus(status, invoice) {
     return 'free';
   }
 
-  return planForPriceIds(getPriceIdsFromInvoice(invoice), 'pro');
+  return planForPriceIds(getPriceIdsFromInvoice(invoice), 'invoice');
 }
 
 async function unpublishIfPlanIsFree(user) {
@@ -124,20 +286,37 @@ async function updateUserFromSubscription(subscription) {
     return null;
   }
 
+  const nextPlan = planForSubscription(subscription);
+
+  if (!nextPlan) {
+    return null;
+  }
+
   const update = {
-    plan: planForSubscription(subscription),
+    plan: nextPlan,
     subscriptionStatus: subscription.status,
-    stripeSubscriptionId,
     billingUpdatedAt: new Date(),
   };
   const periodEnd = subscriptionPeriodEnd(subscription);
+  const unset = {};
+  const isCanceled = subscription.status === 'canceled' || subscription.status === 'incomplete_expired';
 
   if (stripeCustomerId) {
     update.stripeCustomerId = stripeCustomerId;
   }
 
-  if (periodEnd) {
+  if (!isCanceled && stripeSubscriptionId) {
+    update.stripeSubscriptionId = stripeSubscriptionId;
+  }
+
+  if (!isCanceled && periodEnd) {
     update.subscriptionCurrentPeriodEnd = periodEnd;
+  } else if (nextPlan === 'free') {
+    unset.subscriptionCurrentPeriodEnd = '';
+  }
+
+  if (isCanceled) {
+    unset.stripeSubscriptionId = '';
   }
 
   const user = await User.findOneAndUpdate(
@@ -148,7 +327,10 @@ async function updateUserFromSubscription(subscription) {
         ...(userId ? [{ _id: userId }] : []),
       ],
     },
-    { $set: update },
+    {
+      $set: update,
+      ...(Object.keys(unset).length ? { $unset: unset } : {}),
+    },
     { new: true }
   );
 
@@ -210,6 +392,28 @@ async function updateUserFromInvoice(invoice, status) {
     return null;
   }
 
+  const nextPlan = planForInvoiceStatus(status, invoice);
+
+  if (!nextPlan) {
+    return null;
+  }
+
+  const update = {
+    ...(stripeCustomerId ? { stripeCustomerId } : {}),
+    ...(stripeSubscriptionId ? { stripeSubscriptionId } : {}),
+    subscriptionStatus: status,
+    plan: nextPlan,
+    billingUpdatedAt: new Date(),
+  };
+  const unset = {};
+  const periodEnd = invoicePeriodEnd(invoice);
+
+  if (nextPlan === 'free') {
+    unset.subscriptionCurrentPeriodEnd = '';
+  } else if (periodEnd) {
+    update.subscriptionCurrentPeriodEnd = periodEnd;
+  }
+
   const user = await User.findOneAndUpdate(
     {
       $or: [
@@ -219,13 +423,8 @@ async function updateUserFromInvoice(invoice, status) {
       ],
     },
     {
-      $set: {
-        ...(stripeCustomerId ? { stripeCustomerId } : {}),
-        ...(stripeSubscriptionId ? { stripeSubscriptionId } : {}),
-        subscriptionStatus: status,
-        plan: planForInvoiceStatus(status, invoice),
-        billingUpdatedAt: new Date(),
-      },
+      $set: update,
+      ...(Object.keys(unset).length ? { $unset: unset } : {}),
     },
     { new: true }
   );
@@ -236,6 +435,12 @@ async function updateUserFromInvoice(invoice, status) {
 }
 
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const configError = getConfigError('webhook', ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']);
+
+  if (configError) {
+    return res.status(503).json({ message: configError.message, missing: configError.missing });
+  }
+
   const { stripe, webhookSecret } = getBillingConfig();
 
   if (!stripe || !webhookSecret) {
@@ -288,7 +493,7 @@ router.get('/me', authMiddleware, async (req, res) => {
       return null;
     }
 
-    return res.json(serializeBilling(user));
+    return res.json(await serializeBilling(user));
   } catch (error) {
     console.error('Billing lookup failed:', error);
     return res.status(500).json({ message: 'Unable to load billing details.' });
@@ -296,13 +501,24 @@ router.get('/me', authMiddleware, async (req, res) => {
 });
 
 router.post('/checkout', authMiddleware, async (req, res) => {
-  const { stripe, priceIds } = getBillingConfig();
   const requestedPlan = String(req.body?.plan || req.body?.targetPlan || 'pro').toLowerCase();
 
   if (!['pro', 'business'].includes(requestedPlan)) {
     return res.status(400).json({ message: 'Invalid billing plan.' });
   }
 
+  const configError = getConfigError('checkout', [
+    'STRIPE_SECRET_KEY',
+    'STRIPE_PRO_PRICE_ID',
+    'STRIPE_BUSINESS_PRICE_ID',
+    'FRONTEND_URL',
+  ]);
+
+  if (configError) {
+    return res.status(503).json({ message: configError.message, missing: configError.missing });
+  }
+
+  const { stripe, priceIds } = getBillingConfig();
   const priceId = priceIds[requestedPlan];
 
   if (!stripe || !priceId) {
@@ -365,6 +581,12 @@ router.post('/checkout', authMiddleware, async (req, res) => {
 });
 
 router.post('/portal', authMiddleware, async (req, res) => {
+  const configError = getConfigError('portal', ['STRIPE_SECRET_KEY', 'FRONTEND_URL']);
+
+  if (configError) {
+    return res.status(503).json({ message: configError.message, missing: configError.missing });
+  }
+
   const { stripe } = getBillingConfig();
 
   if (!stripe) {
