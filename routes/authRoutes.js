@@ -6,7 +6,12 @@ const authMiddleware = require('../middleware/authMiddleware');
 const Project = require('../models/Project');
 const Session = require('../models/Session');
 const User = require('../models/User');
-const { createAuthToken, serializeUser } = require('../utils/auth');
+const {
+  createAuthToken,
+  hasPasswordHash,
+  serializeAuthMetadata,
+  serializeUser,
+} = require('../utils/auth');
 const { createRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
@@ -318,6 +323,7 @@ async function serializeAccountSettings(user, options = {}) {
     counts: projectCounts,
     profile,
     preferences: serializeAccountPreferences(user.preferences),
+    auth: serializeAuthMetadata(user),
   };
 }
 
@@ -400,8 +406,16 @@ router.patch('/me/password', authMiddleware, passwordChangeRateLimit, async (req
 
     const user = await User.findById(req.userId);
 
-    if (!user || !user.password) {
-      return res.status(400).json({ message: 'PASSWORD_CHANGE_NOT_AVAILABLE' });
+    if (!user) {
+      return res.status(401).json({ message: 'Usuário não encontrado.' });
+    }
+
+    if (!hasPasswordHash(user)) {
+      return res.status(400).json({
+        ok: false,
+        code: 'PASSWORD_NOT_AVAILABLE_FOR_GOOGLE_ACCOUNT',
+        message: 'PASSWORD_NOT_AVAILABLE_FOR_GOOGLE_ACCOUNT',
+      });
     }
 
     const currentPasswordIsValid = await bcrypt.compare(currentPassword, user.password);

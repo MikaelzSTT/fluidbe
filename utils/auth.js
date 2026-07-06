@@ -72,6 +72,29 @@ async function createAuthToken(user, req) {
   return signAuthToken(user, session.jti);
 }
 
+function hasPasswordHash(user) {
+  return typeof user?.password === 'string' && user.password.trim().length > 0;
+}
+
+function serializeAuthMetadata(user) {
+  const providers = [];
+
+  if (hasPasswordHash(user)) {
+    providers.push('password');
+  }
+
+  if (Array.isArray(user?.providers) && user.providers.includes('google')) {
+    providers.push('google');
+  } else if (typeof user?.googleId === 'string' && user.googleId.trim()) {
+    providers.push('google');
+  }
+
+  return {
+    hasPassword: hasPasswordHash(user),
+    providers,
+  };
+}
+
 function serializeUser(user) {
   return {
     id: user._id,
@@ -80,6 +103,7 @@ function serializeUser(user) {
     avatar: user.avatar || null,
     emailVerified: Boolean(user.emailVerified),
     providers: Array.isArray(user.providers) ? user.providers : [],
+    auth: serializeAuthMetadata(user),
     onboardingComplete: Boolean(user.onboardingComplete),
     preferences: serializePreferences(user.preferences),
   };
@@ -89,6 +113,8 @@ module.exports = {
   AUTH_TOKEN_TTL_SECONDS,
   createAuthSession,
   createAuthToken,
+  hasPasswordHash,
+  serializeAuthMetadata,
   serializeUser,
   signAuthToken,
 };
