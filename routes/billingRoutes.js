@@ -14,9 +14,9 @@ const PLAN_DETAILS = Object.freeze({
     price: 0,
     currency: 'USD',
     interval: null,
-    projectLimit: 3,
+    projectLimit: null,
     publishedProjectLimit: 0,
-    messagesLimitLabel: 'Limited',
+    messagesLimitLabel: '15 messages per project',
   }),
   pro: Object.freeze({
     id: 'pro',
@@ -24,9 +24,9 @@ const PLAN_DETAILS = Object.freeze({
     price: 20,
     currency: 'USD',
     interval: 'month',
-    projectLimit: 25,
+    projectLimit: null,
     publishedProjectLimit: 3,
-    messagesLimitLabel: 'Standard',
+    messagesLimitLabel: 'Unlimited messages',
   }),
   business: Object.freeze({
     id: 'business',
@@ -34,9 +34,9 @@ const PLAN_DETAILS = Object.freeze({
     price: 49,
     currency: 'USD',
     interval: 'month',
-    projectLimit: 100,
+    projectLimit: null,
     publishedProjectLimit: 10,
-    messagesLimitLabel: 'Priority',
+    messagesLimitLabel: 'Unlimited messages',
   }),
 });
 
@@ -113,11 +113,11 @@ function normalizeBillingStatus(user) {
   const status = String(user.subscriptionStatus || '').toLowerCase();
 
   if (planId === 'free') {
-    if (status === 'past_due' || status === 'canceled') {
+    if (['past_due', 'canceled', 'unpaid', 'incomplete', 'incomplete_expired'].includes(status)) {
       return status;
     }
 
-    return 'inactive';
+    return 'active';
   }
 
   if (['active', 'trialing', 'past_due', 'canceled', 'inactive'].includes(status)) {
@@ -146,7 +146,7 @@ async function countUserProjects(userId) {
       userId,
       $or: [
         { isPublished: true },
-        { status: 'published' },
+        { status: { $in: ['published', 'deployed', 'live'] } },
         { 'deploy.isPublished': true },
       ],
     }),
