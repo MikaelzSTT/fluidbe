@@ -1,14 +1,23 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const authMiddleware = require('../middleware/authMiddleware');
 const Project = require('../models/Project');
+const Session = require('../models/Session');
 const User = require('../models/User');
-const { serializeUser, signAuthToken } = require('../utils/auth');
+const { createAuthToken, serializeUser } = require('../utils/auth');
+const { createRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const passwordChangeRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => String(req.userId || 'anonymous'),
+});
 
 function getFrontendUrl() {
   return (process.env.FRONTEND_URL || 'https://askfluid.now').replace(/\/+$/, '');
@@ -143,6 +152,55 @@ const PREFERENCE_BOOLEANS = new Set([
 
 function getObjectBody(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+}
+
+function getBearerToken(req) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return null;
+  }
+
+  const [scheme, token] = authHeader.split(/\s+/);
+
+  if (scheme !== 'Bearer' || !token) {
+    return null;
+  }
+
+  return token;
+}
+
+function serializeSession(session, currentSessionId) {
+  const id = String(session._id);
+
+  return {
+    id,
+    current: id === String(currentSessionId),
+    userAgent: session.userAgent || '',
+    createdAt: session.createdAt,
+    lastSeenAt: session.lastSeenAt,
+    expiresAt: session.expiresAt,
+  };
+}
+
+async function revokeOtherSessions(userId, currentSessionId, reason) {
+  const query = {
+    userId,
+    revokedAt: null,
+  };
+
+  if (currentSessionId) {
+    query._id = { $ne: currentSessionId };
+  }
+
+  const result = await Session.updateMany(query, {
+    $set: {
+      revokedAt: new Date(),
+      revokedReason: reason,
+    },
+  });
+
+  return result.modifiedCount || 0;
 }
 
 function rejectUnknownFields(body, allowedFields) {
@@ -319,6 +377,119 @@ router.get('/me/settings', authMiddleware, async (req, res) => {
     const settings = await serializeAccountSettings(user);
 
     return res.json({ settings });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.patch('/me/password', authMiddleware, passwordChangeRateLimit, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const currentPassword = body?.currentPassword;
+    const newPassword = body?.newPassword;
+
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+      return res.status(400).json({ message: 'INVALID_INPUT' });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ message: 'PASSWORD_TOO_SHORT' });
+    }
+
+    const user = await User.findById(req.userId);
+
+    if (!user || !user.password) {
+      return res.status(400).json({ message: 'PASSWORD_CHANGE_NOT_AVAILABLE' });
+    }
+
+    const currentPasswordIsValid = await bcrypt.compare(currentPassword, user.password);
+
+    if (!currentPasswordIsValid) {
+      return res.status(401).json({ message: 'INVALID_CURRENT_PASSWORD' });
+    }
+
+    const newPasswordMatchesCurrent = await bcrypt.compare(newPassword, user.password);
+
+    if (newPasswordMatchesCurrent) {
+      return res.status(400).json({ message: 'PASSWORD_UNCHANGED' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+    await revokeOtherSessions(user._id, req.session?._id, 'password_changed');
+
+    return res.json({
+      ok: true,
+      message: 'PASSWORD_UPDATED',
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.get('/me/sessions', authMiddleware, async (req, res) => {
+  try {
+    const now = new Date();
+    const sessions = await Session.find({
+      userId: req.userId,
+      revokedAt: null,
+      expiresAt: { $gt: now },
+    }).sort({ createdAt: -1 });
+
+    return res.json(sessions.map((session) => serializeSession(session, req.session?._id)));
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.delete('/me/sessions/:sessionId', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.sessionId)) {
+      return res.status(400).json({ message: 'INVALID_SESSION_ID' });
+    }
+
+    await Session.updateOne(
+      {
+        _id: req.params.sessionId,
+        userId: req.userId,
+        revokedAt: null,
+      },
+      {
+        $set: {
+          revokedAt: new Date(),
+          revokedReason: 'user_revoked_session',
+        },
+      }
+    );
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.delete('/me/sessions', authMiddleware, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+
+    if (body?.mode !== 'others') {
+      return res.status(400).json({ message: 'INVALID_MODE' });
+    }
+
+    const revokedCount = await revokeOtherSessions(req.userId, req.session?._id, 'user_revoked_other_sessions');
+
+    return res.json({
+      ok: true,
+      revokedCount,
+    });
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -585,7 +756,7 @@ router.get('/google/callback', async (req, res) => {
       });
     }
 
-    const token = signAuthToken(user);
+    const token = await createAuthToken(user, req);
     const serializedUser = serializeUser(user);
 
     return redirectToOAuthSuccess(res, token, serializedUser);
@@ -672,13 +843,49 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'E-mail ou senha inválidos.' });
     }
 
-    const token = signAuthToken(user);
+    const token = await createAuthToken(user, req);
 
     return res.json({
       message: 'Login realizado com sucesso.',
       token,
       user: serializeUser(user),
     });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/logout', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (decoded?.jti && decoded?.id && !decoded.runtimeUserId) {
+          await Session.updateOne(
+            {
+              jti: decoded.jti,
+              userId: decoded.id,
+              revokedAt: null,
+            },
+            {
+              $set: {
+                revokedAt: new Date(),
+                revokedReason: 'logout',
+              },
+            }
+          );
+        }
+      } catch (error) {
+        // Logout stays idempotent for expired, malformed, or already invalid tokens.
+      }
+    }
+
+    return res.json({ ok: true });
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',

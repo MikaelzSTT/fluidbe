@@ -1,4 +1,9 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const Session = require('../models/Session');
+
+const AUTH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+const AUTH_TOKEN_EXPIRES_IN = '7d';
 
 function serializePreferences(preferences) {
   return {
@@ -17,12 +22,54 @@ function serializePreferences(preferences) {
   };
 }
 
-function signAuthToken(user) {
+function signAuthToken(user, jti) {
   return jwt.sign(
-    { id: user._id },
+    { id: user._id, jti },
     process.env.JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: AUTH_TOKEN_EXPIRES_IN }
   );
+}
+
+function getClientIp(req) {
+  return req.ip || req.socket?.remoteAddress || '';
+}
+
+function hashIp(req) {
+  const ip = getClientIp(req);
+  const secret = process.env.SESSION_IP_HASH_SECRET || process.env.JWT_SECRET;
+
+  if (!ip || !secret) {
+    return undefined;
+  }
+
+  return crypto.createHmac('sha256', secret).update(ip).digest('hex');
+}
+
+async function createAuthSession(user, req) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + AUTH_TOKEN_TTL_SECONDS * 1000);
+  const jti = crypto.randomUUID();
+  const userAgent = typeof req?.headers?.['user-agent'] === 'string'
+    ? req.headers['user-agent'].slice(0, 512)
+    : undefined;
+
+  await Session.create({
+    userId: user._id,
+    jti,
+    userAgent,
+    ipHash: hashIp(req),
+    createdAt: now,
+    lastSeenAt: now,
+    expiresAt,
+  });
+
+  return { jti, expiresAt };
+}
+
+async function createAuthToken(user, req) {
+  const session = await createAuthSession(user, req);
+
+  return signAuthToken(user, session.jti);
 }
 
 function serializeUser(user) {
@@ -39,6 +86,9 @@ function serializeUser(user) {
 }
 
 module.exports = {
+  AUTH_TOKEN_TTL_SECONDS,
+  createAuthSession,
+  createAuthToken,
   serializeUser,
   signAuthToken,
 };
