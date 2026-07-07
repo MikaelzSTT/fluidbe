@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const Session = require('../models/Session');
+const User = require('../models/User');
 
 const LAST_SEEN_UPDATE_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -29,6 +30,15 @@ async function authMiddleware(req, res, next) {
 
     if (!decoded.jti) {
       if (isLegacyTokenAllowed(req)) {
+        const legacyUser = await User.findById(decoded.id).select('deletedAt');
+
+        if (legacyUser?.deletedAt) {
+          return res.status(401).json({
+            code: 'ACCOUNT_DELETED',
+            message: 'ACCOUNT_DELETED',
+          });
+        }
+
         req.userId = decoded.id;
         req.authLegacyToken = true;
         return next();
@@ -52,6 +62,15 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({
         code: 'SESSION_INVALID',
         message: 'Sessão inválida ou expirada.',
+      });
+    }
+
+    const user = await User.findById(decoded.id).select('deletedAt');
+
+    if (user?.deletedAt) {
+      return res.status(401).json({
+        code: 'ACCOUNT_DELETED',
+        message: 'ACCOUNT_DELETED',
       });
     }
 

@@ -173,6 +173,7 @@ const PREFERENCE_BOOLEANS = new Set([
   'confirmBeforeDelete',
   'compactMode',
 ]);
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due']);
 
 function getObjectBody(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : null;
@@ -338,6 +339,21 @@ function serializeAccountPreferences(preferences) {
   };
 }
 
+function hasActivePaidSubscription(user) {
+  const plan = String(user?.plan || '').toLowerCase();
+  const subscriptionStatus = String(user?.subscriptionStatus || '').toLowerCase();
+  const hasSubscriptionId = typeof user?.stripeSubscriptionId === 'string' && user.stripeSubscriptionId.trim();
+
+  return Boolean(
+    hasSubscriptionId &&
+    (['pro', 'business'].includes(plan) || ACTIVE_SUBSCRIPTION_STATUSES.has(subscriptionStatus))
+  );
+}
+
+function getDeletedEmail(userId) {
+  return `deleted-user-${String(userId)}@deleted.askfluid.local`;
+}
+
 async function countUserProjects(userId) {
   const [published, active] = await Promise.all([
     Project.countDocuments({
@@ -380,6 +396,11 @@ async function findAuthenticatedUser(req, res) {
 
   if (!user) {
     res.status(401).json({ message: 'Usuário não encontrado.' });
+    return null;
+  }
+
+  if (user.deletedAt) {
+    res.status(401).json({ code: 'ACCOUNT_DELETED', message: 'ACCOUNT_DELETED' });
     return null;
   }
 
@@ -555,6 +576,130 @@ router.delete('/me/sessions', authMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.delete('/me/account', authMiddleware, async (req, res) => {
+  try {
+    if (req.authLegacyToken || !req.session?.jti) {
+      return res.status(401).json({
+        code: 'SESSION_REFRESH_REQUIRED',
+        message: 'SESSION_REFRESH_REQUIRED',
+      });
+    }
+
+    const body = getObjectBody(req.body);
+
+    if (body?.confirmText !== 'DELETE') {
+      return res.status(400).json({
+        code: 'DELETE_CONFIRMATION_REQUIRED',
+        message: 'DELETE_CONFIRMATION_REQUIRED',
+      });
+    }
+
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (hasActivePaidSubscription(user)) {
+      return res.status(409).json({
+        code: 'ACTIVE_SUBSCRIPTION',
+        message: 'ACTIVE_SUBSCRIPTION',
+      });
+    }
+
+    if (hasPasswordHash(user)) {
+      const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+      const currentPasswordIsValid = currentPassword
+        ? await bcrypt.compare(currentPassword, user.password)
+        : false;
+
+      if (!currentPasswordIsValid) {
+        return res.status(401).json({
+          code: 'INVALID_CURRENT_PASSWORD',
+          message: 'INVALID_CURRENT_PASSWORD',
+        });
+      }
+    }
+
+    const now = new Date();
+
+    user.deletedAt = now;
+    user.deletionReason = typeof body.deletionReason === 'string'
+      ? body.deletionReason.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 280)
+      : undefined;
+    user.name = 'Deleted user';
+    user.email = getDeletedEmail(user._id);
+    user.password = undefined;
+    user.googleId = undefined;
+    user.avatar = undefined;
+    user.emailVerified = false;
+    user.providers = [];
+    user.onboardingComplete = false;
+    user.plan = 'free';
+    user.profile = {
+      displayName: 'Deleted user',
+      bio: '',
+      website: '',
+      company: '',
+      location: '',
+      visibility: 'private',
+      avatarUrl: '',
+    };
+    user.preferences = {
+      language: 'english',
+      appearance: 'system',
+      chatSuggestions: false,
+      soundOnComplete: 'never',
+      autoSave: false,
+      confirmBeforeDelete: true,
+      compactMode: false,
+    };
+    user.stripeCustomerId = undefined;
+    user.stripeSubscriptionId = undefined;
+    user.subscriptionStatus = undefined;
+    user.subscriptionCurrentPeriodEnd = undefined;
+    user.billingUpdatedAt = now;
+
+    await user.save();
+
+    await Promise.all([
+      Session.updateMany(
+        {
+          userId: user._id,
+          revokedAt: null,
+        },
+        {
+          $set: {
+            revokedAt: now,
+            revokedReason: 'account_deleted',
+          },
+        }
+      ),
+      Project.updateMany(
+        { userId: user._id },
+        {
+          $set: {
+            ownerDeleted: true,
+            accountDeleted: true,
+            ownerDeletedAt: now,
+            accountDeletedAt: now,
+          },
+        }
+      ),
+    ]);
+
+    return res.json({
+      ok: true,
+      message: 'ACCOUNT_DELETED',
+    });
+  } catch (error) {
+    return res.status(500).json({
+      code: 'ACCOUNT_DELETION_FAILED',
+      message: 'ACCOUNT_DELETION_FAILED',
     });
   }
 });

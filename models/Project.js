@@ -298,6 +298,28 @@ const projectSchema = new mongoose.Schema(
         default: 0,
       },
     },
+
+    ownerDeleted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    accountDeleted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    ownerDeletedAt: {
+      type: Date,
+      default: null,
+    },
+
+    accountDeletedAt: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,

@@ -182,6 +182,18 @@ const userSchema = new mongoose.Schema(
         type: Date,
       },
     },
+
+    deletedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    deletionReason: {
+      type: String,
+      trim: true,
+      maxlength: 280,
+    },
   },
   { timestamps: true }
 );
