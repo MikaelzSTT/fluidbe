@@ -128,13 +128,32 @@ function normalizeRequiredString(value, maxLength) {
 
 const PROFILE_FIELDS = Object.freeze({
   displayName: 80,
-  username: 32,
-  bio: 240,
-  website: 120,
+  username: 30,
+  bio: 280,
+  website: 2048,
   company: 80,
   location: 80,
+  avatarUrl: 2048,
+});
+const PROFILE_STRING_FIELDS = Object.freeze({
+  displayName: PROFILE_FIELDS.displayName,
+  bio: PROFILE_FIELDS.bio,
+  company: PROFILE_FIELDS.company,
+  location: PROFILE_FIELDS.location,
 });
 const PROFILE_VISIBILITIES = new Set(['public', 'private']);
+const RESERVED_USERNAMES = new Set([
+  'admin',
+  'root',
+  'support',
+  'billing',
+  'security',
+  'settings',
+  'api',
+  'fluid',
+  'null',
+  'undefined',
+]);
 const PREFERENCE_ENUMS = Object.freeze({
   language: new Set(['english', 'portuguese', 'spanish']),
   appearance: new Set(['light', 'dark', 'system']),
@@ -249,11 +268,39 @@ function normalizeUsername(value) {
 
   const normalized = username.toLowerCase();
 
-  if (!/^[a-z0-9_-]{3,32}$/.test(normalized)) {
+  if (!/^[a-z0-9_.-]{3,30}$/.test(normalized) || RESERVED_USERNAMES.has(normalized)) {
     return null;
   }
 
   return normalized;
+}
+
+function normalizeHttpsUrl(value, options = {}) {
+  const normalized = normalizeOptionalString(value, options.maxLength || 2048);
+
+  if (normalized === undefined || normalized === '') {
+    return normalized;
+  }
+
+  if (/^data:/i.test(normalized)) {
+    return null;
+  }
+
+  const candidate = /^[a-z][a-z\d+\-.]*:\/\//i.test(normalized)
+    ? normalized
+    : `https://${normalized}`;
+
+  try {
+    const url = new URL(candidate);
+
+    if (url.protocol !== 'https:' || !url.hostname) {
+      return null;
+    }
+
+    return url.toString();
+  } catch (error) {
+    return null;
+  }
 }
 
 function normalizeAccountLanguage(value) {
@@ -275,6 +322,7 @@ function serializeProfile(profile, user) {
     company: profile?.company || '',
     location: profile?.location || '',
     visibility: PROFILE_VISIBILITIES.has(profile?.visibility) ? profile.visibility : 'public',
+    avatarUrl: profile?.avatarUrl || '',
   };
 }
 
@@ -516,23 +564,19 @@ router.patch('/me/profile', authMiddleware, async (req, res) => {
     const body = getObjectBody(req.body);
 
     if (!body) {
-      return res.status(400).json({ message: 'Informe um perfil válido.' });
+      return res.status(400).json({ code: 'PROFILE_VALIDATION_FAILED', message: 'PROFILE_VALIDATION_FAILED' });
     }
 
     const allowedFields = [...Object.keys(PROFILE_FIELDS), 'visibility'];
     const unknownMessage = rejectUnknownFields(body, allowedFields);
 
     if (unknownMessage) {
-      return res.status(400).json({ message: unknownMessage });
+      return res.status(400).json({ code: 'PROFILE_VALIDATION_FAILED', message: 'PROFILE_VALIDATION_FAILED' });
     }
 
     const updates = {};
 
-    Object.entries(PROFILE_FIELDS).forEach(([field, maxLength]) => {
-      if (field === 'username') {
-        return;
-      }
-
+    Object.entries(PROFILE_STRING_FIELDS).forEach(([field, maxLength]) => {
       const normalized = normalizeOptionalString(body[field], maxLength);
 
       if (normalized === null) {
@@ -546,14 +590,15 @@ router.patch('/me/profile', authMiddleware, async (req, res) => {
     });
 
     if (Object.values(updates).some((value) => value === null)) {
-      return res.status(400).json({ message: 'Informe campos de perfil válidos.' });
+      return res.status(400).json({ code: 'PROFILE_VALIDATION_FAILED', message: 'PROFILE_VALIDATION_FAILED' });
     }
 
     const username = normalizeUsername(body.username);
 
     if (username === null) {
       return res.status(400).json({
-        message: 'Username deve ter 3 a 32 caracteres e usar apenas letras minúsculas, números, underscore ou hífen.',
+        code: 'INVALID_USERNAME',
+        message: 'INVALID_USERNAME',
       });
     }
 
@@ -561,9 +606,35 @@ router.patch('/me/profile', authMiddleware, async (req, res) => {
       updates.username = username;
     }
 
+    const website = normalizeHttpsUrl(body.website, { maxLength: PROFILE_FIELDS.website });
+
+    if (website === null) {
+      return res.status(400).json({
+        code: 'INVALID_WEBSITE',
+        message: 'INVALID_WEBSITE',
+      });
+    }
+
+    if (website !== undefined) {
+      updates.website = website;
+    }
+
+    const avatarUrl = normalizeHttpsUrl(body.avatarUrl, { maxLength: PROFILE_FIELDS.avatarUrl });
+
+    if (avatarUrl === null) {
+      return res.status(400).json({
+        code: 'INVALID_AVATAR_URL',
+        message: 'INVALID_AVATAR_URL',
+      });
+    }
+
+    if (avatarUrl !== undefined) {
+      updates.avatarUrl = avatarUrl;
+    }
+
     if (body.visibility !== undefined) {
       if (typeof body.visibility !== 'string' || !PROFILE_VISIBILITIES.has(body.visibility)) {
-        return res.status(400).json({ message: 'Visibilidade inválida.' });
+        return res.status(400).json({ code: 'PROFILE_VALIDATION_FAILED', message: 'PROFILE_VALIDATION_FAILED' });
       }
 
       updates.visibility = body.visibility;
@@ -575,14 +646,16 @@ router.patch('/me/profile', authMiddleware, async (req, res) => {
       return undefined;
     }
 
-    if (updates.username) {
+    const currentUsername = user.profile?.username || '';
+
+    if (updates.username && updates.username !== currentUsername) {
       const usernameExists = await User.exists({
         _id: { $ne: user._id },
         'profile.username': updates.username,
       });
 
       if (usernameExists) {
-        return res.status(409).json({ message: 'Este username já está em uso.' });
+        return res.status(409).json({ code: 'USERNAME_TAKEN', message: 'USERNAME_TAKEN' });
       }
     }
 
@@ -602,7 +675,11 @@ router.patch('/me/profile', authMiddleware, async (req, res) => {
     return res.json({ settings });
   } catch (error) {
     if (error?.code === 11000 && error?.keyPattern?.['profile.username']) {
-      return res.status(409).json({ message: 'Este username já está em uso.' });
+      return res.status(409).json({ code: 'USERNAME_TAKEN', message: 'USERNAME_TAKEN' });
+    }
+
+    if (error?.name === 'ValidationError') {
+      return res.status(400).json({ code: 'PROFILE_VALIDATION_FAILED', message: 'PROFILE_VALIDATION_FAILED' });
     }
 
     return res.status(500).json({

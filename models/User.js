@@ -67,7 +67,7 @@ const userSchema = new mongoose.Schema(
         type: String,
         trim: true,
         lowercase: true,
-        maxlength: 32,
+        maxlength: 30,
         index: {
           unique: true,
           sparse: true,
@@ -76,12 +76,12 @@ const userSchema = new mongoose.Schema(
       bio: {
         type: String,
         trim: true,
-        maxlength: 240,
+        maxlength: 280,
       },
       website: {
         type: String,
         trim: true,
-        maxlength: 120,
+        maxlength: 2048,
       },
       company: {
         type: String,
@@ -97,6 +97,11 @@ const userSchema = new mongoose.Schema(
         type: String,
         enum: ['public', 'private'],
         default: 'public',
+      },
+      avatarUrl: {
+        type: String,
+        trim: true,
+        maxlength: 2048,
       },
     },
 

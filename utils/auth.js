@@ -22,6 +22,21 @@ function serializePreferences(preferences) {
   };
 }
 
+function serializeProfile(profile, user) {
+  const visibility = profile?.visibility === 'private' ? 'private' : 'public';
+
+  return {
+    displayName: profile?.displayName || user.name || '',
+    username: profile?.username || '',
+    bio: profile?.bio || '',
+    website: profile?.website || '',
+    company: profile?.company || '',
+    location: profile?.location || '',
+    visibility,
+    avatarUrl: profile?.avatarUrl || '',
+  };
+}
+
 function signAuthToken(user, jti) {
   return jwt.sign(
     { id: user._id, jti },
@@ -105,6 +120,7 @@ function serializeUser(user) {
     providers: Array.isArray(user.providers) ? user.providers : [],
     auth: serializeAuthMetadata(user),
     onboardingComplete: Boolean(user.onboardingComplete),
+    profile: serializeProfile(user.profile, user),
     preferences: serializePreferences(user.preferences),
   };
 }
@@ -115,6 +131,7 @@ module.exports = {
   createAuthToken,
   hasPasswordHash,
   serializeAuthMetadata,
+  serializeProfile,
   serializeUser,
   signAuthToken,
 };
