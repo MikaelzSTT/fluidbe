@@ -104,6 +104,12 @@ function serializeAuthMetadata(user) {
     providers.push('google');
   }
 
+  if (Array.isArray(user?.providers) && user.providers.includes('github')) {
+    providers.push('github');
+  } else if (typeof user?.githubId === 'string' && user.githubId.trim()) {
+    providers.push('github');
+  }
+
   return {
     hasPassword: hasPasswordHash(user),
     providers,

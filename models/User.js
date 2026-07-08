@@ -30,6 +30,13 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
 
+    githubId: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+    },
+
     avatar: {
       type: String,
       trim: true,
@@ -42,7 +49,7 @@ const userSchema = new mongoose.Schema(
 
     providers: {
       type: [String],
-      enum: ['local', 'google'],
+      enum: ['local', 'google', 'github'],
       default: ['local'],
     },
 

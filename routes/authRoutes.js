@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const QRCode = require('qrcode');
@@ -29,6 +30,12 @@ const router = express.Router();
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
+const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+const GITHUB_USER_URL = 'https://api.github.com/user';
+const GITHUB_EMAILS_URL = 'https://api.github.com/user/emails';
+const GITHUB_STATE_TTL_SECONDS = 10 * 60;
+const DEFAULT_OAUTH_REDIRECT_PATH = '/projects.html';
 const passwordChangeRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -57,11 +64,17 @@ function redirectToOAuthError(res) {
   return res.redirect(`${getFrontendUrl()}/login.html?oauth_error=google`);
 }
 
-function redirectToOAuthSuccess(res, token, user) {
+function redirectToOAuthCodeError(res, code) {
+  return res.redirect(`${getFrontendUrl()}/login.html?error=${encodeURIComponent(code)}`);
+}
+
+function redirectToOAuthSuccess(res, token, user, redirectPath = '') {
   const encodedToken = encodeURIComponent(token);
   const encodedUser = encodeURIComponent(JSON.stringify(user));
+  const redirect = redirectPath ? normalizeFrontendRedirectPath(redirectPath) : '';
+  const redirectParam = redirect ? `&redirect=${encodeURIComponent(redirect)}` : '';
 
-  return res.redirect(`${getFrontendUrl()}/auth-callback.html#token=${encodedToken}&user=${encodedUser}`);
+  return res.redirect(`${getFrontendUrl()}/auth-callback.html#token=${encodedToken}&user=${encodedUser}${redirectParam}`);
 }
 
 function getGoogleOAuthConfig() {
@@ -74,6 +87,84 @@ function getGoogleOAuthConfig() {
 
 function hasGoogleOAuthConfig(config) {
   return Boolean(config.clientId && config.clientSecret && config.callbackUrl);
+}
+
+function getGitHubOAuthConfig() {
+  return {
+    clientId: process.env.GITHUB_CLIENT_ID,
+    clientSecret: process.env.GITHUB_CLIENT_SECRET,
+    callbackUrl: process.env.GITHUB_OAUTH_CALLBACK_URL,
+  };
+}
+
+function hasGitHubOAuthConfig(config) {
+  return Boolean(config.clientId && config.clientSecret && config.callbackUrl);
+}
+
+function normalizeFrontendRedirectPath(value) {
+  if (typeof value !== 'string') {
+    return DEFAULT_OAUTH_REDIRECT_PATH;
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed || trimmed.length > 2048 || !trimmed.startsWith('/') || trimmed.startsWith('//')) {
+    return DEFAULT_OAUTH_REDIRECT_PATH;
+  }
+
+  try {
+    const parsed = new URL(trimmed, getFrontendUrl());
+
+    if (parsed.origin !== getFrontendUrl() || !parsed.pathname.startsWith('/')) {
+      return DEFAULT_OAUTH_REDIRECT_PATH;
+    }
+
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch (error) {
+    return DEFAULT_OAUTH_REDIRECT_PATH;
+  }
+}
+
+function createGitHubOAuthState(redirectPath) {
+  const now = Math.floor(Date.now() / 1000);
+
+  return jwt.sign(
+    {
+      purpose: 'github_oauth_state',
+      nonce: crypto.randomBytes(16).toString('hex'),
+      redirect: normalizeFrontendRedirectPath(redirectPath),
+      createdAt: now,
+      expiresAt: now + GITHUB_STATE_TTL_SECONDS,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: GITHUB_STATE_TTL_SECONDS }
+  );
+}
+
+function verifyGitHubOAuthState(state) {
+  if (typeof state !== 'string' || !state) {
+    return null;
+  }
+
+  try {
+    const decoded = jwt.verify(state, process.env.JWT_SECRET);
+
+    if (
+      decoded?.purpose !== 'github_oauth_state' ||
+      typeof decoded.nonce !== 'string' ||
+      typeof decoded.createdAt !== 'number' ||
+      typeof decoded.expiresAt !== 'number' ||
+      decoded.expiresAt < Math.floor(Date.now() / 1000)
+    ) {
+      return null;
+    }
+
+    return {
+      redirect: normalizeFrontendRedirectPath(decoded.redirect),
+    };
+  } catch (error) {
+    return null;
+  }
 }
 
 async function exchangeGoogleCodeForToken(code, config) {
@@ -112,6 +203,59 @@ async function fetchGoogleProfile(accessToken) {
   return response.json();
 }
 
+async function exchangeGitHubCodeForToken(code, config) {
+  const response = await fetch(GITHUB_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      code,
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      redirect_uri: config.callbackUrl,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('GitHub token exchange failed.');
+  }
+
+  const payload = await response.json();
+
+  if (!payload.access_token || payload.error) {
+    throw new Error('GitHub token exchange failed.');
+  }
+
+  return payload;
+}
+
+async function fetchGitHubJson(url, accessToken) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${accessToken}`,
+      'User-Agent': 'Fluid OAuth',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error('GitHub API request failed.');
+  }
+
+  return response.json();
+}
+
+async function fetchGitHubProfile(accessToken) {
+  return fetchGitHubJson(GITHUB_USER_URL, accessToken);
+}
+
+async function fetchGitHubEmails(accessToken) {
+  return fetchGitHubJson(GITHUB_EMAILS_URL, accessToken);
+}
+
 function normalizeGoogleProfile(profile) {
   const googleId = String(profile.sub || '').trim();
   const email = String(profile.email || '').trim().toLowerCase();
@@ -135,6 +279,53 @@ function normalizeGoogleProfile(profile) {
 function withGoogleProvider(user) {
   const providers = Array.isArray(user.providers) ? user.providers : [];
   user.providers = Array.from(new Set([...providers, 'google']));
+}
+
+function normalizeGitHubProfile(profile, emails) {
+  const githubId = String(profile?.id || '').trim();
+  const login = String(profile?.login || '').trim();
+  const name = String(profile?.name || '').trim();
+  const avatar = String(profile?.avatar_url || '').trim();
+  const primaryEmail = Array.isArray(emails)
+    ? emails.find((email) => email?.primary === true && email?.verified === true && typeof email.email === 'string')
+    : null;
+  const email = String(primaryEmail?.email || '').trim().toLowerCase();
+
+  if (!githubId || !login || !email) {
+    return null;
+  }
+
+  return {
+    githubId,
+    login,
+    email,
+    name: name || login,
+    avatar,
+  };
+}
+
+function withGitHubProvider(user) {
+  const providers = Array.isArray(user.providers) ? user.providers : [];
+  user.providers = Array.from(new Set([...providers, 'github']));
+}
+
+function applyGitHubAvatarIfEmpty(user, avatar) {
+  if (!avatar) {
+    return;
+  }
+
+  if (!user.avatar) {
+    user.avatar = avatar;
+  }
+
+  const currentProfile = user.profile?.toObject ? user.profile.toObject() : user.profile || {};
+
+  if (!currentProfile.avatarUrl) {
+    user.profile = {
+      ...currentProfile,
+      avatarUrl: avatar,
+    };
+  }
 }
 
 function normalizeRequiredString(value, maxLength) {
@@ -301,6 +492,35 @@ function normalizeUsername(value) {
   return normalized;
 }
 
+async function generateUniqueUsername(preferredUsername, fallbackId) {
+  const candidates = [];
+  const normalizedPreferred = normalizeUsername(preferredUsername);
+
+  if (normalizedPreferred) {
+    candidates.push(normalizedPreferred);
+  }
+
+  const compactFallback = String(fallbackId || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+  if (compactFallback) {
+    candidates.push(`gh-${compactFallback}`.slice(0, PROFILE_FIELDS.username));
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate || candidate.length < 3 || RESERVED_USERNAMES.has(candidate)) {
+      continue;
+    }
+
+    const exists = await User.exists({ 'profile.username': candidate });
+
+    if (!exists) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
 function normalizeHttpsUrl(value, options = {}) {
   const normalized = normalizeOptionalString(value, options.maxLength || 2048);
 
@@ -432,19 +652,33 @@ async function findAuthenticatedUser(req, res) {
   return user;
 }
 
-function isGoogleOnlyUser(user) {
+function getPasswordlessProvider(user) {
   const hasGoogleProvider = Array.isArray(user?.providers) && user.providers.includes('google');
+  const hasGitHubProvider = Array.isArray(user?.providers) && user.providers.includes('github');
 
-  return !hasPasswordHash(user) && (hasGoogleProvider || Boolean(user?.googleId));
+  if (hasPasswordHash(user)) {
+    return null;
+  }
+
+  if (hasGoogleProvider || Boolean(user?.googleId)) {
+    return 'google';
+  }
+
+  if (hasGitHubProvider || Boolean(user?.githubId)) {
+    return 'github';
+  }
+
+  return null;
 }
 
 function serializeTwoFactorStatus(user) {
   const available = hasPasswordHash(user);
+  const passwordlessProvider = getPasswordlessProvider(user);
 
   return {
     enabled: Boolean(user?.twoFactor?.enabled),
     available,
-    managedByProvider: !available && isGoogleOnlyUser(user) ? 'google' : null,
+    managedByProvider: !available ? passwordlessProvider : null,
     recoveryCodesRemaining: countRemainingRecoveryCodes(user),
   };
 }
@@ -572,6 +806,26 @@ router.get('/google', (req, res) => {
   return res.redirect(authUrl.toString());
 });
 
+router.get('/github', (req, res) => {
+  const config = getGitHubOAuthConfig();
+
+  if (!hasGitHubOAuthConfig(config)) {
+    return redirectToOAuthCodeError(res, 'GITHUB_OAUTH_NOT_CONFIGURED');
+  }
+
+  const redirectPath = typeof req.query.redirect === 'string'
+    ? req.query.redirect
+    : DEFAULT_OAUTH_REDIRECT_PATH;
+  const state = createGitHubOAuthState(redirectPath);
+  const authUrl = new URL(GITHUB_AUTH_URL);
+  authUrl.searchParams.set('client_id', config.clientId);
+  authUrl.searchParams.set('redirect_uri', config.callbackUrl);
+  authUrl.searchParams.set('scope', 'read:user user:email');
+  authUrl.searchParams.set('state', state);
+
+  return res.redirect(authUrl.toString());
+});
+
 router.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await findAuthenticatedUser(req, res);
@@ -633,8 +887,10 @@ router.post('/me/2fa/setup', authMiddleware, async (req, res) => {
       return undefined;
     }
 
-    if (isGoogleOnlyUser(user)) {
-      return jsonCode(res, 400, 'TWO_FACTOR_MANAGED_BY_GOOGLE');
+    const passwordlessProvider = getPasswordlessProvider(user);
+
+    if (passwordlessProvider) {
+      return jsonCode(res, 400, `TWO_FACTOR_MANAGED_BY_${passwordlessProvider.toUpperCase()}`);
     }
 
     if (!hasPasswordHash(user)) {
@@ -681,8 +937,10 @@ router.post('/me/2fa/enable', authMiddleware, twoFactorEnableRateLimit, async (r
       return undefined;
     }
 
-    if (isGoogleOnlyUser(user)) {
-      return jsonCode(res, 400, 'TWO_FACTOR_MANAGED_BY_GOOGLE');
+    const passwordlessProvider = getPasswordlessProvider(user);
+
+    if (passwordlessProvider) {
+      return jsonCode(res, 400, `TWO_FACTOR_MANAGED_BY_${passwordlessProvider.toUpperCase()}`);
     }
 
     if (!hasPasswordHash(user)) {
@@ -841,8 +1099,8 @@ router.patch('/me/password', authMiddleware, passwordChangeRateLimit, async (req
     if (!hasPasswordHash(user)) {
       return res.status(400).json({
         ok: false,
-        code: 'PASSWORD_NOT_AVAILABLE_FOR_GOOGLE_ACCOUNT',
-        message: 'PASSWORD_NOT_AVAILABLE_FOR_GOOGLE_ACCOUNT',
+        code: 'PASSWORD_NOT_AVAILABLE_FOR_PROVIDER_ACCOUNT',
+        message: 'PASSWORD_NOT_AVAILABLE_FOR_PROVIDER_ACCOUNT',
       });
     }
 
@@ -994,6 +1252,7 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
     user.email = getDeletedEmail(user._id);
     user.password = undefined;
     user.googleId = undefined;
+    user.githubId = undefined;
     user.avatar = undefined;
     user.emailVerified = false;
     user.providers = [];
@@ -1361,6 +1620,100 @@ router.get('/google/callback', async (req, res) => {
   }
 });
 
+router.get('/github/callback', async (req, res) => {
+  let statePayload = null;
+
+  try {
+    const config = getGitHubOAuthConfig();
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+
+    if (!hasGitHubOAuthConfig(config)) {
+      return redirectToOAuthCodeError(res, 'GITHUB_OAUTH_NOT_CONFIGURED');
+    }
+
+    statePayload = verifyGitHubOAuthState(state);
+
+    if (!statePayload) {
+      return redirectToOAuthCodeError(res, 'GITHUB_STATE_INVALID');
+    }
+
+    if (!code) {
+      return redirectToOAuthCodeError(res, 'GITHUB_OAUTH_FAILED');
+    }
+
+    const tokenResponse = await exchangeGitHubCodeForToken(code, config);
+    const [rawProfile, rawEmails] = await Promise.all([
+      fetchGitHubProfile(tokenResponse.access_token),
+      fetchGitHubEmails(tokenResponse.access_token),
+    ]);
+    const profile = normalizeGitHubProfile(rawProfile, rawEmails);
+
+    if (!profile) {
+      return redirectToOAuthCodeError(res, 'GITHUB_EMAIL_REQUIRED');
+    }
+
+    let user = await User.findOne({ githubId: profile.githubId });
+
+    if (user?.deletedAt) {
+      return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
+    }
+
+    if (!user) {
+      user = await User.findOne({ email: profile.email });
+
+      if (user?.deletedAt) {
+        return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
+      }
+    }
+
+    if (user) {
+      if (user.githubId && user.githubId !== profile.githubId) {
+        return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
+      }
+
+      user.githubId = user.githubId || profile.githubId;
+      user.emailVerified = true;
+      withGitHubProvider(user);
+      applyGitHubAvatarIfEmpty(user, profile.avatar);
+      await user.save();
+    } else {
+      const username = await generateUniqueUsername(profile.login, profile.githubId);
+      const userProfile = {};
+
+      if (username) {
+        userProfile.username = username;
+      }
+
+      if (profile.avatar) {
+        userProfile.avatarUrl = profile.avatar;
+      }
+
+      user = await User.create({
+        name: profile.name,
+        email: profile.email,
+        githubId: profile.githubId,
+        avatar: profile.avatar,
+        emailVerified: true,
+        providers: ['github'],
+        plan: 'free',
+        profile: userProfile,
+      });
+    }
+
+    const token = await createAuthToken(user, req);
+    const serializedUser = serializeUser(user);
+
+    return redirectToOAuthSuccess(res, token, serializedUser, statePayload.redirect);
+  } catch (error) {
+    if (error?.code === 11000) {
+      return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
+    }
+
+    return redirectToOAuthCodeError(res, 'GITHUB_OAUTH_FAILED');
+  }
+});
+
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -1491,7 +1844,7 @@ router.post('/login', async (req, res) => {
     }
 
     if (!user.password) {
-      return res.status(401).json({ message: 'Esta conta usa login com Google.' });
+      return res.status(401).json({ message: 'Esta conta usa login com provedor externo.' });
     }
 
     const passwordIsValid = await bcrypt.compare(password, user.password);
