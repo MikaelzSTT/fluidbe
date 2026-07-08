@@ -183,6 +183,41 @@ const userSchema = new mongoose.Schema(
       },
     },
 
+    twoFactor: {
+      enabled: {
+        type: Boolean,
+        default: false,
+      },
+      secretEnc: {
+        type: String,
+        default: '',
+      },
+      pendingSecretEnc: {
+        type: String,
+        default: '',
+      },
+      pendingExpiresAt: {
+        type: Date,
+      },
+      enabledAt: {
+        type: Date,
+      },
+      recoveryCodes: [
+        {
+          hash: {
+            type: String,
+            required: true,
+          },
+          usedAt: {
+            type: Date,
+          },
+        },
+      ],
+      lastVerifiedAt: {
+        type: Date,
+      },
+    },
+
     deletedAt: {
       type: Date,
       default: null,

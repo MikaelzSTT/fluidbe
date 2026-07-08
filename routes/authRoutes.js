@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+const QRCode = require('qrcode');
 const authMiddleware = require('../middleware/authMiddleware');
 const Project = require('../models/Project');
 const Session = require('../models/Session');
@@ -12,6 +13,16 @@ const {
   serializeAuthMetadata,
   serializeUser,
 } = require('../utils/auth');
+const {
+  countRemainingRecoveryCodes,
+  decryptTotpSecret,
+  encryptTotpSecret,
+  generateRecoveryCodes,
+  generateTotpSecret,
+  getTotpAuthUrl,
+  normalizeRecoveryCode,
+  verifyTotpCode,
+} = require('../utils/twoFactor');
 const { createRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
@@ -21,6 +32,20 @@ const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 const passwordChangeRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
+  keyGenerator: (req) => String(req.userId || 'anonymous'),
+});
+const twoFactorVerifyLoginRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+});
+const twoFactorEnableRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyGenerator: (req) => String(req.userId || 'anonymous'),
+});
+const twoFactorDisableRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
   keyGenerator: (req) => String(req.userId || 'anonymous'),
 });
 
@@ -407,6 +432,128 @@ async function findAuthenticatedUser(req, res) {
   return user;
 }
 
+function isGoogleOnlyUser(user) {
+  const hasGoogleProvider = Array.isArray(user?.providers) && user.providers.includes('google');
+
+  return !hasPasswordHash(user) && (hasGoogleProvider || Boolean(user?.googleId));
+}
+
+function serializeTwoFactorStatus(user) {
+  const available = hasPasswordHash(user);
+
+  return {
+    enabled: Boolean(user?.twoFactor?.enabled),
+    available,
+    managedByProvider: !available && isGoogleOnlyUser(user) ? 'google' : null,
+    recoveryCodesRemaining: countRemainingRecoveryCodes(user),
+  };
+}
+
+function jsonCode(res, status, code) {
+  return res.status(status).json({
+    ok: false,
+    code,
+    message: code,
+  });
+}
+
+function createTwoFactorLoginChallenge(user) {
+  return jwt.sign(
+    {
+      id: user._id,
+      purpose: 'two_factor_login',
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '5m' }
+  );
+}
+
+function clearTwoFactor(user) {
+  user.twoFactor = {
+    enabled: false,
+    secretEnc: '',
+    pendingSecretEnc: '',
+    pendingExpiresAt: undefined,
+    enabledAt: undefined,
+    recoveryCodes: [],
+    lastVerifiedAt: undefined,
+  };
+}
+
+async function hashRecoveryCodes(recoveryCodes) {
+  return Promise.all(
+    recoveryCodes.map(async (recoveryCode) => ({
+      hash: await bcrypt.hash(normalizeRecoveryCode(recoveryCode), 10),
+    }))
+  );
+}
+
+async function verifyCurrentPassword(user, currentPassword) {
+  if (!hasPasswordHash(user) || typeof currentPassword !== 'string' || !currentPassword) {
+    return false;
+  }
+
+  return bcrypt.compare(currentPassword, user.password);
+}
+
+function verifyUserTotp(user, code) {
+  if (!user?.twoFactor?.enabled || !user.twoFactor.secretEnc) {
+    return false;
+  }
+
+  const secret = decryptTotpSecret(user.twoFactor.secretEnc);
+
+  return verifyTotpCode(secret, code);
+}
+
+async function verifyRecoveryCode(user, code, options = {}) {
+  const normalizedCode = normalizeRecoveryCode(code);
+
+  if (!normalizedCode) {
+    return false;
+  }
+
+  const recoveryCodes = Array.isArray(user?.twoFactor?.recoveryCodes) ? user.twoFactor.recoveryCodes : [];
+
+  for (const recoveryCode of recoveryCodes) {
+    if (!recoveryCode?.hash || recoveryCode.usedAt) {
+      continue;
+    }
+
+    const matches = await bcrypt.compare(normalizedCode, recoveryCode.hash);
+
+    if (!matches) {
+      continue;
+    }
+
+    if (options.markUsed) {
+      recoveryCode.usedAt = new Date();
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+async function verifyTwoFactorCredential(user, code, options = {}) {
+  if (verifyUserTotp(user, code)) {
+    return { valid: true, usedRecoveryCode: false };
+  }
+
+  if (options.allowRecovery) {
+    const recoveryCodeIsValid = await verifyRecoveryCode(user, code, {
+      markUsed: options.markRecoveryUsed,
+    });
+
+    if (recoveryCodeIsValid) {
+      return { valid: true, usedRecoveryCode: true };
+    }
+  }
+
+  return { valid: false, usedRecoveryCode: false };
+}
+
 router.get('/google', (req, res) => {
   const config = getGoogleOAuthConfig();
 
@@ -452,6 +599,218 @@ router.get('/me/settings', authMiddleware, async (req, res) => {
     const settings = await serializeAccountSettings(user);
 
     return res.json({ settings });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.get('/me/2fa', authMiddleware, async (req, res) => {
+  try {
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    return res.json({
+      ok: true,
+      twoFactor: serializeTwoFactorStatus(user),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/me/2fa/setup', authMiddleware, async (req, res) => {
+  try {
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (isGoogleOnlyUser(user)) {
+      return jsonCode(res, 400, 'TWO_FACTOR_MANAGED_BY_GOOGLE');
+    }
+
+    if (!hasPasswordHash(user)) {
+      return jsonCode(res, 400, 'TWO_FACTOR_NOT_AVAILABLE');
+    }
+
+    if (user.twoFactor?.enabled) {
+      return jsonCode(res, 400, 'TWO_FACTOR_ALREADY_ENABLED');
+    }
+
+    const secret = generateTotpSecret();
+    const otpauthUrl = getTotpAuthUrl(user.email, secret);
+    const qrCodeDataUrl = await QRCode.toDataURL(otpauthUrl);
+
+    user.twoFactor = {
+      ...(user.twoFactor?.toObject ? user.twoFactor.toObject() : user.twoFactor || {}),
+      enabled: false,
+      pendingSecretEnc: encryptTotpSecret(secret),
+      pendingExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    };
+
+    await user.save();
+
+    return res.json({
+      ok: true,
+      otpauthUrl,
+      secret,
+      qrCodeDataUrl,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/me/2fa/enable', authMiddleware, twoFactorEnableRateLimit, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const code = body?.code;
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (isGoogleOnlyUser(user)) {
+      return jsonCode(res, 400, 'TWO_FACTOR_MANAGED_BY_GOOGLE');
+    }
+
+    if (!hasPasswordHash(user)) {
+      return jsonCode(res, 400, 'TWO_FACTOR_NOT_AVAILABLE');
+    }
+
+    if (user.twoFactor?.enabled) {
+      return jsonCode(res, 400, 'TWO_FACTOR_ALREADY_ENABLED');
+    }
+
+    if (!user.twoFactor?.pendingSecretEnc || !user.twoFactor.pendingExpiresAt || user.twoFactor.pendingExpiresAt <= new Date()) {
+      return jsonCode(res, 400, 'TWO_FACTOR_SETUP_EXPIRED');
+    }
+
+    const pendingSecret = decryptTotpSecret(user.twoFactor.pendingSecretEnc);
+
+    if (!verifyTotpCode(pendingSecret, code)) {
+      return jsonCode(res, 400, 'INVALID_TWO_FACTOR_CODE');
+    }
+
+    const recoveryCodes = generateRecoveryCodes(8);
+    const hashedRecoveryCodes = await hashRecoveryCodes(recoveryCodes);
+    const now = new Date();
+
+    user.twoFactor = {
+      enabled: true,
+      secretEnc: user.twoFactor.pendingSecretEnc,
+      pendingSecretEnc: '',
+      pendingExpiresAt: undefined,
+      enabledAt: now,
+      recoveryCodes: hashedRecoveryCodes,
+      lastVerifiedAt: now,
+    };
+
+    await user.save();
+
+    return res.json({
+      ok: true,
+      message: 'TWO_FACTOR_ENABLED',
+      recoveryCodes,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/me/2fa/disable', authMiddleware, twoFactorDisableRateLimit, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (!user.twoFactor?.enabled) {
+      return jsonCode(res, 400, 'TWO_FACTOR_NOT_ENABLED');
+    }
+
+    if (hasPasswordHash(user)) {
+      const currentPasswordIsValid = await verifyCurrentPassword(user, body?.currentPassword);
+
+      if (!currentPasswordIsValid) {
+        return jsonCode(res, 401, 'INVALID_CURRENT_PASSWORD');
+      }
+    }
+
+    const verification = await verifyTwoFactorCredential(user, body?.code, {
+      allowRecovery: true,
+      markRecoveryUsed: true,
+    });
+
+    if (!verification.valid) {
+      return jsonCode(res, 400, 'INVALID_TWO_FACTOR_CODE');
+    }
+
+    clearTwoFactor(user);
+    await user.save();
+
+    return res.json({
+      ok: true,
+      message: 'TWO_FACTOR_DISABLED',
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/me/2fa/recovery-codes/regenerate', authMiddleware, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (!user.twoFactor?.enabled) {
+      return jsonCode(res, 400, 'TWO_FACTOR_NOT_ENABLED');
+    }
+
+    if (hasPasswordHash(user)) {
+      const currentPasswordIsValid = await verifyCurrentPassword(user, body?.currentPassword);
+
+      if (!currentPasswordIsValid) {
+        return jsonCode(res, 401, 'INVALID_CURRENT_PASSWORD');
+      }
+    }
+
+    if (!verifyUserTotp(user, body?.code)) {
+      return jsonCode(res, 400, 'INVALID_TWO_FACTOR_CODE');
+    }
+
+    const recoveryCodes = generateRecoveryCodes(8);
+
+    user.twoFactor.recoveryCodes = await hashRecoveryCodes(recoveryCodes);
+    user.twoFactor.lastVerifiedAt = new Date();
+    await user.save();
+
+    return res.json({
+      ok: true,
+      message: 'RECOVERY_CODES_REGENERATED',
+      recoveryCodes,
+    });
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -663,6 +1022,7 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
     user.subscriptionStatus = undefined;
     user.subscriptionCurrentPeriodEnd = undefined;
     user.billingUpdatedAt = now;
+    clearTwoFactor(user);
 
     await user.save();
 
@@ -1055,6 +1415,67 @@ router.post('/register', async (req, res) => {
   }
 });
 
+router.post('/2fa/verify-login', twoFactorVerifyLoginRateLimit, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const loginChallenge = typeof body?.loginChallenge === 'string' ? body.loginChallenge : '';
+
+    if (!loginChallenge) {
+      return jsonCode(res, 401, 'TWO_FACTOR_CHALLENGE_EXPIRED');
+    }
+
+    let decoded;
+
+    try {
+      decoded = jwt.verify(loginChallenge, process.env.JWT_SECRET);
+    } catch (error) {
+      return jsonCode(res, 401, 'TWO_FACTOR_CHALLENGE_EXPIRED');
+    }
+
+    if (!decoded?.id || decoded.purpose !== 'two_factor_login') {
+      return jsonCode(res, 401, 'TWO_FACTOR_CHALLENGE_EXPIRED');
+    }
+
+    const user = await User.findById(decoded.id);
+
+    if (!user || user.deletedAt || !user.twoFactor?.enabled) {
+      return jsonCode(res, 401, 'TWO_FACTOR_CHALLENGE_EXPIRED');
+    }
+
+    const verification = await verifyTwoFactorCredential(user, body?.code, {
+      allowRecovery: true,
+      markRecoveryUsed: true,
+    });
+
+    if (!verification.valid) {
+      return jsonCode(res, 400, 'INVALID_TWO_FACTOR_CODE');
+    }
+
+    user.twoFactor.lastVerifiedAt = new Date();
+
+    if (verification.usedRecoveryCode) {
+      await user.save();
+    } else {
+      await User.updateOne(
+        { _id: user._id },
+        { $set: { 'twoFactor.lastVerifiedAt': user.twoFactor.lastVerifiedAt } }
+      );
+    }
+
+    const token = await createAuthToken(user, req);
+
+    return res.json({
+      ok: true,
+      token,
+      user: serializeUser(user),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -1063,7 +1484,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Preencha e-mail e senha.' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() });
 
     if (!user) {
       return res.status(401).json({ message: 'E-mail ou senha inválidos.' });
@@ -1079,9 +1500,19 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'E-mail ou senha inválidos.' });
     }
 
+    if (user.twoFactor?.enabled) {
+      return res.json({
+        ok: true,
+        requiresTwoFactor: true,
+        loginChallenge: createTwoFactorLoginChallenge(user),
+        message: 'TWO_FACTOR_REQUIRED',
+      });
+    }
+
     const token = await createAuthToken(user, req);
 
     return res.json({
+      ok: true,
       message: 'Login realizado com sucesso.',
       token,
       user: serializeUser(user),
