@@ -1,6 +1,7 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const mongoose = require('mongoose');
+const multer = require('multer');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
@@ -17,7 +18,10 @@ const chatUserRateLimit = createRateLimit({
 });
 
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-5';
+const DEFAULT_VISION_MODEL = 'gpt-5.6';
 const VISUAL_CONTEXT_ENABLED = String(process.env.VISUAL_CONTEXT_ENABLED || 'false').toLowerCase() === 'true';
+const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const MAX_CODE_CONTEXT_SUMMARY_CHARS = 1200;
 const MAX_CODE_CONTEXT_FILES = 8;
 const MAX_CODE_CONTEXT_EXCERPTS = 3;
@@ -31,6 +35,27 @@ const WIZARD_MODE = 'wizard';
 const CLARIFY_MODE = 'clarify';
 const CHAT_MODE = 'chat';
 const BUILD_NOW_REPLY = 'Perfeito - vou começar a construir agora.';
+const IMAGE_ONLY_DEFAULT_PROMPTS = Object.freeze({
+  en: 'Use this image as context and help me decide what to build.',
+  pt: 'Use esta imagem como contexto e me ajude a decidir o que construir.',
+  es: 'Usa esta imagen como contexto y ayúdame a decidir qué construir.',
+});
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_IMAGE_UPLOAD_BYTES,
+    files: 1,
+  },
+  fileFilter: (req, file, callback) => {
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
+      const error = new Error('Unsupported image type.');
+      error.code = 'INVALID_IMAGE_TYPE';
+      return callback(error);
+    }
+
+    return callback(null, true);
+  },
+});
 const CONNECTOR_RULES = [
   {
     provider: 'stripe',
@@ -131,6 +156,165 @@ const CONNECTOR_RULES = [
     ],
   },
 ];
+
+function parseOptionalJson(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function normalizeRequestLanguage(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 8);
+
+  if (normalized.startsWith('pt')) return 'pt';
+  if (normalized.startsWith('es')) return 'es';
+  return 'en';
+}
+
+function getRequestLanguage(req) {
+  return normalizeRequestLanguage(
+    req.body?.language ||
+    req.body?.lang ||
+    req.body?.locale ||
+    req.headers['accept-language']
+  );
+}
+
+function getDefaultImagePrompt(req) {
+  const language = getRequestLanguage(req);
+  return IMAGE_ONLY_DEFAULT_PROMPTS[language] || IMAGE_ONLY_DEFAULT_PROMPTS.en;
+}
+
+function getUploadedImage(req) {
+  const files = req.files || {};
+  const candidates = [
+    ...(Array.isArray(files.image) ? files.image : []),
+    ...(Array.isArray(files.attachment) ? files.attachment : []),
+  ];
+
+  return candidates[0] || req.file || null;
+}
+
+function buildImageAttachment(file) {
+  if (!file) {
+    return null;
+  }
+
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
+    const error = new Error('Unsupported image type.');
+    error.code = 'INVALID_IMAGE_TYPE';
+    throw error;
+  }
+
+  if (!Buffer.isBuffer(file.buffer) || file.buffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+    const error = new Error('Image too large.');
+    error.code = 'IMAGE_TOO_LARGE';
+    throw error;
+  }
+
+  return {
+    buffer: file.buffer,
+    name: String(file.originalname || 'image').slice(0, 180),
+    type: file.mimetype,
+    size: file.size || file.buffer.length,
+  };
+}
+
+function buildImageMetadata(imageAttachment) {
+  if (!imageAttachment) {
+    return null;
+  }
+
+  return {
+    hasImageAttachment: true,
+    image: {
+      name: imageAttachment.name,
+      type: imageAttachment.type,
+      size: imageAttachment.size,
+    },
+  };
+}
+
+function buildUploadedImageInstruction(imageAttachment) {
+  if (!imageAttachment) {
+    return '';
+  }
+
+  return [
+    'Imagem anexada pelo usuario:',
+    `Arquivo: ${imageAttachment.name}`,
+    `Tipo: ${imageAttachment.type}`,
+    'Use a imagem enviada como contexto visual real para entender marca, tela, logo, referencia estetica, layout, conteudo e intencao do usuario.',
+    'Se o texto for vago, como "quero um app" ou "me ajude a decidir", infera a partir da imagem e faca uma pergunta estruturada util em vez de ignorar a imagem.',
+    'Quando for util, mencione brevemente o que voce entendeu da imagem.',
+  ].join('\n');
+}
+
+function getVisionModel() {
+  const configuredVisionModel = String(process.env.VISION_MODEL || '').trim();
+
+  if (configuredVisionModel) {
+    return configuredVisionModel;
+  }
+
+  const configuredOpenAiModel = String(process.env.OPENAI_MODEL || '').trim();
+
+  if (
+    configuredOpenAiModel &&
+    /^(gpt-5|gpt-4\.1|gpt-4o|o[34]|omni)/i.test(configuredOpenAiModel)
+  ) {
+    return configuredOpenAiModel;
+  }
+
+  return DEFAULT_VISION_MODEL;
+}
+
+function parseChatUpload(req, res, next) {
+  imageUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'attachment', maxCount: 1 },
+  ])(req, res, (error) => {
+    if (!error) {
+      return next();
+    }
+
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        code: 'IMAGE_TOO_LARGE',
+        message: 'Image exceeds the 8MB limit.',
+      });
+    }
+
+    if (error.code === 'INVALID_IMAGE_TYPE') {
+      return res.status(400).json({
+        code: 'INVALID_IMAGE_TYPE',
+        message: 'Unsupported image type. Use PNG, JPEG, or WebP.',
+      });
+    }
+
+    if (error.code === 'LIMIT_UNEXPECTED_FILE' || error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({
+        code: 'INVALID_IMAGE_UPLOAD',
+        message: 'Send one image using PNG, JPEG, or WebP.',
+      });
+    }
+
+    return next(error);
+  });
+}
 
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') {
@@ -471,6 +655,7 @@ function filterNewRequiredConnectors(project, detectedConnectors) {
 
 function buildDecisionSystemPrompt(projectContext, hasProjectContext = false, projectCodeContext = '', projectVisualContext = '') {
   const buildContext = [projectCodeContext, projectVisualContext].filter(Boolean).join('\n\n');
+  const hasUploadedImageContext = projectVisualContext.includes('Imagem anexada pelo usuario:');
 
   return `
 Voce e a IA de chat da Fluid, em portugues do Brasil.
@@ -483,6 +668,7 @@ ${hasProjectContext ? 'Como ha um projeto atual, tambem use action "wizard" quan
 Use action "chat" para conversa normal, duvidas, mensagens aleatorias, testes, cumprimentos, risadas, reacoes curtas ou texto sem intencao clara de criacao.
 
 Use action "clarify" quando houver intencao clara de criar um projeto, mas o pedido ainda estiver vago ou incompleto para uma boa primeira geracao.
+${hasUploadedImageContext ? 'Excecao importante: quando houver imagem anexada e o texto for vago, nao use uma resposta generica. Use action "chat" para fazer uma pergunta util baseada no que voce entendeu da imagem e inclua options curtas. A pergunta deve demonstrar que voce analisou a imagem.' : ''}
 
 Exemplos que devem ser "chat" se nao houver contexto anterior suficiente:
 - "wadsczx"
@@ -947,6 +1133,102 @@ async function callClaude({ messages, maxTokens = 700 }) {
   return content;
 }
 
+function extractOpenAiResponseText(response) {
+  const directText = String(response?.output_text || '').trim();
+
+  if (directText) {
+    return directText;
+  }
+
+  const output = Array.isArray(response?.output) ? response.output : [];
+
+  return output
+    .flatMap((item) => Array.isArray(item?.content) ? item.content : [])
+    .map((content) => {
+      if (typeof content?.text === 'string') return content.text;
+      if (typeof content?.output_text === 'string') return content.output_text;
+      return '';
+    })
+    .join('')
+    .trim();
+}
+
+function buildOpenAiInputMessages(messages, imageAttachment) {
+  const { system, messages: conversationMessages } = splitSystemMessage(messages);
+  const input = conversationMessages.map((message) => ({
+    role: message.role,
+    content: [{ type: 'input_text', text: message.content }],
+  }));
+
+  if (imageAttachment) {
+    const dataUrl = `data:${imageAttachment.type};base64,${imageAttachment.buffer.toString('base64')}`;
+    let targetMessage = input[input.length - 1];
+
+    if (!targetMessage || targetMessage.role !== 'user') {
+      targetMessage = {
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Use this image as context.' }],
+      };
+      input.push(targetMessage);
+    }
+
+    targetMessage.content.push({
+      type: 'input_image',
+      image_url: dataUrl,
+    });
+  }
+
+  return { instructions: system, input };
+}
+
+async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700 }) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY nao configurada.');
+  }
+
+  const { instructions, input } = buildOpenAiInputMessages(messages, imageAttachment);
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: getVisionModel(),
+      instructions,
+      input,
+      max_output_tokens: maxTokens,
+    }),
+  });
+
+  if (!response.ok) {
+    let errorMessage = `OpenAI vision request failed with status ${response.status}.`;
+
+    try {
+      const body = await response.json();
+      const apiMessage = String(body?.error?.message || '').trim();
+      if (apiMessage) {
+        errorMessage = apiMessage;
+      }
+    } catch (error) {
+      // Keep the sanitized status-only message.
+    }
+
+    const error = new Error(errorMessage);
+    error.status = response.status;
+    throw error;
+  }
+
+  const parsed = await response.json();
+  const content = extractOpenAiResponseText(parsed);
+
+  if (!content) {
+    throw new Error('Resposta vazia da IA.');
+  }
+
+  return content;
+}
+
 async function getClarificationQuestions({ message, history }) {
   const previousMessages = Array.isArray(history)
     ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
@@ -966,15 +1248,16 @@ async function getClarificationQuestions({ message, history }) {
 }
 
 async function getFallbackChatReply({
-  message, previousMessages, projectContext, projectCodeContext, projectVisualContext,
+  message, previousMessages, projectContext, projectCodeContext, projectVisualContext, imageAttachment,
 }) {
-  const content = await callClaude({
-    messages: [
-      { role: 'system', content: buildFallbackSystemPrompt(projectContext, projectCodeContext, projectVisualContext) },
-      ...previousMessages,
-      { role: 'user', content: message },
-    ],
-  });
+  const messages = [
+    { role: 'system', content: buildFallbackSystemPrompt(projectContext, projectCodeContext, projectVisualContext) },
+    ...previousMessages,
+    { role: 'user', content: message },
+  ];
+  const content = imageAttachment
+    ? await callOpenAiVision({ messages, imageAttachment })
+    : await callClaude({ messages });
 
   const reply = String(content || '').trim();
 
@@ -996,11 +1279,11 @@ async function getFallbackChatReply({
 }
 
 async function getAiReply({
-  message, history, project, projectCodeContext = '', projectVisualContext = '',
+  message, history, project, projectCodeContext = '', projectVisualContext = '', imageAttachment,
 }) {
   const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
-  const firstPromptBuildNow = isCompleteFirstBuildPrompt(message, history, project);
+  const firstPromptBuildNow = !imageAttachment && isCompleteFirstBuildPrompt(message, history, project);
 
   console.info('[chat] detectedBuildNow', {
     detectedBuildNow: firstPromptBuildNow,
@@ -1039,7 +1322,9 @@ async function getAiReply({
   ];
 
   try {
-    const content = await callClaude({ messages: decisionMessages });
+    const content = imageAttachment
+      ? await callOpenAiVision({ messages: decisionMessages, imageAttachment })
+      : await callClaude({ messages: decisionMessages });
     const parsed = extractJson(content);
     let action = String(parsed.action || '').trim().toLowerCase();
     let reply = String(parsed.reply || '').trim();
@@ -1058,8 +1343,28 @@ async function getAiReply({
         : reply;
     }
 
+    let forcedImageClarifyOptions = null;
+
+    if (imageAttachment && action === 'clarify') {
+      action = 'chat';
+      if (
+        !reply ||
+        reply === 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
+      ) {
+        reply = 'Vou usar a imagem como referência. Você quer que eu siga mais a identidade visual, o layout da tela ou transforme a ideia em um app completo?';
+      }
+      forcedImageClarifyOptions = [
+        'Seguir a identidade visual',
+        'Recriar o layout',
+        'Criar um app completo',
+      ];
+    }
+
     const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
-    const options = normalizeOptions(parsed.options, shouldIncludeOptions);
+    const options = normalizeOptions(
+      forcedImageClarifyOptions || parsed.options,
+      shouldIncludeOptions
+    );
     const readyForWizard = action === 'wizard';
     const buildNowFromAi = readyForWizard && firstPromptNoContext;
     const connectorScope = project ? 'edit' : 'initial';
@@ -1100,6 +1405,7 @@ async function getAiReply({
         projectContext,
         projectCodeContext,
         projectVisualContext,
+        imageAttachment,
       });
     }
 
@@ -1131,11 +1437,17 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
   }
 });
 
-router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
+router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req, res) => {
   try {
-    const { projectId, message, history, messages } = req.body;
+    const { projectId } = req.body;
+    const history = parseOptionalJson(req.body.history, req.body.history);
+    const messages = parseOptionalJson(req.body.messages, req.body.messages);
+    const imageAttachment = buildImageAttachment(getUploadedImage(req));
+    const rawMessage = typeof req.body.message === 'string' ? req.body.message : '';
+    const safeImageMetadata = buildImageMetadata(imageAttachment);
+    const imageVisualContext = buildUploadedImageInstruction(imageAttachment);
 
-    if (!message || typeof message !== 'string') {
+    if (!rawMessage && !imageAttachment) {
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
     }
 
@@ -1144,7 +1456,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
     let projectVisualContext = '';
     let userMessage = null;
     let changeRequest = null;
-    const trimmedMessage = message.trim();
+    const trimmedMessage = rawMessage.trim() || getDefaultImagePrompt(req);
 
     if (!trimmedMessage) {
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
@@ -1172,7 +1484,10 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
         .select(VISUAL_CONTEXT_ENABLED ? 'sourceSummary indexedFiles sourceFiles previewUrl' : 'sourceSummary indexedFiles sourceFiles')
         .lean();
       projectCodeContext = buildProjectCodeContext(latestBuild, trimmedMessage);
-      projectVisualContext = reserveProjectVisualContext(latestBuild);
+      projectVisualContext = [
+        reserveProjectVisualContext(latestBuild),
+        imageVisualContext,
+      ].filter(Boolean).join('\n\n');
 
       userMessage = await ProjectMessage.create({
         projectId: project._id,
@@ -1181,6 +1496,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
         metadata: {
           source: 'api_chat',
           userId: req.userId,
+          ...(safeImageMetadata || {}),
         },
       });
 
@@ -1192,8 +1508,11 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
         metadata: {
           source: 'api_chat',
           classification: 'edit',
+          ...(safeImageMetadata || {}),
         },
       });
+    } else {
+      projectVisualContext = imageVisualContext;
     }
 
     const aiReply = await getAiReply({
@@ -1202,6 +1521,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
       project,
       projectCodeContext,
       projectVisualContext,
+      imageAttachment,
     });
     let requiredConnectors = aiReply.requiredConnectors || [];
 
@@ -1223,6 +1543,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
           status: aiReply.status || null,
           options: aiReply.options || [],
           requiredConnectors,
+          ...(safeImageMetadata || {}),
         },
       });
 
@@ -1235,6 +1556,7 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
           needsClarification: Boolean(aiReply.needsClarification),
           mode: aiReply.mode || CHAT_MODE,
           status: aiReply.status || null,
+          ...(safeImageMetadata || {}),
         };
         await changeRequest.save();
       }
@@ -1263,6 +1585,20 @@ router.post('/', authMiddleware, chatUserRateLimit, async (req, res) => {
 
     return res.json(responsePayload);
   } catch (error) {
+    if (error?.code === 'INVALID_IMAGE_TYPE') {
+      return res.status(400).json({
+        code: 'INVALID_IMAGE_TYPE',
+        message: 'Unsupported image type. Use PNG, JPEG, or WebP.',
+      });
+    }
+
+    if (error?.code === 'IMAGE_TOO_LARGE') {
+      return res.status(413).json({
+        code: 'IMAGE_TOO_LARGE',
+        message: 'Image exceeds the 8MB limit.',
+      });
+    }
+
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });
