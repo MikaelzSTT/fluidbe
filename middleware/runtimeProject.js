@@ -25,7 +25,10 @@ async function validateRuntimeProject(req, res, next) {
 
     return next();
   } catch (error) {
-    console.error('Runtime project validation failed:', error);
+    console.error('Runtime project validation failed.', {
+      name: error?.name || 'Error',
+      code: error?.code || null,
+    });
     return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
   }
 }

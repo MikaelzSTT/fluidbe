@@ -49,6 +49,14 @@ const BILLING_ENV_NAMES = Object.freeze([
 ]);
 const loggedMissingBillingConfig = new Set();
 
+function logBillingError(context, error) {
+  console.error(context, {
+    name: error?.name || 'Error',
+    code: error?.code || null,
+    status: error?.statusCode || error?.status || null,
+  });
+}
+
 function getFrontendUrl() {
   return (process.env.FRONTEND_URL || 'https://askfluid.now').replace(/\/+$/, '');
 }
@@ -478,7 +486,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
 
     return res.json({ received: true });
   } catch (error) {
-    console.error('Stripe webhook handling failed:', error);
+    logBillingError('Stripe webhook handling failed.', error);
     return res.status(500).json({ message: 'Stripe webhook handling failed.' });
   }
 });
@@ -495,7 +503,7 @@ router.get('/me', authMiddleware, async (req, res) => {
 
     return res.json(await serializeBilling(user));
   } catch (error) {
-    console.error('Billing lookup failed:', error);
+    logBillingError('Billing lookup failed.', error);
     return res.status(500).json({ message: 'Unable to load billing details.' });
   }
 });
@@ -575,7 +583,7 @@ router.post('/checkout', authMiddleware, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (error) {
-    console.error('Stripe checkout session creation failed:', error);
+    logBillingError('Stripe checkout session creation failed.', error);
     return res.status(500).json({ message: 'Unable to create checkout session.' });
   }
 });
@@ -611,7 +619,7 @@ router.post('/portal', authMiddleware, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (error) {
-    console.error('Stripe portal session creation failed:', error);
+    logBillingError('Stripe portal session creation failed.', error);
     return res.status(500).json({ message: 'Unable to create billing portal session.' });
   }
 });

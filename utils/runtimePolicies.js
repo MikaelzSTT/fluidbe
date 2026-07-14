@@ -3,8 +3,8 @@ const RUNTIME_COLLECTION_POLICIES = {
     publicRead: true,
     createAuth: true,
     assignOwnerOnCreate: true,
-    updateRoles: new Set(['seller', 'admin']),
-    deleteRoles: new Set(['seller', 'admin']),
+    updateRoles: new Set(['admin']),
+    deleteRoles: new Set(['admin']),
   },
 
   orders: {
@@ -19,20 +19,21 @@ const RUNTIME_COLLECTION_POLICIES = {
   },
 
   tasks: {
-    publicRead: true,
-    createAuth: false,
-    assignOwnerOnCreate: false,
-    publicWrite: true,
-    ownerCanUpdate: false,
-    ownerCanDelete: false,
+    publicRead: false,
+    createAuth: true,
+    assignOwnerOnCreate: true,
+    publicWrite: false,
+    ownerScopedRead: true,
+    ownerCanUpdate: true,
+    ownerCanDelete: true,
   },
 };
 
 const DEFAULT_RUNTIME_COLLECTION_POLICY = {
-  publicRead: true,
+  publicRead: false,
   createAuth: true,
   assignOwnerOnCreate: true,
-  ownerScopedRead: false,
+  ownerScopedRead: true,
   updateRoles: new Set(['admin']),
   deleteRoles: new Set(['admin']),
   ownerCanUpdate: true,

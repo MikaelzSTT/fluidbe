@@ -14,7 +14,13 @@ const billingRoutes = require('./routes/billingRoutes');
 const runtimeRoutes = require('./routes/runtimeRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
+const Session = require('./models/Session');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
+const {
+  BUILD_PREVIEW_TTL_SECONDS,
+  verifyBuildPreviewToken,
+} = require('./utils/buildPreviewAccess');
+const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 
 
 dotenv.config();
@@ -179,6 +185,14 @@ function securityHeaders(req, res, next) {
     'Permissions-Policy',
     'accelerometer=(), gyroscope=(), magnetometer=(), payment=(), usb=()'
   );
+
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+
+  if ((req.path || '').startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'no-store');
+  }
 
   // Do not send a global CSP here. Published builds contain generated HTML,
   // scripts, styles, and third-party resources whose requirements vary per
@@ -376,7 +390,7 @@ function parseBuildRequestPath(requestPath) {
   };
 }
 
-function getBearerUserId(req) {
+async function getBearerUserId(req) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
@@ -392,13 +406,32 @@ function getBearerUserId(req) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    if (!decoded.id || decoded.runtimeUserId) {
+    if (!decoded.id || !decoded.jti || decoded.runtimeUserId) {
       return null;
     }
 
-    return decoded.id;
+    const session = await Session.exists({
+      jti: decoded.jti,
+      userId: decoded.id,
+      revokedAt: null,
+      expiresAt: { $gt: new Date() },
+    });
+
+    return session ? decoded.id : null;
   } catch (error) {
     return null;
+  }
+}
+
+function getCookie(req, name) {
+  const header = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+  const prefix = `${name}=`;
+  const part = header.split(';').map((value) => value.trim()).find((value) => value.startsWith(prefix));
+  if (!part) return '';
+  try {
+    return decodeURIComponent(part.slice(prefix.length));
+  } catch (error) {
+    return '';
   }
 }
 
@@ -441,22 +474,37 @@ async function authorizeBuildAccess(req, res, next) {
     }
 
     const project = await Project.findById(parsedPath.projectId)
-      .select('userId isPublished')
+      .select('userId isPublished latestPublishedBuildId buildUrl deployUrl previewUrl distUrl')
       .lean();
 
     if (!project) {
       return res.sendStatus(404);
     }
 
-    // A completed worker build remains in "draft" until publication. Its
-    // artifact must still be reachable by an iframe, which cannot attach the
-    // API authorization headers used by the admin client.
-    if (['draft', 'done'].includes(build.status) || project.isPublished === true) {
+    if (isProjectBuildExplicitlyPublished(project, build)) {
+      return next();
+    }
+
+    const previewCookieName = 'fluid_build_preview';
+    const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
+    const cookieToken = getCookie(req, previewCookieName);
+    const previewToken = queryToken || cookieToken;
+
+    if (verifyBuildPreviewToken(previewToken, parsedPath.projectId, parsedPath.buildKey)) {
+      if (queryToken) {
+        res.cookie(previewCookieName, queryToken, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          path: `/builds/${parsedPath.projectId}/${parsedPath.buildKey}`,
+          maxAge: BUILD_PREVIEW_TTL_SECONDS * 1000,
+        });
+      }
       return next();
     }
 
     const isAdmin = Boolean(process.env.ADMIN_TOKEN) && req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
-    const userId = getBearerUserId(req);
+    const userId = await getBearerUserId(req);
 
     if (isAdmin || (userId && String(project.userId) === String(userId))) {
       return next();
@@ -588,7 +636,7 @@ app.options(/.*/, cors(corsOptions));
 app.use(publicAppsOnly);
 app.use('/api', apiRateLimit);
 app.use('/api/billing', billingRoutes);
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 app.use('/builds', authorizeBuildAccess, express.static(PUBLIC_BUILDS_DIR));
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
   try {
@@ -656,7 +704,11 @@ app.use('/api/admin', adminRateLimit, adminRoutes);
 app.use('/api/connectors', connectorRegistryRoutes);
 app.use('/api/runtime/:projectId', runtimeRoutes);
 app.use((error, req, res, next) => {
-  console.error('Erro não tratado na requisição:', error);
+  console.error('Erro não tratado na requisição.', {
+    name: error?.name || 'Error',
+    code: error?.code || null,
+    status: error?.status || error?.statusCode || 500,
+  });
 
   if (res.headersSent) {
     return next(error);
@@ -671,7 +723,7 @@ mongoose
     console.log('MongoDB conectado');
   })
   .catch((err) => {
-    console.error('Erro MongoDB:', err);
+    console.error('Erro MongoDB.', { name: err?.name || 'Error', code: err?.code || null });
   });
 
 app.get('/', (req, res) => {

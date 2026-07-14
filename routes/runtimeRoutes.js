@@ -36,11 +36,24 @@ const {
 } = require('../utils/runtimeAuth');
 
 const router = express.Router({ mergeParams: true });
+const MAX_RUNTIME_PASSWORD_BYTES = 72;
 const runtimeRateLimit = createRateLimit({
   windowMs: 60 * 1000,
   max: 120,
   keyGenerator: (req) => `${req.params.projectId || 'unknown'}:${getClientIp(req)}`,
 });
+const runtimeAuthRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `${req.params.projectId || 'unknown'}:${getClientIp(req)}`,
+});
+
+function logRuntimeError(context, error) {
+  console.error(context, {
+    name: error?.name || 'Error',
+    code: error?.code || null,
+  });
+}
 
 function serializeRuntimeDocument(document) {
   if (!document) {
@@ -108,7 +121,7 @@ function buildPolicyReadFilter(req, policy, filter) {
 router.use(validateRuntimeProject);
 router.use(runtimeRateLimit);
 
-router.post('/auth/register', async (req, res) => {
+router.post('/auth/register', runtimeAuthRateLimit, async (req, res) => {
   try {
     const email = normalizeRuntimeEmail(req.body?.email);
     const password = req.body?.password;
@@ -118,12 +131,20 @@ router.post('/auth/register', async (req, res) => {
       return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_EMAIL', 'Invalid email.');
     }
 
-    if (typeof password !== 'string' || password.length < 6) {
-      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_PASSWORD', 'Password must be at least 6 characters.');
+    if (
+      typeof password !== 'string'
+      || password.length < 6
+      || Buffer.byteLength(password, 'utf8') > MAX_RUNTIME_PASSWORD_BYTES
+    ) {
+      return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_PASSWORD', 'Password must be 6 to 72 bytes.');
     }
 
     if (!role) {
       return runtimeError(res, 400, 'RUNTIME_AUTH_INVALID_ROLE', 'Invalid runtime user role.');
+    }
+
+    if (role === 'seller') {
+      return runtimeError(res, 403, 'RUNTIME_AUTH_ROLE_FORBIDDEN', 'Privileged roles cannot be self-assigned.');
     }
 
     const existingUser = await runtimeFindOne(req.runtimeProjectId, RUNTIME_USER_COLLECTION, {
@@ -147,12 +168,12 @@ router.post('/auth/register', async (req, res) => {
       token: signRuntimeAuthToken(user),
     });
   } catch (error) {
-    console.error('Runtime auth register failed:', error);
+    logRuntimeError('Runtime auth register failed.', error);
     return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime auth request failed.');
   }
 });
 
-router.post('/auth/login', async (req, res) => {
+router.post('/auth/login', runtimeAuthRateLimit, async (req, res) => {
   try {
     const email = normalizeRuntimeEmail(req.body?.email);
     const password = req.body?.password;
@@ -180,7 +201,7 @@ router.post('/auth/login', async (req, res) => {
       token: signRuntimeAuthToken(user),
     });
   } catch (error) {
-    console.error('Runtime auth login failed:', error);
+    logRuntimeError('Runtime auth login failed.', error);
     return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime auth request failed.');
   }
 });
@@ -222,7 +243,7 @@ router.get('/collections/:collection', validateRuntimeCollection, optionalRuntim
       },
     });
   } catch (error) {
-    console.error('Runtime collection query failed:', error);
+    logRuntimeError('Runtime collection query failed.', error);
     return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
   }
 });
@@ -254,7 +275,7 @@ router.get(
 
       return res.json({ data: serializeRuntimeDocument(document) });
     } catch (error) {
-      console.error('Runtime document lookup failed:', error);
+      logRuntimeError('Runtime document lookup failed.', error);
       return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
     }
   }
@@ -277,7 +298,7 @@ router.post('/collections/:collection', validateRuntimeCollection, optionalRunti
     const document = await runtimeCreate(req.runtimeProjectId, req.runtimeCollection, req.body, createOptions);
     return res.status(201).json({ data: serializeRuntimeDocument(document) });
   } catch (error) {
-    console.error('Runtime document create failed:', error);
+    logRuntimeError('Runtime document create failed.', error);
     return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
   }
 });
@@ -317,7 +338,7 @@ router.patch(
 
       return res.json({ data: serializeRuntimeDocument(document) });
     } catch (error) {
-      console.error('Runtime document update failed:', error);
+      logRuntimeError('Runtime document update failed.', error);
       return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
     }
   }
@@ -354,7 +375,7 @@ router.delete(
 
       return res.json({ data: serializeRuntimeDocument(document) });
     } catch (error) {
-      console.error('Runtime document delete failed:', error);
+      logRuntimeError('Runtime document delete failed.', error);
       return runtimeError(res, 500, 'RUNTIME_INTERNAL_ERROR', 'Runtime request failed.');
     }
   }

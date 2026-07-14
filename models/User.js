@@ -231,6 +231,12 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
 
+    deletedIdentityHashes: {
+      type: [String],
+      default: [],
+      select: false,
+    },
+
     deletionReason: {
       type: String,
       trim: true,
@@ -239,5 +245,7 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+userSchema.index({ deletedAt: 1, deletedIdentityHashes: 1 });
 
 module.exports = mongoose.model('User', userSchema);

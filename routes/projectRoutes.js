@@ -36,6 +36,8 @@ const {
   getUniqueProjectTitleForUser,
   normalizeAppName,
 } = require('../utils/projectNaming');
+const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
+const { deleteProjectsData } = require('../utils/projectDeletion');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -636,11 +638,10 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  if (!value.startsWith('/builds/')) {
-    return value;
-  }
-
-  return new URL(value, `${getBackendBaseUrl(req)}/`).toString();
+  const absoluteValue = value.startsWith('/builds/')
+    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+    : value;
+  return addBuildPreviewToken(absoluteValue);
 }
 
 function withAbsoluteBuildUrls(req, value) {
@@ -1619,7 +1620,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
 
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const project = await Project.findOneAndDelete({
+    const project = await Project.findOne({
       _id: req.params.id,
       userId: req.userId,
     });
@@ -1627,6 +1628,8 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
+
+    await deleteProjectsData([project._id]);
 
     return res.json({
       message: 'Projeto excluído com sucesso.',

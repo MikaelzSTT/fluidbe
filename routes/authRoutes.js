@@ -25,6 +25,7 @@ const {
   verifyTotpCode,
 } = require('../utils/twoFactor');
 const { createRateLimit } = require('../middleware/rateLimit');
+const { deleteProjectsData } = require('../utils/projectDeletion');
 
 const router = express.Router();
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
@@ -35,7 +36,10 @@ const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 const GITHUB_USER_URL = 'https://api.github.com/user';
 const GITHUB_EMAILS_URL = 'https://api.github.com/user/emails';
 const GITHUB_STATE_TTL_SECONDS = 10 * 60;
+const GOOGLE_STATE_TTL_SECONDS = 10 * 60;
 const DEFAULT_OAUTH_REDIRECT_PATH = '/projects.html';
+const OAUTH_STATE_COOKIE_PREFIX = 'fluid_oauth_state_';
+const MAX_PASSWORD_BYTES = 72;
 const passwordChangeRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -125,6 +129,59 @@ function normalizeFrontendRedirectPath(value) {
   }
 }
 
+function parseCookieHeader(req) {
+  const cookies = {};
+  const header = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+
+  header.split(';').forEach((part) => {
+    const separator = part.indexOf('=');
+    if (separator < 1) return;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!name) return;
+    try {
+      cookies[name] = decodeURIComponent(value);
+    } catch (error) {
+      cookies[name] = '';
+    }
+  });
+
+  return cookies;
+}
+
+function oauthStateCookieName(provider) {
+  return `${OAUTH_STATE_COOKIE_PREFIX}${provider}`;
+}
+
+function setOAuthStateCookie(res, provider, state, maxAge) {
+  res.cookie(oauthStateCookieName(provider), state, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: `/api/auth/${provider}/callback`,
+    maxAge,
+  });
+}
+
+function consumeOAuthStateCookie(req, res, provider, presentedState) {
+  const cookieName = oauthStateCookieName(provider);
+  const expectedState = parseCookieHeader(req)[cookieName] || '';
+  res.clearCookie(cookieName, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: `/api/auth/${provider}/callback`,
+  });
+
+  if (!expectedState || typeof presentedState !== 'string' || !presentedState) {
+    return false;
+  }
+
+  const expected = Buffer.from(expectedState);
+  const presented = Buffer.from(presentedState);
+  return expected.length === presented.length && crypto.timingSafeEqual(expected, presented);
+}
+
 function createGitHubOAuthState(redirectPath) {
   const now = Math.floor(Date.now() / 1000);
 
@@ -156,6 +213,38 @@ function verifyGitHubOAuthState(state) {
       typeof decoded.expiresAt !== 'number' ||
       decoded.expiresAt < Math.floor(Date.now() / 1000)
     ) {
+      return null;
+    }
+
+    return {
+      redirect: normalizeFrontendRedirectPath(decoded.redirect),
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function createGoogleOAuthState(redirectPath) {
+  return jwt.sign(
+    {
+      purpose: 'google_oauth_state',
+      nonce: crypto.randomBytes(16).toString('hex'),
+      redirect: normalizeFrontendRedirectPath(redirectPath),
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: GOOGLE_STATE_TTL_SECONDS }
+  );
+}
+
+function verifyGoogleOAuthState(state) {
+  if (typeof state !== 'string' || !state) {
+    return null;
+  }
+
+  try {
+    const decoded = jwt.verify(state, process.env.JWT_SECRET);
+
+    if (decoded?.purpose !== 'google_oauth_state' || typeof decoded.nonce !== 'string') {
       return null;
     }
 
@@ -599,6 +688,24 @@ function getDeletedEmail(userId) {
   return `deleted-user-${String(userId)}@deleted.askfluid.local`;
 }
 
+function hashDeletedIdentity(type, value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  const secret = process.env.DELETION_IDENTITY_SECRET || process.env.JWT_SECRET;
+  if (!normalized || !secret) return '';
+  return crypto.createHmac('sha256', secret).update(`${type}:${normalized}`).digest('base64url');
+}
+
+async function deletedIdentityExists(identities) {
+  const hashes = identities
+    .map(({ type, value }) => hashDeletedIdentity(type, value))
+    .filter(Boolean);
+  if (!hashes.length) return false;
+  return Boolean(await User.exists({
+    deletedAt: { $ne: null },
+    deletedIdentityHashes: { $in: hashes },
+  }));
+}
+
 async function countUserProjects(userId) {
   const [published, active] = await Promise.all([
     Project.countDocuments({
@@ -796,12 +903,18 @@ router.get('/google', (req, res) => {
   }
 
   const authUrl = new URL(GOOGLE_AUTH_URL);
+  const redirectPath = typeof req.query.redirect === 'string'
+    ? req.query.redirect
+    : DEFAULT_OAUTH_REDIRECT_PATH;
   authUrl.searchParams.set('client_id', config.clientId);
   authUrl.searchParams.set('redirect_uri', config.callbackUrl);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('scope', 'openid email profile');
   authUrl.searchParams.set('access_type', 'online');
   authUrl.searchParams.set('prompt', 'select_account');
+  const state = createGoogleOAuthState(redirectPath);
+  authUrl.searchParams.set('state', state);
+  setOAuthStateCookie(res, 'google', state, GOOGLE_STATE_TTL_SECONDS * 1000);
 
   return res.redirect(authUrl.toString());
 });
@@ -822,6 +935,7 @@ router.get('/github', (req, res) => {
   authUrl.searchParams.set('redirect_uri', config.callbackUrl);
   authUrl.searchParams.set('scope', 'read:user user:email');
   authUrl.searchParams.set('state', state);
+  setOAuthStateCookie(res, 'github', state, GITHUB_STATE_TTL_SECONDS * 1000);
 
   return res.redirect(authUrl.toString());
 });
@@ -964,6 +1078,8 @@ router.post('/me/2fa/enable', authMiddleware, twoFactorEnableRateLimit, async (r
     const recoveryCodes = generateRecoveryCodes(8);
     const hashedRecoveryCodes = await hashRecoveryCodes(recoveryCodes);
     const now = new Date();
+    const ownedProjects = await Project.find({ userId: user._id }).select('_id').lean();
+    const projectIds = ownedProjects.map((project) => project._id);
 
     user.twoFactor = {
       enabled: true,
@@ -1088,6 +1204,10 @@ router.patch('/me/password', authMiddleware, passwordChangeRateLimit, async (req
 
     if (newPassword.length < 8) {
       return res.status(400).json({ message: 'PASSWORD_TOO_SHORT' });
+    }
+
+    if (Buffer.byteLength(newPassword, 'utf8') > MAX_PASSWORD_BYTES) {
+      return res.status(400).json({ message: 'PASSWORD_TOO_LONG' });
     }
 
     const user = await User.findById(req.userId);
@@ -1245,6 +1365,11 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
     const now = new Date();
 
     user.deletedAt = now;
+    user.deletedIdentityHashes = [
+      hashDeletedIdentity('email', user.email),
+      hashDeletedIdentity('google', user.googleId),
+      hashDeletedIdentity('github', user.githubId),
+    ].filter(Boolean);
     user.deletionReason = typeof body.deletionReason === 'string'
       ? body.deletionReason.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 280)
       : undefined;
@@ -1298,17 +1423,7 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
           },
         }
       ),
-      Project.updateMany(
-        { userId: user._id },
-        {
-          $set: {
-            ownerDeleted: true,
-            accountDeleted: true,
-            ownerDeletedAt: now,
-            accountDeletedAt: now,
-          },
-        }
-      ),
+      deleteProjectsData(projectIds),
     ]);
 
     return res.json({
@@ -1566,8 +1681,11 @@ router.get('/google/callback', async (req, res) => {
   try {
     const config = getGoogleOAuthConfig();
     const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const stateMatchesBrowser = consumeOAuthStateCookie(req, res, 'google', state);
+    const statePayload = stateMatchesBrowser ? verifyGoogleOAuthState(state) : null;
 
-    if (!hasGoogleOAuthConfig(config) || !code) {
+    if (!hasGoogleOAuthConfig(config) || !code || !statePayload) {
       return redirectToOAuthError(res);
     }
 
@@ -1584,10 +1702,25 @@ router.get('/google/callback', async (req, res) => {
       return redirectToOAuthError(res);
     }
 
+    if (await deletedIdentityExists([
+      { type: 'email', value: profile.email },
+      { type: 'google', value: profile.googleId },
+    ])) {
+      return redirectToOAuthError(res);
+    }
+
     let user = await User.findOne({ googleId: profile.googleId });
+
+    if (user?.deletedAt) {
+      return redirectToOAuthError(res);
+    }
 
     if (!user) {
       user = await User.findOne({ email: profile.email });
+
+      if (user?.deletedAt) {
+        return redirectToOAuthError(res);
+      }
     }
 
     if (user) {
@@ -1614,7 +1747,7 @@ router.get('/google/callback', async (req, res) => {
     const token = await createAuthToken(user, req);
     const serializedUser = serializeUser(user);
 
-    return redirectToOAuthSuccess(res, token, serializedUser);
+    return redirectToOAuthSuccess(res, token, serializedUser, statePayload.redirect);
   } catch (error) {
     return redirectToOAuthError(res);
   }
@@ -1632,7 +1765,8 @@ router.get('/github/callback', async (req, res) => {
       return redirectToOAuthCodeError(res, 'GITHUB_OAUTH_NOT_CONFIGURED');
     }
 
-    statePayload = verifyGitHubOAuthState(state);
+    const stateMatchesBrowser = consumeOAuthStateCookie(req, res, 'github', state);
+    statePayload = stateMatchesBrowser ? verifyGitHubOAuthState(state) : null;
 
     if (!statePayload) {
       return redirectToOAuthCodeError(res, 'GITHUB_STATE_INVALID');
@@ -1651,6 +1785,13 @@ router.get('/github/callback', async (req, res) => {
 
     if (!profile) {
       return redirectToOAuthCodeError(res, 'GITHUB_EMAIL_REQUIRED');
+    }
+
+    if (await deletedIdentityExists([
+      { type: 'email', value: profile.email },
+      { type: 'github', value: profile.githubId },
+    ])) {
+      return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
     }
 
     let user = await User.findOne({ githubId: profile.githubId });
@@ -1742,9 +1883,13 @@ router.post('/register', async (req, res) => {
       });
     }
 
+    if (Buffer.byteLength(password, 'utf8') > MAX_PASSWORD_BYTES) {
+      return res.status(400).json({ message: 'A senha excede o limite seguro.' });
+    }
+
     const userExists = await User.findOne({ email: normalizedEmail });
 
-    if (userExists) {
+    if (userExists || await deletedIdentityExists([{ type: 'email', value: normalizedEmail }])) {
       return res.status(400).json({ message: 'Este e-mail já está cadastrado.' });
     }
 

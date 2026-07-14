@@ -28,8 +28,9 @@ const {
   findReactViteRoot,
   fixDistIndexAssetPaths,
   formatConnectorInjectionLog,
+  publishValidatedDist,
   redactBuildLogs,
-  runNpmCommand,
+  runReactViteInstall,
   runReactViteBuild,
   validateReactViteProject,
 } = reactViteBuildHelpers;
@@ -159,10 +160,7 @@ async function runBuildPipeline(job, workspace) {
     }
 
     try {
-      const installEnv = { NODE_ENV: 'development', NPM_CONFIG_PRODUCTION: 'false' };
-      logs += `${await runNpmCommand(['install', '--include=dev'], appRoot, { env: installEnv })}\n`;
-      logs += `${await runNpmCommand(['install', 'react', 'react-dom'], appRoot, { env: installEnv })}\n`;
-      logs += `${await runNpmCommand(['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'], appRoot, { env: installEnv })}\n`;
+      logs += `${await runReactViteInstall(appRoot)}\n`;
       for (const fixedPath of await applyTsconfigDeprecationFix(appRoot)) {
         logs += `Auto-fix TS5107 aplicado em: ${fixedPath}\n`;
       }
@@ -176,8 +174,10 @@ async function runBuildPipeline(job, workspace) {
 
     const distDir = path.join(appRoot, 'dist');
     if (!(await pathExists(distDir))) throw new Error('Build concluído sem gerar a pasta dist.');
+    await reactViteBuildHelpers.validateDistDirectory(distDir);
     if (await fixDistIndexAssetPaths(distDir)) {
       logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
+      await reactViteBuildHelpers.validateDistDirectory(distDir);
     }
 
     const fullHtml = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
@@ -194,8 +194,7 @@ async function runBuildPipeline(job, workspace) {
     const previewUrl = buildPreviewUrl(job.projectId, job._id);
     reserveVisualPreviewContext(previewUrl);
     publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(job.projectId), String(job._id));
-    await fs.mkdir(publicBuildDir, { recursive: true });
-    await fs.cp(distDir, publicBuildDir, { recursive: true });
+    await publishValidatedDist(distDir, publicBuildDir);
 
     const build = await ProjectBuild.findOneAndUpdate(
       { _id: job.projectBuildId, projectId: job.projectId },
@@ -298,7 +297,10 @@ async function processOneJob() {
     await runBuildPipeline(job, workspace);
     console.log(`[react-vite-worker] job ${job._id} succeeded`);
   } catch (error) {
-    console.error(`[react-vite-worker] job ${job._id} failed: ${error.message}`);
+    console.error(`[react-vite-worker] job ${job._id} failed`, {
+      name: error?.name || 'Error',
+      code: error?.code || null,
+    });
   }
   return true;
 }
@@ -327,7 +329,10 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 main().catch(async (error) => {
-  console.error(`[react-vite-worker] fatal: ${error.message}`);
+  console.error('[react-vite-worker] fatal', {
+    name: error?.name || 'Error',
+    code: error?.code || null,
+  });
   await mongoose.disconnect().catch(() => {});
   process.exit(1);
 });

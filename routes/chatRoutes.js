@@ -21,6 +21,8 @@ const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-5';
 const DEFAULT_VISION_MODEL = 'gpt-5.6';
 const VISUAL_CONTEXT_ENABLED = String(process.env.VISUAL_CONTEXT_ENABLED || 'false').toLowerCase() === 'true';
 const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_CHAT_FIELD_BYTES = 256 * 1024;
+const MAX_CHAT_MESSAGE_CHARS = 20_000;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const MAX_CODE_CONTEXT_SUMMARY_CHARS = 1200;
 const MAX_CODE_CONTEXT_FILES = 8;
@@ -45,6 +47,9 @@ const imageUpload = multer({
   limits: {
     fileSize: MAX_IMAGE_UPLOAD_BYTES,
     files: 1,
+    fields: 8,
+    parts: 10,
+    fieldSize: MAX_CHAT_FIELD_BYTES,
   },
   fileFilter: (req, file, callback) => {
     if (!ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
@@ -225,9 +230,30 @@ function buildImageAttachment(file) {
     throw error;
   }
 
+  const isJpeg = file.mimetype === 'image/jpeg' && file.buffer.length >= 3
+    && file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff;
+  const isPng = file.mimetype === 'image/png' && file.buffer.length >= 8
+    && file.buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const isWebp = file.mimetype === 'image/webp' && file.buffer.length >= 12
+    && file.buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && file.buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+
+  if (!isJpeg && !isPng && !isWebp) {
+    const error = new Error('Image content does not match its declared type.');
+    error.code = 'INVALID_IMAGE_TYPE';
+    throw error;
+  }
+
+  const safeName = String(file.originalname || 'image')
+    .replace(/\\/g, '/')
+    .split('/')
+    .pop()
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .slice(0, 180) || 'image';
+
   return {
     buffer: file.buffer,
-    name: String(file.originalname || 'image').slice(0, 180),
+    name: safeName,
     type: file.mimetype,
     size: file.size || file.buffer.length,
   };
@@ -309,6 +335,13 @@ function parseChatUpload(req, res, next) {
       return res.status(400).json({
         code: 'INVALID_IMAGE_UPLOAD',
         message: 'Send one image using PNG, JPEG, or WebP.',
+      });
+    }
+
+    if (['LIMIT_FIELD_VALUE', 'LIMIT_FIELD_COUNT', 'LIMIT_PART_COUNT'].includes(error.code)) {
+      return res.status(413).json({
+        code: 'CHAT_REQUEST_TOO_LARGE',
+        message: 'Chat request exceeds the allowed size.',
       });
     }
 
@@ -1421,6 +1454,10 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
     }
 
+    if (message.length > MAX_CHAT_MESSAGE_CHARS) {
+      return res.status(413).json({ code: 'CHAT_MESSAGE_TOO_LARGE', message: 'Mensagem muito longa.' });
+    }
+
     const questions = await getClarificationQuestions({
       message: message.trim(),
       history: history || messages,
@@ -1457,6 +1494,10 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     let userMessage = null;
     let changeRequest = null;
     const trimmedMessage = rawMessage.trim() || getDefaultImagePrompt(req);
+
+    if (rawMessage.length > MAX_CHAT_MESSAGE_CHARS) {
+      return res.status(413).json({ code: 'CHAT_MESSAGE_TOO_LARGE', message: 'Mensagem muito longa.' });
+    }
 
     if (!trimmedMessage) {
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
@@ -1581,8 +1622,6 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       status: responsePayload.status,
       generationStatus: responsePayload.generationStatus,
     });
-    console.info('[chat] final response payload', responsePayload);
-
     return res.json(responsePayload);
   } catch (error) {
     if (error?.code === 'INVALID_IMAGE_TYPE') {

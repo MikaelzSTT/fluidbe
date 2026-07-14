@@ -1,9 +1,11 @@
 const fs = require('fs/promises');
 const path = require('path');
 const mongoose = require('mongoose');
+const { addBuildPreviewToken } = require('./buildPreviewAccess');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const BuildJob = require('../models/BuildJob');
+const { isProjectBuildExplicitlyPublished } = require('./buildPublicationAccess');
 const {
   generateFallbackAppName,
   normalizeAppName,
@@ -44,11 +46,10 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  if (!value.startsWith('/builds/')) {
-    return value;
-  }
-
-  return new URL(value, `${getBackendBaseUrl(req)}/`).toString();
+  const absoluteValue = value.startsWith('/builds/')
+    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+    : value;
+  return addBuildPreviewToken(absoluteValue);
 }
 
 function withAbsoluteBuildUrls(req, document) {
@@ -580,9 +581,7 @@ function scanBuildSecurity(projectBuild) {
 
 async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publishMetadataUpdate = buildPublishMetadataUpdate(body);
-  const isLatestPublishedBuild = idsEqual(project.latestPublishedBuildId, projectBuild._id);
-  const isAlreadyPublishedBuild =
-    project.isPublished === true && (isLatestPublishedBuild || projectBuild.status === 'done');
+  const isAlreadyPublishedBuild = isProjectBuildExplicitlyPublished(project, projectBuild);
 
   if (isAlreadyPublishedBuild) {
     const hasMetadataUpdate = Object.keys(publishMetadataUpdate).length > 0;

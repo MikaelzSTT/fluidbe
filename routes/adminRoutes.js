@@ -1,8 +1,7 @@
 const express = require('express');
 const fsSync = require('fs');
 const fs = require('fs/promises');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
+const { spawn } = require('child_process');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
@@ -15,6 +14,7 @@ const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
+const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
@@ -34,7 +34,6 @@ const {
 } = require('../utils/projectPublication');
 
 const router = express.Router();
-const execFileAsync = promisify(execFile);
 const reactViteUploadRateLimit = createRateLimit({
   windowMs: 60 * 60 * 1000,
   max: 3,
@@ -55,6 +54,21 @@ const MAX_MONGO_SOURCE_BYTES = Number(process.env.MAX_MONGO_SOURCE_BYTES || 3 * 
 const MAX_PROJECT_FILE_CONTENT_BYTES = Number(process.env.MAX_PROJECT_FILE_CONTENT_BYTES || 512 * 1024);
 const MAX_PROJECT_FILE_TREE_ENTRIES = Number(process.env.MAX_PROJECT_FILE_TREE_ENTRIES || 5000);
 const BUILD_WORKER_ENABLED = process.env.BUILD_WORKER_ENABLED === 'true';
+const BUILD_COMMAND_TIMEOUT_MS = Number(process.env.BUILD_COMMAND_TIMEOUT_MS || 5 * 60 * 1000);
+const BUILD_COMMAND_KILL_GRACE_MS = Number(process.env.BUILD_COMMAND_KILL_GRACE_MS || 2000);
+const BUILD_COMMAND_MAX_BUFFER = Number(process.env.BUILD_COMMAND_MAX_BUFFER || 20 * 1024 * 1024);
+const MAX_DIST_FILE_BYTES = Number(process.env.MAX_REACT_VITE_DIST_FILE_BYTES || 10 * 1024 * 1024);
+const MAX_DIST_TOTAL_BYTES = Number(process.env.MAX_REACT_VITE_DIST_TOTAL_BYTES || 50 * 1024 * 1024);
+const MAX_DIST_FILES = Number(process.env.MAX_REACT_VITE_DIST_FILES || 1000);
+const REACT_VITE_RUNTIME_PACKAGES = (process.env.REACT_VITE_RUNTIME_PACKAGES || 'react@18.3.1 react-dom@18.3.1')
+  .split(/\s+/)
+  .filter(Boolean);
+const REACT_VITE_DEV_PACKAGES = (
+  process.env.REACT_VITE_DEV_PACKAGES ||
+  'vite@5.4.11 @vitejs/plugin-react@4.3.4 typescript@5.6.3 @types/react@18.3.12 @types/react-dom@18.3.1'
+)
+  .split(/\s+/)
+  .filter(Boolean);
 const SECURITY_SCAN_MAX_FINDINGS = 50;
 const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
 
@@ -109,6 +123,7 @@ const SOURCE_SNAPSHOT_IGNORED_DIRS = new Set([
 const SUBPROCESS_ENV_ALLOWLIST = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TEMP', 'TMP', 'NODE_ENV', 'CI',
   'NPM_CONFIG_CACHE', 'npm_config_cache', 'NPM_CONFIG_PRODUCTION', 'npm_config_production',
+  'NPM_CONFIG_IGNORE_SCRIPTS', 'npm_config_ignore_scripts',
 ]);
 const SENSITIVE_ENV_NAME_PATTERN =
   /(SECRET|TOKEN|PASSWORD|PASS|PRIVATE|KEY|CREDENTIAL|MONGODB|MONGO|DATABASE_URL|DB_URL|OPENAI|STRIPE|JWT|CONNECTOR|RESEND|TWILIO|SHOPIFY|AUTH)/i;
@@ -184,11 +199,10 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  if (!value.startsWith('/builds/')) {
-    return value;
-  }
-
-  return new URL(value, `${getBackendBaseUrl(req)}/`).toString();
+  const absoluteValue = value.startsWith('/builds/')
+    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+    : value;
+  return addBuildPreviewToken(absoluteValue);
 }
 
 function withAbsoluteBuildUrls(req, document) {
@@ -907,6 +921,169 @@ async function collectBuildArtifactFiles(distDir) {
     totalBytes,
     skippedFiles: Math.max(candidates.length - files.length, 0),
   };
+}
+
+async function validateDistDirectory(distDir, options = {}) {
+  const distRoot = path.resolve(distDir);
+  const maxFileBytes = Number(options.maxFileBytes || MAX_DIST_FILE_BYTES);
+  const maxTotalBytes = Number(options.maxTotalBytes || MAX_DIST_TOTAL_BYTES);
+  const maxFiles = Number(options.maxFiles || MAX_DIST_FILES);
+  const files = [];
+  let totalBytes = 0;
+
+  const indexPath = path.join(distRoot, 'index.html');
+  let indexStats;
+
+  try {
+    indexStats = await fs.lstat(indexPath);
+  } catch (error) {
+    throw new Error('Build inválido: dist/index.html é obrigatório.');
+  }
+
+  if (!indexStats.isFile() || indexStats.nlink > 1) {
+    throw new Error('Build inválido: dist/index.html precisa ser um arquivo regular.');
+  }
+
+  async function discover(currentDir) {
+    const resolvedCurrentDir = path.resolve(currentDir);
+
+    if (resolvedCurrentDir !== distRoot && !resolvedCurrentDir.startsWith(`${distRoot}${path.sep}`)) {
+      throw new Error('Build inválido: caminho fora de dist.');
+    }
+
+    const entries = await fs.readdir(resolvedCurrentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const absolutePath = path.resolve(resolvedCurrentDir, entry.name);
+
+      if (absolutePath !== distRoot && !absolutePath.startsWith(`${distRoot}${path.sep}`)) {
+        throw new Error('Build inválido: caminho fora de dist.');
+      }
+
+      const stats = await fs.lstat(absolutePath);
+
+      if (stats.isSymbolicLink() || stats.isSocket() || stats.isFIFO() || stats.isBlockDevice() || stats.isCharacterDevice()) {
+        throw new Error('Build inválido: dist contém symlink, socket, FIFO ou device.');
+      }
+
+      if (stats.isDirectory()) {
+        await discover(absolutePath);
+        continue;
+      }
+
+      if (!stats.isFile()) {
+        throw new Error('Build inválido: dist contém entrada não regular.');
+      }
+
+      if (stats.nlink > 1) {
+        throw new Error('Build inválido: dist contém hardlink.');
+      }
+
+      if (stats.size > maxFileBytes) {
+        throw new Error(`Build inválido: arquivo excede ${maxFileBytes} bytes.`);
+      }
+
+      if (files.length + 1 > maxFiles) {
+        throw new Error(`Build inválido: dist excede ${maxFiles} arquivos.`);
+      }
+
+      if (totalBytes + stats.size > maxTotalBytes) {
+        throw new Error(`Build inválido: dist excede ${maxTotalBytes} bytes.`);
+      }
+
+      totalBytes += stats.size;
+      files.push({
+        absolutePath,
+        relativePath: path.relative(distRoot, absolutePath).split(path.sep).join('/'),
+        size: stats.size,
+      });
+    }
+  }
+
+  await discover(distRoot);
+
+  return {
+    distRoot,
+    files,
+    totalBytes,
+  };
+}
+
+async function copyValidatedDistFiles(validation, stagingDir) {
+  const stagingRoot = path.resolve(stagingDir);
+
+  await fs.mkdir(stagingRoot, { recursive: true });
+
+  for (const file of validation.files) {
+    const destinationPath = path.resolve(stagingRoot, file.relativePath);
+
+    if (destinationPath === stagingRoot || !destinationPath.startsWith(`${stagingRoot}${path.sep}`)) {
+      throw new Error('Build inválido: caminho de publicação fora do staging.');
+    }
+
+    const sourceStats = await fs.lstat(file.absolutePath);
+
+    if (!sourceStats.isFile() || sourceStats.isSymbolicLink() || sourceStats.nlink > 1) {
+      throw new Error('Build inválido: arquivo dist mudou antes da publicação.');
+    }
+
+    await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+
+    const flags = fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW || 0);
+    const source = await fs.open(file.absolutePath, flags);
+    try {
+      const currentStats = await source.stat();
+      if (
+        !currentStats.isFile() ||
+        currentStats.nlink > 1 ||
+        currentStats.size !== file.size ||
+        currentStats.size > MAX_DIST_FILE_BYTES
+      ) {
+        throw new Error('Build inválido: arquivo dist mudou antes da publicação.');
+      }
+      const content = await source.readFile();
+      await fs.writeFile(destinationPath, content, { mode: 0o600 });
+    } finally {
+      await source.close();
+    }
+  }
+}
+
+async function publishValidatedDist(distDir, finalDir) {
+  const finalPath = path.resolve(finalDir);
+  const stagingPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  const backupPath = `${finalPath}.bak-${process.pid}-${Date.now()}`;
+  let backupCreated = false;
+
+  try {
+    const validation = await validateDistDirectory(distDir);
+    await fs.rm(stagingPath, { recursive: true, force: true });
+    await fs.rm(backupPath, { recursive: true, force: true });
+    await copyValidatedDistFiles(validation, stagingPath);
+    await fs.mkdir(path.dirname(finalPath), { recursive: true });
+    try {
+      await fs.rename(finalPath, backupPath);
+      backupCreated = true;
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    await fs.rename(stagingPath, finalPath);
+    if (backupCreated) {
+      await fs.rm(backupPath, { recursive: true, force: true });
+      backupCreated = false;
+    }
+    return validation;
+  } catch (error) {
+    await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => {});
+    if (backupCreated) {
+      await fs.rm(finalPath, { recursive: true, force: true }).catch(() => {});
+      await fs.rename(backupPath, finalPath).catch(() => {});
+    }
+    await fs.rm(backupPath, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function collectProjectSourceFiles(sourceDir) {
@@ -1651,9 +1828,7 @@ async function validateReactViteProject(appRoot) {
 async function runNpmCommand(args, cwd, options = {}) {
   const redactionValues = getCommandRedactionValues(options);
   try {
-    const result = await execFileAsync('npm', args, {
-      cwd, env: buildSubprocessEnv(options), maxBuffer: 20 * 1024 * 1024, timeout: 15 * 60 * 1000,
-    });
+    const result = await runFileCommand('npm', args, cwd, options);
     return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
     throw new Error(formatBuildCommandFailure('npm', args, error, redactionValues));
@@ -1662,13 +1837,38 @@ async function runNpmCommand(args, cwd, options = {}) {
 
 async function runNpxCommand(args, cwd, options = {}) {
   const redactionValues = getCommandRedactionValues(options);
+  const message = 'npx remoto está desabilitado para builds React/Vite; use binários locais em node_modules/.bin.';
+  if (options.throwDisabledError !== false) {
+    throw new Error(redactBuildLogs(`[command disabled: npx ${args.join(' ')}] ${message}`, redactionValues));
+  }
+}
+
+async function runLocalBinCommand(binName, args, cwd, options = {}) {
+  const redactionValues = getCommandRedactionValues(options);
+  const binPath = path.join(cwd, 'node_modules', '.bin', process.platform === 'win32' ? `${binName}.cmd` : binName);
+  const resolvedBinPath = path.resolve(binPath);
+  const resolvedNodeModulesBin = path.resolve(cwd, 'node_modules', '.bin');
+
+  if (resolvedBinPath !== resolvedNodeModulesBin && !resolvedBinPath.startsWith(`${resolvedNodeModulesBin}${path.sep}`)) {
+    throw new Error(`Binário local inválido: ${binName}`);
+  }
+
   try {
-    const result = await execFileAsync('npx', args, {
-      cwd, env: buildSubprocessEnv(options), maxBuffer: 20 * 1024 * 1024, timeout: 15 * 60 * 1000,
-    });
+    const stats = await fs.lstat(resolvedBinPath);
+    if (!stats.isFile() && !stats.isSymbolicLink()) {
+      throw new Error(`Binário local não executável: ${binName}`);
+    }
+    const realBinPath = await fs.realpath(resolvedBinPath);
+    const realNodeModules = await fs.realpath(path.resolve(cwd, 'node_modules'));
+
+    if (realBinPath !== realNodeModules && !realBinPath.startsWith(`${realNodeModules}${path.sep}`)) {
+      throw new Error(`Binário local aponta para fora de node_modules: ${binName}`);
+    }
+
+    const result = await runFileCommand(realBinPath, args, cwd, options);
     return redactBuildLogs([result.stdout, result.stderr].filter(Boolean).join('\n'), redactionValues);
   } catch (error) {
-    throw new Error(formatBuildCommandFailure('npx', args, error, redactionValues));
+    throw new Error(formatBuildCommandFailure(resolvedBinPath, args, error, redactionValues));
   }
 }
 
@@ -1694,6 +1894,131 @@ function formatBuildCommandFailure(command, args, error, redactionValues = []) {
   ].filter(Boolean).join('\n'), redactionValues);
 }
 
+function terminateBuildProcess(child) {
+  if (!child || child.killed) {
+    return;
+  }
+
+  try {
+    if (process.platform !== 'win32' && child.pid) {
+      process.kill(-child.pid, 'SIGTERM');
+    } else {
+      child.kill('SIGTERM');
+    }
+  } catch (error) {
+    // The process may have exited between timeout and termination.
+  }
+
+  setTimeout(() => {
+    try {
+      if (process.platform !== 'win32' && child.pid) {
+        process.kill(-child.pid, 'SIGKILL');
+      } else {
+        child.kill('SIGKILL');
+      }
+    } catch (error) {
+      // Best-effort hard kill after the grace period.
+    }
+  }, BUILD_COMMAND_KILL_GRACE_MS).unref();
+}
+
+function runFileCommand(command, args, cwd, options = {}) {
+  const timeoutMs = options.timeoutMs || BUILD_COMMAND_TIMEOUT_MS;
+  const maxBuffer = options.maxBuffer || BUILD_COMMAND_MAX_BUFFER;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: buildSubprocessEnv(options),
+      detached: process.platform !== 'win32',
+      shell: false,
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timedOut = false;
+    let bufferExceeded = false;
+
+    const settle = (error, result) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+
+      if (error) {
+        error.stdout = Buffer.concat(stdout, stdoutBytes).toString('utf8');
+        error.stderr = Buffer.concat(stderr, stderrBytes).toString('utf8');
+        reject(error);
+        return;
+      }
+
+      resolve(result);
+    };
+
+    const appendOutput = (chunks, currentBytes, chunk) => {
+      const nextBytes = currentBytes + chunk.length;
+
+      if (nextBytes > maxBuffer) {
+        bufferExceeded = true;
+        const error = new Error(`Command output exceeded ${maxBuffer} bytes.`);
+        error.code = null;
+        terminateBuildProcess(child);
+        settle(error);
+        return currentBytes;
+      }
+
+      chunks.push(chunk);
+      return nextBytes;
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      const error = new Error(`Command timed out after ${timeoutMs}ms.`);
+      error.code = null;
+      terminateBuildProcess(child);
+      settle(error);
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      if (!settled) {
+        stdoutBytes = appendOutput(stdout, stdoutBytes, chunk);
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      if (!settled) {
+        stderrBytes = appendOutput(stderr, stderrBytes, chunk);
+      }
+    });
+    child.on('error', (error) => {
+      settle(error);
+    });
+    child.on('close', (code, signal) => {
+      if (settled && (timedOut || bufferExceeded)) {
+        return;
+      }
+
+      const result = {
+        stdout: Buffer.concat(stdout, stdoutBytes).toString('utf8'),
+        stderr: Buffer.concat(stderr, stderrBytes).toString('utf8'),
+      };
+
+      if (code === 0) {
+        settle(null, result);
+        return;
+      }
+
+      const error = new Error(signal ? `Command terminated by ${signal}.` : `Command exited with code ${code}.`);
+      error.code = Number.isInteger(code) ? code : null;
+      settle(error);
+    });
+  });
+}
+
 function buildSubprocessEnv(options = {}) {
   const env = {};
   SUBPROCESS_ENV_ALLOWLIST.forEach((name) => {
@@ -1706,6 +2031,7 @@ function buildSubprocessEnv(options = {}) {
     if (/^VITE_[A-Za-z0-9_]+$/.test(name) && value != null) env[name] = String(value);
   });
   env.CI = 'true';
+  env.NPM_CONFIG_IGNORE_SCRIPTS = 'true';
   return env;
 }
 
@@ -1715,17 +2041,54 @@ function getCommandRedactionValues(options = {}) {
 
 async function runReactViteBuild(appRoot, options = {}) {
   const packageJson = await readPackageJson(appRoot);
+  // Temporary mitigation only: npm run build, vite.config.*, and Vite plugins
+  // still execute project-controlled JavaScript. This does not replace a
+  // container or VM sandbox.
   try {
     return await runNpmCommand(['run', 'build'], appRoot, options);
   } catch (error) {
     if (!buildScriptContainsTscBuild(packageJson) && !looksLikeTypecheckFailure(error.message)) throw error;
-    const fallbackLog = [error.message, 'Fallback aplicado: npx vite build sem typecheck.'].filter(Boolean).join('\n');
+    const fallbackLog = [error.message, 'Fallback aplicado: vite build local sem typecheck.'].filter(Boolean).join('\n');
     try {
-      return [fallbackLog, await runNpxCommand(['vite', 'build'], appRoot, options)].filter(Boolean).join('\n');
+      return [fallbackLog, await runLocalBinCommand('vite', ['build'], appRoot, options)].filter(Boolean).join('\n');
     } catch (fallbackError) {
       throw new Error([fallbackLog, fallbackError.message].filter(Boolean).join('\n'));
     }
   }
+}
+
+async function hasNpmLockfile(appRoot) {
+  return (
+    await pathExists(path.join(appRoot, 'package-lock.json')) ||
+    await pathExists(path.join(appRoot, 'npm-shrinkwrap.json'))
+  );
+}
+
+async function runReactViteInstall(appRoot, options = {}) {
+  const installEnv = {
+    NODE_ENV: 'development',
+    NPM_CONFIG_PRODUCTION: 'false',
+    NPM_CONFIG_IGNORE_SCRIPTS: 'true',
+  };
+  const installOptions = {
+    ...options,
+    env: {
+      ...(options.env || {}),
+      ...installEnv,
+    },
+  };
+  const logs = [];
+
+  if (await hasNpmLockfile(appRoot)) {
+    logs.push(await runNpmCommand(['ci', '--ignore-scripts', '--include=dev'], appRoot, installOptions));
+  } else {
+    logs.push(await runNpmCommand(['install', '--ignore-scripts', '--include=dev'], appRoot, installOptions));
+  }
+
+  logs.push(await runNpmCommand(['install', '--ignore-scripts', ...REACT_VITE_RUNTIME_PACKAGES], appRoot, installOptions));
+  logs.push(await runNpmCommand(['install', '--ignore-scripts', '-D', ...REACT_VITE_DEV_PACKAGES], appRoot, installOptions));
+
+  return logs.filter(Boolean).join('\n');
 }
 
 function stripJsonComments(json) {
@@ -1798,81 +2161,13 @@ async function fixDistIndexAssetPaths(distDir) {
   return false;
 }
 
-async function runLegacyReactViteBuild(req, res, project, buildDir, extractDir) {
-  const timestamp = req.reactViteBuildTimestamp;
-  let logs = '';
-  let temporaryFrontendEnvRedactionValues = [];
-  let connectorInjection = {
-    requiredEnvVars: [], frontendEnvVars: [], backendEnvVars: [], resolvedConnectors: [],
-    unresolvedConnectors: [], injectionPlan: [], blockedEnvVars: [], unresolvedBackendEnvVars: [],
-  };
-
-  try {
-    const appRoot = await findReactViteRoot(extractDir);
-    await validateReactViteProject(appRoot);
-    try {
-      const buildFiles = await collectConnectorInjectionBuildFiles(appRoot);
-      connectorInjection = await resolveProjectConnectorInjection(project._id, buildFiles);
-      logs += `${formatConnectorInjectionLog(connectorInjection)}\n`;
-    } catch (error) {
-      logs += `Connector injection plan unavailable: ${error.message}\n`;
-    }
-
-    const temporaryFrontendEnv = await createTemporaryFrontendEnv({
-      projectId: project._id, projectDir: appRoot, injectionPlan: connectorInjection.injectionPlan,
-    });
-    temporaryFrontendEnvRedactionValues = Object.values(temporaryFrontendEnv.envValues || {});
-    if (temporaryFrontendEnv.injectedEnvVars.length > 0) {
-      logs += `Frontend env vars injected: ${temporaryFrontendEnv.injectedEnvVars.join(', ')}\n`;
-    }
-    try {
-      const installEnv = { NODE_ENV: 'development', NPM_CONFIG_PRODUCTION: 'false' };
-      logs += `${await runNpmCommand(['install', '--include=dev'], appRoot, { env: installEnv })}\n`;
-      logs += `${await runNpmCommand(['install', 'react', 'react-dom'], appRoot, { env: installEnv })}\n`;
-      logs += `${await runNpmCommand(['install', '-D', 'vite', '@vitejs/plugin-react', 'typescript', '@types/react', '@types/react-dom'], appRoot, { env: installEnv })}\n`;
-      for (const fixedPath of await applyTsconfigDeprecationFix(appRoot)) logs += `Auto-fix TS5107 aplicado em: ${fixedPath}\n`;
-      const viteConfigFixed = await ensureViteRelativeBase(appRoot);
-      if (viteConfigFixed) logs += `Auto-fix aplicado: base './' em ${viteConfigFixed}.\n`;
-      logs += await runReactViteBuild(appRoot, { frontendEnv: temporaryFrontendEnv.envValues });
-    } finally {
-      await temporaryFrontendEnv.cleanup();
-    }
-
-    const distDir = path.join(appRoot, 'dist');
-    if (!(await pathExists(distDir))) throw new Error('Build concluído sem gerar a pasta dist.');
-    if (await fixDistIndexAssetPaths(distDir)) logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
-    const previewUrl = `/builds/${project._id}/${timestamp}/index.html`;
-    const fullHtml = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
-    const artifactSnapshot = await collectBuildArtifactFiles(distDir);
-    const sourceSnapshot = await collectProjectSourceFiles(appRoot);
-    const sourceContext = createSourceContext(sourceSnapshot.files);
-    if (!artifactSnapshot.complete) logs += `\nAviso: dist gerado excedeu ${MAX_MONGO_ARTIFACT_BYTES} bytes; ${artifactSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
-    if (!sourceSnapshot.complete) logs += `\nAviso: source excedeu ${MAX_MONGO_SOURCE_BYTES} bytes; ${sourceSnapshot.skippedFiles} arquivo(s) menos prioritario(s) nao foram salvos no fallback MongoDB.\n`;
-    const publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), timestamp);
-    await fs.mkdir(publicBuildDir, { recursive: true });
-    await fs.cp(distDir, publicBuildDir, { recursive: true });
-    const build = await ProjectBuild.create({
-      projectId: project._id, type: 'react_vite', status: 'draft', distUrl: previewUrl, previewUrl,
-      buildUrl: previewUrl, deployUrl: previewUrl, fullHtml, artifactFiles: artifactSnapshot.files,
-      sourceFiles: sourceSnapshot.files, sourceSummary: sourceContext.sourceSummary,
-      indexedFiles: sourceContext.indexedFiles, sourceZipUrl: '',
-      logs: [redactBuildLogs(logs, temporaryFrontendEnvRedactionValues), 'React/Vite build concluído com sucesso.'].filter(Boolean).join('\n'),
-    });
-    await Project.findByIdAndUpdate(project._id, {
-      status: 'in_progress', generation_status: 'in_progress', generationStatus: 'in_progress', reactVite: true,
-      'metadata.lastBuildAt': new Date(),
-    }, { runValidators: true });
-    return res.status(201).json({ success: true, build: withAbsoluteBuildUrls(req, build), previewUrl: toAbsoluteBackendUrl(req, previewUrl), connectorInjection });
-  } catch (error) {
-    const build = await ProjectBuild.create({
-      projectId: project._id, type: 'react_vite', status: 'failed',
-      logs: redactBuildLogs([logs, error.message].filter(Boolean).join('\n'), temporaryFrontendEnvRedactionValues),
-    });
-    return res.status(500).json({
-      success: false, message: 'Erro interno do servidor.',
-      build: { ...withAbsoluteBuildUrls(req, build), logs: '' }, connectorInjection,
-    });
-  }
+async function runLegacyReactViteBuild(req, res, project, buildDir) {
+  await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+  return res.status(503).json({
+    success: false,
+    code: 'BUILD_WORKER_REQUIRED',
+    message: 'Execução local síncrona de builds React/Vite está desabilitada.',
+  });
 }
 
 function formatConnectorInjectionLog(resolution) {
@@ -2780,11 +3075,18 @@ router.post(
     let job = null;
 
     try {
-      await extractZipSafely(sourceZipPath, extractDir);
-
       if (!BUILD_WORKER_ENABLED) {
-        return runLegacyReactViteBuild(req, res, project, buildDir, extractDir);
+        await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
+        return res.status(503).json({
+          success: false,
+          code: 'BUILD_WORKER_REQUIRED',
+          message: process.env.NODE_ENV === 'production'
+            ? 'BUILD_WORKER_ENABLED=true é obrigatório em produção para builds React/Vite.'
+            : 'Build worker React/Vite não está habilitado; execução local síncrona está desabilitada.',
+        });
       }
+
+      await extractZipSafely(sourceZipPath, extractDir);
 
       const appRoot = await findReactViteRoot(extractDir);
       await validateReactViteProject(appRoot);
@@ -3331,9 +3633,13 @@ module.exports.reactViteBuildHelpers = {
   findReactViteRoot,
   fixDistIndexAssetPaths,
   formatConnectorInjectionLog,
+  publishValidatedDist,
   redactBuildLogs,
+  runLocalBinCommand,
   runNpmCommand,
+  runReactViteInstall,
   runReactViteBuild,
   runNpxCommand,
+  validateDistDirectory,
   validateReactViteProject,
 };
