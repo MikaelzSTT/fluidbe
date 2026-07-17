@@ -841,7 +841,7 @@ router.get('/', authMiddleware, async (req, res) => {
       createdAt: -1,
     });
 
-    return res.json(projects);
+    return res.json(projects.map((project) => withAbsoluteProjectBuildUrls(req, project)));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -1616,7 +1616,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    return res.json(project);
+    return res.json(withAbsoluteProjectBuildUrls(req, project));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
