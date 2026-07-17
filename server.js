@@ -18,8 +18,13 @@ const Session = require('./models/Session');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
 const {
   BUILD_PREVIEW_TTL_SECONDS,
+  createBuildPreviewToken,
   verifyBuildPreviewToken,
 } = require('./utils/buildPreviewAccess');
+const {
+  injectBuildPreviewTokenIntoCodeAssets,
+  injectBuildPreviewTokenIntoHtmlAssets,
+} = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 
 
@@ -61,13 +66,21 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173'
 ];
-const corsOptions = {
-  origin: allowedOrigins,
-  credentials: true,
+const baseCorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-key'],
   optionsSuccessStatus: 204
 };
+function corsOptions(req, callback) {
+  const origin = req.header('Origin');
+  const isAllowedOrigin = allowedOrigins.includes(origin);
+
+  callback(null, {
+    ...baseCorsOptions,
+    origin: isAllowedOrigin ? origin : false,
+    credentials: isAllowedOrigin,
+  });
+}
 const apiRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -435,6 +448,107 @@ function getCookie(req, name) {
   }
 }
 
+function hasOpaqueSandboxOrigin(req) {
+  return String(req.headers.origin || '') === 'null';
+}
+
+function setSandboxBuildCorsHeaders(req, res) {
+  if (!hasOpaqueSandboxOrigin(req)) {
+    return;
+  }
+
+  res.setHeader('Access-Control-Allow-Origin', 'null');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
+}
+
+function applyBuildArtifactCors(req, res, next) {
+  setSandboxBuildCorsHeaders(req, res);
+
+  if (req.buildAccess && req.buildAccess.isPublished !== true) {
+    res.setHeader('Cache-Control', 'no-store');
+  }
+
+  next();
+}
+
+async function serveBuildIndexWithCapabilities(req, res, next) {
+  const access = req.buildAccess;
+
+  if (
+    !access ||
+    access.isPublished === true ||
+    !access.previewToken ||
+    access.parsedPath.artifactPath !== 'index.html'
+  ) {
+    return next();
+  }
+
+  const buildsRoot = path.resolve(PUBLIC_BUILDS_DIR);
+  const indexPath = path.resolve(
+    buildsRoot,
+    access.parsedPath.projectId,
+    access.parsedPath.buildKey,
+    'index.html'
+  );
+
+  if (indexPath !== buildsRoot && !indexPath.startsWith(`${buildsRoot}${path.sep}`)) {
+    return res.sendStatus(404);
+  }
+
+  try {
+    const html = await fs.readFile(indexPath, 'utf8');
+    return res
+      .type('html')
+      .send(injectBuildPreviewTokenIntoHtmlAssets(html, access.parsedPath, access.previewToken));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return next();
+    }
+
+    return next(error);
+  }
+}
+
+async function serveBuildCodeAssetWithCapabilities(req, res, next) {
+  const access = req.buildAccess;
+
+  if (
+    !access ||
+    access.isPublished === true ||
+    !access.previewToken ||
+    !/\.(?:css|js|mjs)$/.test(access.parsedPath.artifactPath)
+  ) {
+    return next();
+  }
+
+  const buildsRoot = path.resolve(PUBLIC_BUILDS_DIR);
+  const assetPath = path.resolve(
+    buildsRoot,
+    access.parsedPath.projectId,
+    access.parsedPath.buildKey,
+    access.parsedPath.artifactPath
+  );
+
+  if (assetPath !== buildsRoot && !assetPath.startsWith(`${buildsRoot}${path.sep}`)) {
+    return res.sendStatus(404);
+  }
+
+  try {
+    const code = await fs.readFile(assetPath, 'utf8');
+    return res
+      .type(path.extname(assetPath).toLowerCase() === '.css' ? 'css' : 'js')
+      .send(injectBuildPreviewTokenIntoCodeAssets(code, access.parsedPath, access.previewToken));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return next();
+    }
+
+    return next(error);
+  }
+}
+
 function buildUrlMatchQuery(indexBuildUrl) {
   const escapedIndexBuildUrl = indexBuildUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const absoluteIndexBuildUrlPattern = new RegExp(`${escapedIndexBuildUrl}$`);
@@ -482,6 +596,11 @@ async function authorizeBuildAccess(req, res, next) {
     }
 
     if (isProjectBuildExplicitlyPublished(project, build)) {
+      req.buildAccess = {
+        parsedPath,
+        isPublished: true,
+        previewToken: '',
+      };
       return next();
     }
 
@@ -500,6 +619,11 @@ async function authorizeBuildAccess(req, res, next) {
           maxAge: BUILD_PREVIEW_TTL_SECONDS * 1000,
         });
       }
+      req.buildAccess = {
+        parsedPath,
+        isPublished: false,
+        previewToken,
+      };
       return next();
     }
 
@@ -507,6 +631,11 @@ async function authorizeBuildAccess(req, res, next) {
     const userId = await getBearerUserId(req);
 
     if (isAdmin || (userId && String(project.userId) === String(userId))) {
+      req.buildAccess = {
+        parsedPath,
+        isPublished: false,
+        previewToken: createBuildPreviewToken(parsedPath.projectId, parsedPath.buildKey),
+      };
       return next();
     }
 
@@ -632,18 +761,66 @@ async function loadPublishedHtml(project) {
 app.set('trust proxy', 1);
 app.use(securityHeaders);
 app.use(cors(corsOptions));
+app.options(/^\/builds\/.+$/, authorizeBuildAccess, applyBuildArtifactCors, (req, res) => {
+  res.sendStatus(204);
+});
 app.options(/.*/, cors(corsOptions));
 app.use(publicAppsOnly);
 app.use('/api', apiRateLimit);
 app.use('/api/billing', billingRoutes);
 app.use(express.json({ limit: '100kb' }));
-app.use('/builds', authorizeBuildAccess, express.static(PUBLIC_BUILDS_DIR));
+app.use(
+  '/builds',
+  authorizeBuildAccess,
+  applyBuildArtifactCors,
+  serveBuildIndexWithCapabilities,
+  serveBuildCodeAssetWithCapabilities,
+  express.static(PUBLIC_BUILDS_DIR)
+);
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
   try {
     const artifact = await findMongoBuildArtifact(req.path);
 
     if (!artifact) {
       return next();
+    }
+
+    if (
+      req.buildAccess &&
+      req.buildAccess.isPublished !== true &&
+      req.buildAccess.previewToken &&
+      req.buildAccess.parsedPath.artifactPath === 'index.html' &&
+      String(artifact.contentType || '').startsWith('text/html')
+    ) {
+      const html = Buffer.isBuffer(artifact.body)
+        ? artifact.body.toString('utf8')
+        : String(artifact.body || '');
+      return res
+        .set('Content-Type', artifact.contentType)
+        .send(injectBuildPreviewTokenIntoHtmlAssets(
+          html,
+          req.buildAccess.parsedPath,
+          req.buildAccess.previewToken
+        ));
+    }
+
+    if (
+      req.buildAccess &&
+      req.buildAccess.isPublished !== true &&
+      req.buildAccess.previewToken &&
+      /\.(?:css|js|mjs)$/.test(req.buildAccess.parsedPath.artifactPath) &&
+      /^text\/css|(?:application|text)\/javascript/.test(String(artifact.contentType || ''))
+    ) {
+      const code = Buffer.isBuffer(artifact.body)
+        ? artifact.body.toString('utf8')
+        : String(artifact.body || '');
+      return res
+        .set('Content-Type', artifact.contentType)
+        .send(injectBuildPreviewTokenIntoCodeAssets(
+          code,
+          req.buildAccess.parsedPath,
+          req.buildAccess.previewToken
+        ));
     }
 
     return res.set('Content-Type', artifact.contentType).send(artifact.body);

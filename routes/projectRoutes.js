@@ -75,6 +75,17 @@ const CONNECTOR_STATUS_TONES = {
   skipped: 'gray',
   error: 'red',
 };
+const PROJECT_UPDATE_FIELDS = new Set([
+  'name',
+  'title',
+  'description',
+  'status',
+  'generationStatus',
+  'generation_status',
+  'prompt',
+  'type',
+  'settings',
+]);
 const PUBLISHED_PROJECT_LIMITS = {
   free: 0,
   pro: 3,
@@ -786,6 +797,42 @@ function buildStatusError(projectBuild, buildJob) {
     code: null,
     message: 'Build falhou.',
   };
+}
+
+function buildProjectUpdate(body) {
+  const update = {};
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+
+  for (const field of PROJECT_UPDATE_FIELDS) {
+    if (
+      Object.prototype.hasOwnProperty.call(source, field) &&
+      source[field] !== undefined
+    ) {
+      update[field] = source[field];
+    }
+  }
+
+  return update;
+}
+
+function sendProjectUpdateError(res, error) {
+  if (error?.name === 'ValidationError') {
+    return res.status(400).json({ message: 'Dados inválidos para atualização do projeto.' });
+  }
+
+  if (error?.name === 'CastError') {
+    return res.status(400).json({ message: 'Identificador de projeto inválido.' });
+  }
+
+  console.error('Erro ao atualizar projeto.', {
+    name: error?.name || 'Error',
+    path: error?.path || null,
+    kind: error?.kind || null,
+  });
+
+  return res.status(500).json({
+    message: 'Erro interno do servidor.',
+  });
 }
 
 router.get('/', authMiddleware, async (req, res) => {
@@ -1579,24 +1626,18 @@ router.get('/:id', authMiddleware, async (req, res) => {
 
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { name, description, status, prompt, type, settings } = req.body;
+    const update = buildProjectUpdate(req.body);
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ message: 'Nenhum campo válido enviado para atualização.' });
+    }
 
     const project = await Project.findOneAndUpdate(
       {
         _id: req.params.id,
         userId: req.userId,
       },
-      {
-        name,
-        description,
-        status,
-        prompt,
-        type,
-        settings,
-        
-
-
-      },
+      { $set: update },
       {
         new: true,
         runValidators: true,
@@ -1612,9 +1653,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
       project,
     });
   } catch (error) {
-    return res.status(500).json({
-      message: 'Erro interno do servidor.',
-    });
+    return sendProjectUpdateError(res, error);
   }
 });
 
@@ -1642,3 +1681,5 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.buildProjectUpdate = buildProjectUpdate;
+module.exports.sendProjectUpdateError = sendProjectUpdateError;

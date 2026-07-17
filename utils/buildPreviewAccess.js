@@ -56,5 +56,6 @@ function addBuildPreviewToken(value) {
 module.exports = {
   BUILD_PREVIEW_TTL_SECONDS,
   addBuildPreviewToken,
+  createBuildPreviewToken,
   verifyBuildPreviewToken,
 };
