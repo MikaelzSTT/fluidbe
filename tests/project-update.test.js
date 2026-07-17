@@ -208,3 +208,35 @@ test('project PUT preserves normal wizard update fields and drops draft metadata
     },
   });
 });
+
+test('project PUT ignores build artifacts and preview token URLs', async () => {
+  let update;
+  const res = await runPut({
+    name: 'Safe update',
+    prompt: 'Only this should be saved',
+    fullHtml: '<!doctype html>' + 'x'.repeat(120000),
+    latestFullHtml: '<!doctype html>' + 'y'.repeat(120000),
+    latestBuild: { artifactFiles: [{ path: 'index.html', body: 'large' }] },
+    build: { artifactFiles: [{ path: 'index.html', body: 'large' }], logs: 'secret' },
+    artifactFiles: [{ path: 'index.html', body: 'large' }],
+    logs: 'secret logs',
+    sourceZipUrl: '/builds/source.zip?previewToken=secret',
+    previewUrl: '/builds/project/build/index.html?previewToken=secret',
+    buildUrl: '/builds/project/build/index.html?previewToken=secret',
+    distUrl: '/builds/project/build/index.html?previewToken=secret',
+    deployUrl: '/builds/project/build/index.html?previewToken=secret',
+  }, async (query, nextUpdate) => {
+    update = nextUpdate;
+    return { _id: query._id, name: 'Safe update' };
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(update, {
+    $set: {
+      name: 'Safe update',
+      prompt: 'Only this should be saved',
+    },
+  });
+  assert.equal(JSON.stringify(update).includes('previewToken'), false);
+  assert.equal(JSON.stringify(update).includes('artifactFiles'), false);
+});

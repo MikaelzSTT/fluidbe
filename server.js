@@ -26,6 +26,7 @@ const {
   injectBuildPreviewTokenIntoHtmlAssets,
 } = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
+const { payloadTooLargeHandler } = require('./utils/payloadErrors');
 
 
 dotenv.config();
@@ -769,6 +770,7 @@ app.use(publicAppsOnly);
 app.use('/api', apiRateLimit);
 app.use('/api/billing', billingRoutes);
 app.use(express.json({ limit: '100kb' }));
+app.use(payloadTooLargeHandler);
 app.use(
   '/builds',
   authorizeBuildAccess,
