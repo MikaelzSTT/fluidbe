@@ -40,6 +40,8 @@ const GOOGLE_STATE_TTL_SECONDS = 10 * 60;
 const DEFAULT_OAUTH_REDIRECT_PATH = '/projects.html';
 const OAUTH_STATE_COOKIE_PREFIX = 'fluid_oauth_state_';
 const MAX_PASSWORD_BYTES = 72;
+const MAX_EMAIL_CHARS = 320;
+const INVALID_PASSWORD_HASH = '$2b$10$oE4adb62xrznmIZJwK9GYOgfO83CCk9wNy5mZUnKXto9FfRRWHfbq';
 const passwordChangeRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -194,7 +196,7 @@ function createGitHubOAuthState(redirectPath) {
       expiresAt: now + GITHUB_STATE_TTL_SECONDS,
     },
     process.env.JWT_SECRET,
-    { expiresIn: GITHUB_STATE_TTL_SECONDS }
+    { algorithm: 'HS256', expiresIn: GITHUB_STATE_TTL_SECONDS }
   );
 }
 
@@ -204,7 +206,7 @@ function verifyGitHubOAuthState(state) {
   }
 
   try {
-    const decoded = jwt.verify(state, process.env.JWT_SECRET);
+    const decoded = jwt.verify(state, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (
       decoded?.purpose !== 'github_oauth_state' ||
@@ -232,7 +234,7 @@ function createGoogleOAuthState(redirectPath) {
       redirect: normalizeFrontendRedirectPath(redirectPath),
     },
     process.env.JWT_SECRET,
-    { expiresIn: GOOGLE_STATE_TTL_SECONDS }
+    { algorithm: 'HS256', expiresIn: GOOGLE_STATE_TTL_SECONDS }
   );
 }
 
@@ -242,7 +244,7 @@ function verifyGoogleOAuthState(state) {
   }
 
   try {
-    const decoded = jwt.verify(state, process.env.JWT_SECRET);
+    const decoded = jwt.verify(state, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (decoded?.purpose !== 'google_oauth_state' || typeof decoded.nonce !== 'string') {
       return null;
@@ -805,7 +807,7 @@ function createTwoFactorLoginChallenge(user) {
       purpose: 'two_factor_login',
     },
     process.env.JWT_SECRET,
-    { expiresIn: '5m' }
+    { algorithm: 'HS256', expiresIn: '5m' }
   );
 }
 
@@ -1857,20 +1859,25 @@ router.get('/github/callback', async (req, res) => {
 
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const body = getObjectBody(req.body);
+    const name = body?.name;
+    const email = body?.email;
+    const password = body?.password;
 
     if (
       typeof name !== 'string' ||
       !name.trim() ||
+      name.trim().length > 120 ||
       typeof email !== 'string' ||
       !email.trim() ||
+      email.length > MAX_EMAIL_CHARS ||
       typeof password !== 'string' ||
       !password
     ) {
       return res.status(400).json({ message: 'Preencha todos os campos.' });
     }
 
-    const normalizedEmail = email.trim();
+    const normalizedEmail = email.trim().toLowerCase();
     const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
 
     if (!emailIsValid) {
@@ -1896,7 +1903,7 @@ router.post('/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const user = await User.create({
-      name,
+      name: name.trim(),
       email: normalizedEmail,
       password: hashedPassword,
       providers: ['local'],
@@ -1907,6 +1914,10 @@ router.post('/register', async (req, res) => {
       user: serializeUser(user),
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(400).json({ message: 'Este e-mail já está cadastrado.' });
+    }
+
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });
@@ -1925,7 +1936,7 @@ router.post('/2fa/verify-login', twoFactorVerifyLoginRateLimit, async (req, res)
     let decoded;
 
     try {
-      decoded = jwt.verify(loginChallenge, process.env.JWT_SECRET);
+      decoded = jwt.verify(loginChallenge, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     } catch (error) {
       return jsonCode(res, 401, 'TWO_FACTOR_CHALLENGE_EXPIRED');
     }
@@ -1976,25 +1987,25 @@ router.post('/2fa/verify-login', twoFactorVerifyLoginRateLimit, async (req, res)
 
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const body = getObjectBody(req.body);
+    const email = body?.email;
+    const password = body?.password;
 
-    if (!email || !password) {
+    if (
+      typeof email !== 'string' ||
+      !email.trim() ||
+      email.length > MAX_EMAIL_CHARS ||
+      typeof password !== 'string' ||
+      !password ||
+      Buffer.byteLength(password, 'utf8') > MAX_PASSWORD_BYTES
+    ) {
       return res.status(400).json({ message: 'Preencha e-mail e senha.' });
     }
 
     const user = await User.findOne({ email: String(email).trim().toLowerCase() });
+    const passwordIsValid = await bcrypt.compare(password, user?.password || INVALID_PASSWORD_HASH);
 
-    if (!user) {
-      return res.status(401).json({ message: 'E-mail ou senha inválidos.' });
-    }
-
-    if (!user.password) {
-      return res.status(401).json({ message: 'Esta conta usa login com provedor externo.' });
-    }
-
-    const passwordIsValid = await bcrypt.compare(password, user.password);
-
-    if (!passwordIsValid) {
+    if (!user || !user.password || !passwordIsValid || user.deletedAt) {
       return res.status(401).json({ message: 'E-mail ou senha inválidos.' });
     }
 
@@ -2028,7 +2039,7 @@ router.post('/logout', async (req, res) => {
 
     if (token) {
       try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
         if (decoded?.jti && decoded?.id && !decoded.runtimeUserId) {
           await Session.updateOne(

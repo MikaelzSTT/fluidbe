@@ -41,7 +41,7 @@ function signAuthToken(user, jti) {
   return jwt.sign(
     { id: user._id, jti },
     process.env.JWT_SECRET,
-    { expiresIn: AUTH_TOKEN_EXPIRES_IN }
+    { algorithm: 'HS256', expiresIn: AUTH_TOKEN_EXPIRES_IN }
   );
 }
 

@@ -13,6 +13,7 @@ const BLOCKED_COLLECTIONS = new Set([
 
 const SAFE_COLLECTION_PATTERN = /^[a-z0-9_-]+$/;
 const SAFE_FIELD_PATTERN = /^[A-Za-z0-9_-]+$/;
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function validateCollectionName(collection) {
   if (
@@ -48,6 +49,7 @@ function containsUnsafeKey(value, { blockOwnerId = false, blockProjectId = false
     if (
       key.startsWith('$') ||
       key.includes('.') ||
+      UNSAFE_OBJECT_KEYS.has(key) ||
       (blockProjectId && key === 'projectId') ||
       (blockOwnerId && key === 'ownerId')
     ) {

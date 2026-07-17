@@ -27,11 +27,13 @@ const {
 } = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 const { payloadTooLargeHandler } = require('./utils/payloadErrors');
+const { timingSafeEqualString } = require('./utils/timingSafe');
 
 
 dotenv.config();
 
 const app = express();
+app.disable('x-powered-by');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PUBLIC_BUILDS_DIR = path.join(PUBLIC_DIR, 'builds');
@@ -90,6 +92,11 @@ const apiRateLimit = createRateLimit({
 const loginRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  keyGenerator: getClientIp,
+});
+const registerRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   keyGenerator: getClientIp,
 });
 const chatIpRateLimit = createRateLimit({
@@ -418,7 +425,7 @@ async function getBearerUserId(req) {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (!decoded.id || !decoded.jti || decoded.runtimeUserId) {
       return null;
@@ -469,6 +476,7 @@ function applyBuildArtifactCors(req, res, next) {
 
   if (req.buildAccess && req.buildAccess.isPublished !== true) {
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
   }
 
   next();
@@ -628,7 +636,8 @@ async function authorizeBuildAccess(req, res, next) {
       return next();
     }
 
-    const isAdmin = Boolean(process.env.ADMIN_TOKEN) && req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
+    const isAdmin = Boolean(process.env.ADMIN_TOKEN)
+      && timingSafeEqualString(req.headers['x-admin-token'], process.env.ADMIN_TOKEN);
     const userId = await getBearerUserId(req);
 
     if (isAdmin || (userId && String(project.userId) === String(userId))) {
@@ -840,6 +849,10 @@ function sendSettingsAccountPage(req, res) {
 
 app.get(['/settings/account', '/settings/account/', '/settings/account/index.html'], sendSettingsAccountPage);
 app.get('/debug/settings-build', async (req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.sendStatus(404);
+  }
+
   try {
     const html = await fs.readFile(SETTINGS_ACCOUNT_HTML_PATH, 'utf8');
     const oldProfileSavedLocallyText = ['Profile', 'saved', 'locally'].join(' ');
@@ -876,6 +889,7 @@ app.get('/p/:slug', async (req, res) => {
   }
 });
 app.use('/api/auth/login', loginRateLimit);
+app.use('/api/auth/register', registerRateLimit);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/chat', chatIpRateLimit, chatRoutes);

@@ -67,6 +67,10 @@ test('project PUT accepts partial update without name', async () => {
   });
 
   assert.equal(res.statusCode, 200);
+  assert.deepEqual(captured[0], {
+    _id: '64f000000000000000000001',
+    userId: '64f000000000000000000002',
+  });
   assert.deepEqual(captured[1], { $set: { prompt: 'Refine the dashboard' } });
   assert.equal(captured[2].runValidators, true);
   assert.equal(captured[2].new, true);

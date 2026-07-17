@@ -22,7 +22,7 @@ async function authMiddleware(req, res, next) {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (!decoded.id || decoded.runtimeUserId) {
       return res.status(401).json({ message: 'Token inválido ou expirado.' });

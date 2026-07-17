@@ -180,13 +180,20 @@ function normalizeShopifyStoreUrl(value) {
 
   try {
     const parsedUrl = new URL(storeUrl.includes('://') ? storeUrl : `https://${storeUrl}`);
-    return parsedUrl.hostname.toLowerCase();
+    const hostname = parsedUrl.hostname.toLowerCase();
+
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      parsedUrl.username ||
+      parsedUrl.password ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/.test(hostname)
+    ) {
+      return '';
+    }
+
+    return hostname;
   } catch (error) {
-    return storeUrl
-      .replace(/^https?:\/\//i, '')
-      .split('/')[0]
-      .trim()
-      .toLowerCase();
+    return '';
   }
 }
 
@@ -271,8 +278,8 @@ function validateConnectorValues(connector, values) {
   if (provider === 'shopify') {
     const storeUrl = trimmedValue('store_url');
 
-    if (!storeUrl.includes('.myshopify.com') && !storeUrl.startsWith('https://')) {
-      return 'Shopify store_url inválida. O valor precisa conter .myshopify.com ou começar com https://.';
+    if (!normalizeShopifyStoreUrl(storeUrl)) {
+      return 'Shopify store_url inválida. Use o domínio HTTPS da loja em .myshopify.com.';
     }
   }
 
@@ -833,6 +840,14 @@ function sendProjectUpdateError(res, error) {
   return res.status(500).json({
     message: 'Erro interno do servidor.',
   });
+}
+
+function validateOwnedProjectId(req, res, next) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    return res.status(404).json({ message: 'Projeto não encontrado.' });
+  }
+
+  return next();
 }
 
 router.get('/', authMiddleware, async (req, res) => {
@@ -1605,7 +1620,7 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const project = await Project.findOne({
       _id: req.params.id,
@@ -1624,7 +1639,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const update = buildProjectUpdate(req.body);
 
@@ -1657,7 +1672,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const project = await Project.findOne({
       _id: req.params.id,
@@ -1682,4 +1697,5 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 
 module.exports = router;
 module.exports.buildProjectUpdate = buildProjectUpdate;
+module.exports.normalizeShopifyStoreUrl = normalizeShopifyStoreUrl;
 module.exports.sendProjectUpdateError = sendProjectUpdateError;

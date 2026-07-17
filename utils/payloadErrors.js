@@ -11,6 +11,14 @@ function getApproxBodySize(error, req) {
   return Number.isFinite(contentLength) ? contentLength : null;
 }
 
+function getSafeRequestRoute(req) {
+  const pathname = typeof req?.path === 'string' && req.path
+    ? req.path
+    : String(req?.originalUrl || req?.url || '').split('?')[0];
+
+  return `${req?.method || 'UNKNOWN'} ${pathname || '/'}`;
+}
+
 function payloadTooLargeHandler(error, req, res, next) {
   const status = error?.status || error?.statusCode;
   const isPayloadTooLarge =
@@ -24,7 +32,7 @@ function payloadTooLargeHandler(error, req, res, next) {
 
   const approxBytes = getApproxBodySize(error, req);
   console.warn('Payload rejeitado por tamanho.', {
-    route: `${req.method} ${req.originalUrl || req.url}`,
+    route: getSafeRequestRoute(req),
     approxBytes,
     name: error?.name || 'PayloadTooLargeError',
   });
@@ -41,5 +49,6 @@ function payloadTooLargeHandler(error, req, res, next) {
 
 module.exports = {
   getApproxBodySize,
+  getSafeRequestRoute,
   payloadTooLargeHandler,
 };

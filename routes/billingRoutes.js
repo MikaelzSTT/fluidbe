@@ -3,9 +3,15 @@ const Stripe = require('stripe');
 const User = require('../models/User');
 const Project = require('../models/Project');
 const authMiddleware = require('../middleware/authMiddleware');
+const { createRateLimit } = require('../middleware/rateLimit');
 const { unpublishActiveProjectsForUser } = require('../utils/projectPublication');
 
 const router = express.Router();
+const billingMutationRateLimit = createRateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => String(req.userId || 'anonymous'),
+});
 
 const PLAN_DETAILS = Object.freeze({
   free: Object.freeze({
@@ -446,7 +452,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   const configError = getConfigError('webhook', ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']);
 
   if (configError) {
-    return res.status(503).json({ message: configError.message, missing: configError.missing });
+    return res.status(503).json({ message: configError.message });
   }
 
   const { stripe, webhookSecret } = getBillingConfig();
@@ -461,7 +467,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   try {
     event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
   } catch (error) {
-    return res.status(400).json({ message: `Webhook signature verification failed: ${error.message}` });
+    return res.status(400).json({ message: 'Webhook signature verification failed.' });
   }
 
   try {
@@ -508,7 +514,7 @@ router.get('/me', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/checkout', authMiddleware, async (req, res) => {
+router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, res) => {
   const requestedPlan = String(req.body?.plan || req.body?.targetPlan || 'pro').toLowerCase();
 
   if (!['pro', 'business'].includes(requestedPlan)) {
@@ -523,7 +529,7 @@ router.post('/checkout', authMiddleware, async (req, res) => {
   ]);
 
   if (configError) {
-    return res.status(503).json({ message: configError.message, missing: configError.missing });
+    return res.status(503).json({ message: configError.message });
   }
 
   const { stripe, priceIds } = getBillingConfig();
@@ -588,11 +594,11 @@ router.post('/checkout', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/portal', authMiddleware, async (req, res) => {
+router.post('/portal', authMiddleware, billingMutationRateLimit, async (req, res) => {
   const configError = getConfigError('portal', ['STRIPE_SECRET_KEY', 'FRONTEND_URL']);
 
   if (configError) {
-    return res.status(503).json({ message: configError.message, missing: configError.missing });
+    return res.status(503).json({ message: configError.message });
   }
 
   const { stripe } = getBillingConfig();

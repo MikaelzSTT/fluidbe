@@ -15,6 +15,7 @@ const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
+const { timingSafeEqualString } = require('../utils/timingSafe');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
@@ -357,7 +358,7 @@ function removePublicPublishFields(update) {
 function requireAdmin(req, res, next) {
   const adminToken = process.env.ADMIN_TOKEN;
 
-  if (!adminToken || req.headers['x-admin-token'] !== adminToken) {
+  if (!adminToken || !timingSafeEqualString(req.headers['x-admin-token'], adminToken)) {
     return res.status(401).json({ message: 'Admin não autorizado' });
   }
 

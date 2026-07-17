@@ -38,7 +38,7 @@ test('payloadTooLargeHandler returns safe JSON 413', () => {
       { name: 'PayloadTooLargeError', status: 413, length: 150001 },
       {
         method: 'PUT',
-        originalUrl: '/api/projects/64f000000000000000000001',
+        originalUrl: '/api/projects/64f000000000000000000001?previewToken=must-not-be-logged',
         headers: { 'content-length': '150001' },
       },
       res,

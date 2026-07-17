@@ -73,12 +73,12 @@ function signRuntimeAuthToken(document) {
       role: safeUser.role,
     },
     getRuntimeJwtSecret(),
-    { expiresIn: '7d' }
+    { algorithm: 'HS256', expiresIn: '7d' }
   );
 }
 
 function verifyRuntimeAuthToken(token) {
-  return jwt.verify(token, getRuntimeJwtSecret());
+  return jwt.verify(token, getRuntimeJwtSecret(), { algorithms: ['HS256'] });
 }
 
 module.exports = {
