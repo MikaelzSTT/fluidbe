@@ -110,6 +110,19 @@ const adminRateLimit = createRateLimit({
   keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
 });
 
+function isStripeWebhookRequest(req) {
+  const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+  return req.method === 'POST' && requestPath === '/api/billing/webhook';
+}
+
+function apiRateLimitUnlessStripeWebhook(req, res, next) {
+  if (isStripeWebhookRequest(req)) {
+    return next();
+  }
+
+  return apiRateLimit(req, res, next);
+}
+
 function getContentType(filePath) {
   return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 }
@@ -776,7 +789,7 @@ app.options(/^\/builds\/.+$/, authorizeBuildAccess, applyBuildArtifactCors, (req
 });
 app.options(/.*/, cors(corsOptions));
 app.use(publicAppsOnly);
-app.use('/api', apiRateLimit);
+app.use('/api', apiRateLimitUnlessStripeWebhook);
 app.use('/api/billing', billingRoutes);
 app.use(express.json({ limit: '100kb' }));
 app.use(payloadTooLargeHandler);

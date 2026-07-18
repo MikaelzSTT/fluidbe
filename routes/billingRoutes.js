@@ -2,11 +2,17 @@ const express = require('express');
 const Stripe = require('stripe');
 const User = require('../models/User');
 const Project = require('../models/Project');
+const StripeWebhookEvent = require('../models/StripeWebhookEvent');
 const authMiddleware = require('../middleware/authMiddleware');
-const { createRateLimit } = require('../middleware/rateLimit');
+const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
 const { unpublishActiveProjectsForUser } = require('../utils/projectPublication');
 
 const router = express.Router();
+const stripeWebhookRateLimit = createRateLimit({
+  windowMs: 60 * 1000,
+  max: 1200,
+  keyGenerator: getClientIp,
+});
 const billingMutationRateLimit = createRateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -116,6 +122,75 @@ function getBillingConfig() {
     },
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   };
+}
+
+function isDuplicateKeyError(error) {
+  return error && (error.code === 11000 || error.code === 11001);
+}
+
+async function claimStripeWebhookEvent(event) {
+  try {
+    await StripeWebhookEvent.create({
+      eventId: event.id,
+      type: event.type || '',
+      status: 'processing',
+      receivedAt: new Date(),
+    });
+    return true;
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) {
+      throw error;
+    }
+  }
+
+  const existing = await StripeWebhookEvent.findOne({ eventId: event.id }).select('status');
+
+  if (!existing || existing.status !== 'failed') {
+    return false;
+  }
+
+  const reclaimed = await StripeWebhookEvent.findOneAndUpdate(
+    {
+      eventId: event.id,
+      status: 'failed',
+    },
+    {
+      $set: {
+        type: event.type || '',
+        status: 'processing',
+        receivedAt: new Date(),
+        processedAt: null,
+        failedAt: null,
+      },
+    },
+    { new: true }
+  ).select('_id');
+
+  return Boolean(reclaimed);
+}
+
+async function markStripeWebhookEventProcessed(event) {
+  await StripeWebhookEvent.updateOne(
+    { eventId: event.id },
+    {
+      $set: {
+        status: 'processed',
+        processedAt: new Date(),
+      },
+    }
+  );
+}
+
+async function markStripeWebhookEventFailed(event) {
+  await StripeWebhookEvent.updateOne(
+    { eventId: event.id },
+    {
+      $set: {
+        status: 'failed',
+        failedAt: new Date(),
+      },
+    }
+  );
 }
 
 function normalizePlanId(plan) {
@@ -448,7 +523,7 @@ async function updateUserFromInvoice(invoice, status) {
   return user;
 }
 
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+router.post('/webhook', stripeWebhookRateLimit, express.raw({ type: 'application/json' }), async (req, res) => {
   const configError = getConfigError('webhook', ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']);
 
   if (configError) {
@@ -471,6 +546,14 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   }
 
   try {
+    if (!event.id) {
+      return res.status(400).json({ message: 'Invalid webhook event.' });
+    }
+
+    if (!(await claimStripeWebhookEvent(event))) {
+      return res.json({ received: true });
+    }
+
     switch (event.type) {
       case 'checkout.session.completed':
         await updateUserFromCheckoutSession(event.data.object, stripe);
@@ -490,8 +573,12 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         break;
     }
 
+    await markStripeWebhookEventProcessed(event);
     return res.json({ received: true });
   } catch (error) {
+    if (event && event.id) {
+      await markStripeWebhookEventFailed(event).catch(() => {});
+    }
     logBillingError('Stripe webhook handling failed.', error);
     return res.status(500).json({ message: 'Stripe webhook handling failed.' });
   }
@@ -631,3 +718,6 @@ router.post('/portal', authMiddleware, billingMutationRateLimit, async (req, res
 });
 
 module.exports = router;
+module.exports.stripeWebhookTestHelpers = {
+  claimStripeWebhookEvent,
+};

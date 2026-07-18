@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const test = require('node:test');
+const AdmZip = require('adm-zip');
 
 const {
   getBuildIdentityFromUrl,
@@ -17,6 +18,7 @@ const {
 
 const {
   publishValidatedDist,
+  extractZipSafely,
   runLocalBinCommand,
   runNpmCommand,
   runNpxCommand,
@@ -37,6 +39,79 @@ async function writeValidDist(root) {
   await fs.writeFile(path.join(dist, 'index.html'), '<div id="root"></div>');
   await fs.writeFile(path.join(dist, 'assets', 'app.js'), 'console.log("ok");');
   return dist;
+}
+
+async function writeZip(zipPath, entries) {
+  const zip = new AdmZip();
+
+  for (const entry of entries) {
+    zip.addFile(entry.name, Buffer.from(entry.content || 'x'));
+    if (entry.attr !== undefined) {
+      const zipEntry = zip.getEntry(entry.name);
+      zipEntry.attr = entry.attr;
+    }
+  }
+
+  await new Promise((resolve, reject) => {
+    zip.writeZip(zipPath, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function patchZipSizes(zipPath, uncompressedBytes, compressedBytes) {
+  const buffer = await fs.readFile(zipPath);
+  const localFileHeader = 0x04034b50;
+  const centralDirectoryHeader = 0x02014b50;
+
+  for (let offset = 0; offset <= buffer.length - 4; offset += 1) {
+    const signature = buffer.readUInt32LE(offset);
+
+    if (signature === localFileHeader) {
+      buffer.writeUInt32LE(compressedBytes, offset + 18);
+      buffer.writeUInt32LE(uncompressedBytes, offset + 22);
+    } else if (signature === centralDirectoryHeader) {
+      buffer.writeUInt32LE(compressedBytes, offset + 20);
+      buffer.writeUInt32LE(uncompressedBytes, offset + 24);
+    }
+  }
+
+  await fs.writeFile(zipPath, buffer);
+}
+
+async function patchZipEntryName(zipPath, fromName, toName) {
+  assert.equal(Buffer.byteLength(fromName), Buffer.byteLength(toName));
+  const buffer = await fs.readFile(zipPath);
+  const from = Buffer.from(fromName);
+  const to = Buffer.from(toName);
+  let offset = 0;
+  let patched = 0;
+
+  while ((offset = buffer.indexOf(from, offset)) !== -1) {
+    to.copy(buffer, offset);
+    offset += to.length;
+    patched += 1;
+  }
+
+  assert.ok(patched >= 1);
+  await fs.writeFile(zipPath, buffer);
+}
+
+async function patchZipExternalAttributes(zipPath, externalAttributes) {
+  const buffer = await fs.readFile(zipPath);
+  const centralDirectoryHeader = 0x02014b50;
+  let patched = 0;
+
+  for (let offset = 0; offset <= buffer.length - 4; offset += 1) {
+    if (buffer.readUInt32LE(offset) === centralDirectoryHeader) {
+      buffer.writeUInt32LE(externalAttributes >>> 0, offset + 38);
+      patched += 1;
+    }
+  }
+
+  assert.ok(patched >= 1);
+  await fs.writeFile(zipPath, buffer);
 }
 
 test('npm install ignores package lifecycle scripts', async () => {
@@ -97,6 +172,54 @@ test('dist validation rejects symlinks', async () => {
   }
 });
 
+test('React/Vite ZIP extraction rejects traversal, symlink, zip bomb, and entry-count abuse', async () => {
+  const root = await makeTempDir('fluid-zip-security');
+
+  try {
+    const traversalZip = path.join(root, 'traversal.zip');
+    await writeZip(traversalZip, [{ name: 'aa/escape.txt', content: 'escape' }]);
+    await patchZipEntryName(traversalZip, 'aa/escape.txt', '../escape.txt');
+    await assert.rejects(
+      extractZipSafely(traversalZip, path.join(root, 'out-traversal')),
+      /Arquivo ZIP inválido/
+    );
+
+    const symlinkZip = path.join(root, 'symlink.zip');
+    await writeZip(symlinkZip, [
+      {
+        name: 'link-to-secret',
+        content: '/etc/passwd',
+      },
+    ]);
+    await patchZipExternalAttributes(symlinkZip, 0o120777 << 16);
+    await assert.rejects(
+      extractZipSafely(symlinkZip, path.join(root, 'out-symlink')),
+      /Arquivo ZIP inválido/
+    );
+
+    const bombZip = path.join(root, 'bomb.zip');
+    await writeZip(bombZip, [{ name: 'bomb.txt', content: 'x' }]);
+    await patchZipSizes(bombZip, 501 * 1024 * 1024, 1);
+    await assert.rejects(
+      extractZipSafely(bombZip, path.join(root, 'out-bomb')),
+      /Arquivo ZIP inválido/
+    );
+
+    const tooManyEntriesZip = path.join(root, 'too-many.zip');
+    const entries = Array.from({ length: 5001 }, (_, index) => ({
+      name: `files/${index}.txt`,
+      content: 'x',
+    }));
+    await writeZip(tooManyEntriesZip, entries);
+    await assert.rejects(
+      extractZipSafely(tooManyEntriesZip, path.join(root, 'out-many')),
+      /Arquivo ZIP inválido/
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('dist validation rejects hardlinks', async () => {
   const root = await makeTempDir('fluid-dist-hardlink');
   try {
@@ -115,7 +238,16 @@ test('dist validation rejects FIFO and socket entries', async (t) => {
   const fifoRoot = await makeTempDir('fluid-dist-fifo');
   try {
     const dist = await writeValidDist(fifoRoot);
-    execFileSync('mkfifo', [path.join(dist, 'assets', 'pipe')]);
+    try {
+      execFileSync('mkfifo', [path.join(dist, 'assets', 'pipe')]);
+    } catch (error) {
+      if (error.code === 'EPERM') {
+        t.skip('mkfifo is not permitted in this sandbox');
+        return;
+      }
+
+      throw error;
+    }
     await assert.rejects(validateDistDirectory(dist), /symlink, socket, FIFO ou device/);
   } finally {
     await fs.rm(fifoRoot, { recursive: true, force: true });

@@ -579,11 +579,31 @@ function scanBuildSecurity(projectBuild) {
   };
 }
 
+function assertBuildSecurityAllowsPublication(projectBuild) {
+  const securityScan = scanBuildSecurity(projectBuild);
+  const hasCriticalFinding = securityScan.findings.some((finding) => finding.severity === 'critical');
+
+  if (securityScan.status === 'blocked' || hasCriticalFinding) {
+    throw createHttpError(409, {
+      message: 'Build blocked by security scan.',
+      code: 'BUILD_SECURITY_BLOCKED',
+      security: {
+        status: 'blocked',
+        criticalFindings: securityScan.findings.filter((finding) => finding.severity === 'critical').length,
+      },
+    });
+  }
+
+  return securityScan;
+}
+
 async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publishMetadataUpdate = buildPublishMetadataUpdate(body);
   const isAlreadyPublishedBuild = isProjectBuildExplicitlyPublished(project, projectBuild);
 
   if (isAlreadyPublishedBuild) {
+    assertBuildSecurityAllowsPublication(projectBuild);
+
     const hasMetadataUpdate = Object.keys(publishMetadataUpdate).length > 0;
     const publishedProject = hasMetadataUpdate
       ? await Project.findByIdAndUpdate(project._id, publishMetadataUpdate, {
@@ -622,6 +642,8 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
       buildStatus: projectBuild.status,
     });
   }
+
+  assertBuildSecurityAllowsPublication(projectBuild);
 
   let buildJob = null;
 
@@ -711,6 +733,7 @@ module.exports = {
   buildUnpublishUpdate,
   getServableBuildPreviewUrl,
   publishProjectBuild,
+  assertBuildSecurityAllowsPublication,
   scanBuildSecurity,
   toAbsoluteBackendUrl,
   unpublishActiveProjectsForUser,
