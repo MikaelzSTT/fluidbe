@@ -8,6 +8,15 @@ const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
+const {
+  AI_QUOTA_DUPLICATE_CODE,
+  AI_QUOTA_EXCEEDED_CODE,
+  commitAiQuotaContext,
+  createAiQuotaContext,
+  ensureAiQuotaReserved,
+  refundAiQuotaContext,
+  sendAiQuotaError,
+} = require('../utils/aiQuota');
 const { createSourceContext } = require('../utils/sourceContext');
 
 const router = express.Router();
@@ -1138,10 +1147,12 @@ function normalizeClarifyQuestions(questions) {
   return normalizedQuestions.slice(0, 4);
 }
 
-async function callClaude({ messages, maxTokens = 700 }) {
+async function callClaude({ messages, maxTokens = 700, aiQuotaContext }) {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error('ANTHROPIC_API_KEY nao configurada.');
   }
+
+  await ensureAiQuotaReserved(aiQuotaContext);
 
   const anthropic = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
@@ -1215,10 +1226,12 @@ function buildOpenAiInputMessages(messages, imageAttachment) {
   return { instructions: system, input };
 }
 
-async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700 }) {
+async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700, aiQuotaContext }) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY nao configurada.');
   }
+
+  await ensureAiQuotaReserved(aiQuotaContext);
 
   const { instructions, input } = buildOpenAiInputMessages(messages, imageAttachment);
   const response = await fetch('https://api.openai.com/v1/responses', {
@@ -1263,12 +1276,13 @@ async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700 }) 
   return content;
 }
 
-async function getClarificationQuestions({ message, history }) {
+async function getClarificationQuestions({ message, history, aiQuotaContext }) {
   const previousMessages = Array.isArray(history)
     ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
     : [];
 
   const content = await callClaude({
+    aiQuotaContext,
     maxTokens: 1400,
     messages: [
       { role: 'system', content: buildClarifySystemPrompt() },
@@ -1282,7 +1296,7 @@ async function getClarificationQuestions({ message, history }) {
 }
 
 async function getFallbackChatReply({
-  message, previousMessages, projectContext, projectCodeContext, projectVisualContext, imageAttachment,
+  message, previousMessages, projectContext, projectCodeContext, projectVisualContext, imageAttachment, aiQuotaContext,
 }) {
   const messages = [
     { role: 'system', content: buildFallbackSystemPrompt(projectContext, projectCodeContext, projectVisualContext) },
@@ -1290,8 +1304,8 @@ async function getFallbackChatReply({
     { role: 'user', content: message },
   ];
   const content = imageAttachment
-    ? await callOpenAiVision({ messages, imageAttachment })
-    : await callClaude({ messages });
+    ? await callOpenAiVision({ messages, imageAttachment, aiQuotaContext })
+    : await callClaude({ messages, aiQuotaContext });
 
   const reply = String(content || '').trim();
 
@@ -1313,7 +1327,7 @@ async function getFallbackChatReply({
 }
 
 async function getAiReply({
-  message, history, project, projectCodeContext = '', projectVisualContext = '', imageAttachment,
+  message, history, project, projectCodeContext = '', projectVisualContext = '', imageAttachment, aiQuotaContext,
 }) {
   const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
@@ -1357,8 +1371,8 @@ async function getAiReply({
 
   try {
     const content = imageAttachment
-      ? await callOpenAiVision({ messages: decisionMessages, imageAttachment })
-      : await callClaude({ messages: decisionMessages });
+      ? await callOpenAiVision({ messages: decisionMessages, imageAttachment, aiQuotaContext })
+      : await callClaude({ messages: decisionMessages, aiQuotaContext });
     const parsed = extractJson(content);
     let action = String(parsed.action || '').trim().toLowerCase();
     let reply = String(parsed.reply || '').trim();
@@ -1440,6 +1454,7 @@ async function getAiReply({
         projectCodeContext,
         projectVisualContext,
         imageAttachment,
+        aiQuotaContext,
       });
     }
 
@@ -1448,6 +1463,8 @@ async function getAiReply({
 }
 
 router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
+  const aiQuotaContext = createAiQuotaContext(req, { route: 'chat-clarify' });
+
   try {
     const { message, history, messages } = req.body;
 
@@ -1462,13 +1479,22 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
     const questions = await getClarificationQuestions({
       message: message.trim(),
       history: history || messages,
+      aiQuotaContext,
     });
+    aiQuotaContext.providerUsefulResponse = true;
+    await commitAiQuotaContext(aiQuotaContext);
 
     return res.json({
       success: true,
       questions,
     });
   } catch (error) {
+    if (error?.code === AI_QUOTA_EXCEEDED_CODE || error?.code === AI_QUOTA_DUPLICATE_CODE) {
+      return sendAiQuotaError(res, error);
+    }
+
+    await refundAiQuotaContext(aiQuotaContext);
+
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });
@@ -1476,10 +1502,13 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
 });
 
 router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req, res) => {
+  const aiQuotaContext = createAiQuotaContext(req, { route: 'chat' });
+
   try {
     const { projectId } = req.body;
     const history = parseOptionalJson(req.body.history, req.body.history);
     const messages = parseOptionalJson(req.body.messages, req.body.messages);
+    const effectiveHistory = history || messages;
     const imageAttachment = buildImageAttachment(getUploadedImage(req));
     const rawMessage = typeof req.body.message === 'string' ? req.body.message : '';
     const safeImageMetadata = buildImageMetadata(imageAttachment);
@@ -1531,6 +1560,12 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         imageVisualContext,
       ].filter(Boolean).join('\n\n');
 
+      const willCallAiProvider = imageAttachment
+        || !isCompleteFirstBuildPrompt(trimmedMessage, effectiveHistory, project);
+      if (willCallAiProvider) {
+        await ensureAiQuotaReserved(aiQuotaContext);
+      }
+
       userMessage = await ProjectMessage.create({
         projectId: project._id,
         role: 'user',
@@ -1559,12 +1594,15 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
 
     const aiReply = await getAiReply({
       message: trimmedMessage,
-      history: history || messages,
+      history: effectiveHistory,
       project,
       projectCodeContext,
       projectVisualContext,
       imageAttachment,
+      aiQuotaContext,
     });
+    aiQuotaContext.providerUsefulResponse = true;
+    await commitAiQuotaContext(aiQuotaContext);
     let requiredConnectors = aiReply.requiredConnectors || [];
 
     if (project) {
@@ -1625,6 +1663,10 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     });
     return res.json(responsePayload);
   } catch (error) {
+    if (error?.code === AI_QUOTA_EXCEEDED_CODE || error?.code === AI_QUOTA_DUPLICATE_CODE) {
+      return sendAiQuotaError(res, error);
+    }
+
     if (error?.code === 'INVALID_IMAGE_TYPE') {
       return res.status(400).json({
         code: 'INVALID_IMAGE_TYPE',
@@ -1638,6 +1680,8 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         message: 'Image exceeds the 8MB limit.',
       });
     }
+
+    await refundAiQuotaContext(aiQuotaContext);
 
     return res.status(500).json({
       message: 'Erro interno do servidor.',

@@ -267,6 +267,7 @@ module.exports = {
   closeRateLimitRedis,
   createRateLimit,
   getEmailRateLimitKey,
+  getConnectedRedisClient,
   getAdminTokenKey,
   getClientIp,
   hitRedisRateLimit,

@@ -76,7 +76,7 @@ const allowedOrigins = [
 ];
 const baseCorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-key', 'Idempotency-Key', 'X-Idempotency-Key'],
   optionsSuccessStatus: 204
 };
 function corsOptions(req, callback) {
