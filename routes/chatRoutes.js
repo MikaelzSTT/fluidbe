@@ -12,6 +12,7 @@ const { createSourceContext } = require('../utils/sourceContext');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
+  name: 'chat-user',
   windowMs: 15 * 60 * 1000,
   max: 30,
   keyGenerator: (req) => req.userId ? `user:${req.userId}` : `ip:${getClientIp(req)}`,

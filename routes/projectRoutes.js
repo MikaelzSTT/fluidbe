@@ -41,11 +41,13 @@ const { deleteProjectsData } = require('../utils/projectDeletion');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
+  name: 'project-connector-credential-ip',
   windowMs: 15 * 60 * 1000,
   max: 10,
   keyGenerator: getClientIp,
 });
 const connectorCredentialUserRateLimit = createRateLimit({
+  name: 'project-connector-credential-user',
   windowMs: 15 * 60 * 1000,
   max: 6,
   keyGenerator: (req) => req.userId ? `user:${req.userId}` : `ip:${getClientIp(req)}`,

@@ -15,7 +15,12 @@ const runtimeRoutes = require('./routes/runtimeRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
 const Session = require('./models/Session');
-const { createRateLimit, getAdminTokenKey, getClientIp } = require('./middleware/rateLimit');
+const {
+  closeRateLimitRedis,
+  createRateLimit,
+  getAdminTokenKey,
+  getClientIp,
+} = require('./middleware/rateLimit');
 const {
   BUILD_PREVIEW_TTL_SECONDS,
   createBuildPreviewToken,
@@ -85,26 +90,31 @@ function corsOptions(req, callback) {
   });
 }
 const apiRateLimit = createRateLimit({
+  name: 'api-global',
   windowMs: 15 * 60 * 1000,
   max: 300,
   keyGenerator: getClientIp,
 });
 const loginRateLimit = createRateLimit({
+  name: 'auth-login',
   windowMs: 15 * 60 * 1000,
   max: 10,
   keyGenerator: getClientIp,
 });
 const registerRateLimit = createRateLimit({
+  name: 'auth-register',
   windowMs: 15 * 60 * 1000,
   max: 5,
   keyGenerator: getClientIp,
 });
 const chatIpRateLimit = createRateLimit({
+  name: 'chat-ip',
   windowMs: 15 * 60 * 1000,
   max: 60,
   keyGenerator: getClientIp,
 });
 const adminRateLimit = createRateLimit({
+  name: 'admin-global',
   windowMs: 15 * 60 * 1000,
   max: 120,
   keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
@@ -945,6 +955,25 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  console.log(`Recebido ${signal}, encerrando servidor.`);
+
+  server.close(async () => {
+    await closeRateLimitRedis().catch(() => {});
+    await mongoose.disconnect().catch(() => {});
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

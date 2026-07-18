@@ -9,11 +9,13 @@ const { unpublishActiveProjectsForUser } = require('../utils/projectPublication'
 
 const router = express.Router();
 const stripeWebhookRateLimit = createRateLimit({
+  name: 'billing-stripe-webhook',
   windowMs: 60 * 1000,
   max: 1200,
   keyGenerator: getClientIp,
 });
 const billingMutationRateLimit = createRateLimit({
+  name: 'billing-mutation',
   windowMs: 15 * 60 * 1000,
   max: 5,
   keyGenerator: (req) => String(req.userId || 'anonymous'),

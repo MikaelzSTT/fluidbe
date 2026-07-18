@@ -38,11 +38,13 @@ const {
 const router = express.Router({ mergeParams: true });
 const MAX_RUNTIME_PASSWORD_BYTES = 72;
 const runtimeRateLimit = createRateLimit({
+  name: 'runtime-global',
   windowMs: 60 * 1000,
   max: 120,
   keyGenerator: (req) => `${req.params.projectId || 'unknown'}:${getClientIp(req)}`,
 });
 const runtimeAuthRateLimit = createRateLimit({
+  name: 'runtime-auth',
   windowMs: 15 * 60 * 1000,
   max: 10,
   keyGenerator: (req) => `${req.params.projectId || 'unknown'}:${getClientIp(req)}`,

@@ -36,6 +36,7 @@ const {
 
 const router = express.Router();
 const reactViteUploadRateLimit = createRateLimit({
+  name: 'admin-react-vite-upload',
   windowMs: 60 * 60 * 1000,
   max: 3,
   keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,

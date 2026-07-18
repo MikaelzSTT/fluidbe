@@ -43,20 +43,24 @@ const MAX_PASSWORD_BYTES = 72;
 const MAX_EMAIL_CHARS = 320;
 const INVALID_PASSWORD_HASH = '$2b$10$oE4adb62xrznmIZJwK9GYOgfO83CCk9wNy5mZUnKXto9FfRRWHfbq';
 const passwordChangeRateLimit = createRateLimit({
+  name: 'auth-password-change',
   windowMs: 15 * 60 * 1000,
   max: 5,
   keyGenerator: (req) => String(req.userId || 'anonymous'),
 });
 const twoFactorVerifyLoginRateLimit = createRateLimit({
+  name: 'auth-2fa-verify-login',
   windowMs: 15 * 60 * 1000,
   max: 10,
 });
 const twoFactorEnableRateLimit = createRateLimit({
+  name: 'auth-2fa-enable',
   windowMs: 15 * 60 * 1000,
   max: 8,
   keyGenerator: (req) => String(req.userId || 'anonymous'),
 });
 const twoFactorDisableRateLimit = createRateLimit({
+  name: 'auth-2fa-disable',
   windowMs: 15 * 60 * 1000,
   max: 8,
   keyGenerator: (req) => String(req.userId || 'anonymous'),
