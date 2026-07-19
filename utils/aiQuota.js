@@ -155,7 +155,9 @@ return {1, 'reserved', daily, monthly, globalDaily, globalMonthly, ipDaily}
 let lastFallbackLogAt = 0;
 
 function parseIntegerEnv(name, fallback, { allowZero = true } = {}) {
-  const value = process.env[name];
+  const value = typeof process.env[name] === 'string'
+    ? process.env[name].trim()
+    : process.env[name];
 
   if (value === undefined || value === '') {
     return fallback;
@@ -625,10 +627,12 @@ function createAiQuotaService({
       return;
     }
 
-    const client = await redisClientProvider().catch((error) => {
-      logAiQuotaRedisFallback(error);
-      return null;
-    });
+    const client = await Promise.resolve()
+      .then(redisClientProvider)
+      .catch((error) => {
+        logAiQuotaRedisFallback(error);
+        return null;
+      });
 
     if (!client) {
       return;
@@ -652,10 +656,12 @@ function createAiQuotaService({
       return;
     }
 
-    const client = await redisClientProvider().catch((error) => {
-      logAiQuotaRedisFallback(error);
-      return null;
-    });
+    const client = await Promise.resolve()
+      .then(redisClientProvider)
+      .catch((error) => {
+        logAiQuotaRedisFallback(error);
+        return null;
+      });
 
     if (!client) {
       return;
@@ -694,8 +700,10 @@ function createAiQuotaContext(req, { route = 'chat' } = {}) {
   return {
     req,
     route,
+    requestId: null,
     reservation: null,
     providerUsefulResponse: false,
+    stage: null,
   };
 }
 
@@ -709,8 +717,9 @@ async function ensureAiQuotaReserved(context, service = defaultAiQuotaService) {
   }
 
   const req = context.req;
-  const plan = await resolveBackendPlan(req.userId);
   const requestId = getAiQuotaRequestId(req, context.route);
+  context.requestId = requestId;
+  const plan = await resolveBackendPlan(req.userId);
   const reservation = await service.reserve({
     userId: req.userId,
     plan,

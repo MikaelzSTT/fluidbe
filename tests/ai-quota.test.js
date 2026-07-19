@@ -274,6 +274,29 @@ test('planos diferentes recebem limites diferentes reais do backend', () => {
   });
 });
 
+test('variáveis opcionais de quota com espaços usam fallback em vez de zero', async () => {
+  await withEnv({
+    AI_QUOTA_FREE_DAILY_LIMIT: '   ',
+    AI_QUOTA_FREE_MONTHLY_LIMIT: '   ',
+  }, async () => {
+    const service = createAiQuotaService({
+      nowProvider: () => new Date('2026-07-18T12:00:00.000Z'),
+      redisClientProvider: () => null,
+    });
+
+    const reservation = await service.reserve({
+      userId: 'space-env-user',
+      plan: 'free',
+      route: 'chat',
+      requestId: 'space-env',
+      ip: '203.0.113.21',
+    });
+
+    assert.equal(reservation.usage.daily.limit, 3);
+    assert.equal(reservation.usage.monthly.limit, 10);
+  });
+});
+
 test('troca de dia e mês reseta os contadores por TTL', async () => {
   await withEnv({
     AI_QUOTA_FREE_DAILY_LIMIT: '1',
@@ -333,6 +356,36 @@ test('falha do provider estorna quando não houve resposta útil', async () => {
 
     await service.reserve({ userId: 'refund-user', plan: 'free', route: 'chat', requestId: 'retry-1', ip: '203.0.113.15' });
   });
+});
+
+test('commit e refund aceitam redisClientProvider síncrono em testes/stubs', async () => {
+  const now = new Date('2026-07-18T12:00:00.000Z');
+  const redis = new FakeRedis(() => now);
+  const service = createAiQuotaService({
+    nowProvider: () => now,
+    redisClientProvider: () => redis,
+  });
+
+  const committed = await service.reserve({
+    userId: 'sync-provider-user',
+    plan: 'free',
+    route: 'chat',
+    requestId: 'sync-commit',
+    ip: '203.0.113.22',
+  });
+  await service.commit(committed);
+
+  const refunded = await service.reserve({
+    userId: 'sync-provider-user',
+    plan: 'free',
+    route: 'chat',
+    requestId: 'sync-refund',
+    ip: '203.0.113.22',
+  });
+  await service.refund(refunded);
+
+  assert.equal(redis.requests.get(committed.keys.requestKey).state, 'committed');
+  assert.equal(redis.requests.get(refunded.keys.requestKey).state, 'refunded');
 });
 
 test('Redis indisponível não libera uso ilimitado', async () => {

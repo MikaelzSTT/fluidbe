@@ -47,6 +47,12 @@ const WIZARD_MODE = 'wizard';
 const CLARIFY_MODE = 'clarify';
 const CHAT_MODE = 'chat';
 const BUILD_NOW_REPLY = 'Perfeito - vou começar a construir agora.';
+const SAFE_CHAT_ERROR_STAGES = new Set([
+  'quota_reserve',
+  'provider_call',
+  'quota_commit',
+  'quota_refund',
+]);
 const IMAGE_ONLY_DEFAULT_PROMPTS = Object.freeze({
   en: 'Use this image as context and help me decide what to build.',
   pt: 'Use esta imagem como contexto e me ajude a decidir o que construir.',
@@ -171,6 +177,41 @@ const CONNECTOR_RULES = [
     ],
   },
 ];
+
+function getSafeQuotaRequestId(aiQuotaContext) {
+  const value = aiQuotaContext?.reservation?.requestId || aiQuotaContext?.requestId;
+  const requestId = String(value || '').trim();
+
+  return requestId ? requestId.slice(0, 160) : null;
+}
+
+function setAiQuotaStage(aiQuotaContext, stage) {
+  if (aiQuotaContext) {
+    aiQuotaContext.stage = stage;
+  }
+}
+
+function logSafeChatError(error, aiQuotaContext, stage = aiQuotaContext?.stage) {
+  if (!SAFE_CHAT_ERROR_STAGES.has(stage)) {
+    return;
+  }
+
+  console.error('[chat] error', {
+    name: error?.name || 'Error',
+    stage,
+    requestId: getSafeQuotaRequestId(aiQuotaContext),
+  });
+}
+
+async function refundAiQuotaAfterError(aiQuotaContext) {
+  setAiQuotaStage(aiQuotaContext, 'quota_refund');
+
+  try {
+    await refundAiQuotaContext(aiQuotaContext);
+  } catch (error) {
+    logSafeChatError(error, aiQuotaContext, 'quota_refund');
+  }
+}
 
 function parseOptionalJson(value, fallback) {
   if (value === undefined || value === null || value === '') {
@@ -1149,10 +1190,13 @@ function normalizeClarifyQuestions(questions) {
 
 async function callClaude({ messages, maxTokens = 700, aiQuotaContext }) {
   if (!process.env.ANTHROPIC_API_KEY) {
+    setAiQuotaStage(aiQuotaContext, 'provider_call');
     throw new Error('ANTHROPIC_API_KEY nao configurada.');
   }
 
+  setAiQuotaStage(aiQuotaContext, 'quota_reserve');
   await ensureAiQuotaReserved(aiQuotaContext);
+  setAiQuotaStage(aiQuotaContext, 'provider_call');
 
   const anthropic = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
@@ -1228,10 +1272,13 @@ function buildOpenAiInputMessages(messages, imageAttachment) {
 
 async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700, aiQuotaContext }) {
   if (!process.env.OPENAI_API_KEY) {
+    setAiQuotaStage(aiQuotaContext, 'provider_call');
     throw new Error('OPENAI_API_KEY nao configurada.');
   }
 
+  setAiQuotaStage(aiQuotaContext, 'quota_reserve');
   await ensureAiQuotaReserved(aiQuotaContext);
+  setAiQuotaStage(aiQuotaContext, 'provider_call');
 
   const { instructions, input } = buildOpenAiInputMessages(messages, imageAttachment);
   const response = await fetch('https://api.openai.com/v1/responses', {
@@ -1482,7 +1529,9 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
       aiQuotaContext,
     });
     aiQuotaContext.providerUsefulResponse = true;
+    setAiQuotaStage(aiQuotaContext, 'quota_commit');
     await commitAiQuotaContext(aiQuotaContext);
+    setAiQuotaStage(aiQuotaContext, null);
 
     return res.json({
       success: true,
@@ -1493,7 +1542,8 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
       return sendAiQuotaError(res, error);
     }
 
-    await refundAiQuotaContext(aiQuotaContext);
+    logSafeChatError(error, aiQuotaContext);
+    await refundAiQuotaAfterError(aiQuotaContext);
 
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -1563,6 +1613,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       const willCallAiProvider = imageAttachment
         || !isCompleteFirstBuildPrompt(trimmedMessage, effectiveHistory, project);
       if (willCallAiProvider) {
+        setAiQuotaStage(aiQuotaContext, 'quota_reserve');
         await ensureAiQuotaReserved(aiQuotaContext);
       }
 
@@ -1602,7 +1653,9 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       aiQuotaContext,
     });
     aiQuotaContext.providerUsefulResponse = true;
+    setAiQuotaStage(aiQuotaContext, 'quota_commit');
     await commitAiQuotaContext(aiQuotaContext);
+    setAiQuotaStage(aiQuotaContext, null);
     let requiredConnectors = aiReply.requiredConnectors || [];
 
     if (project) {
@@ -1681,7 +1734,8 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       });
     }
 
-    await refundAiQuotaContext(aiQuotaContext);
+    logSafeChatError(error, aiQuotaContext);
+    await refundAiQuotaAfterError(aiQuotaContext);
 
     return res.status(500).json({
       message: 'Erro interno do servidor.',
