@@ -1,5 +1,6 @@
 const assert = require('assert/strict');
 const test = require('node:test');
+const mongoose = require('mongoose');
 
 const Project = require('../models/Project');
 const RuntimeDocument = require('../models/RuntimeDocument');
@@ -70,11 +71,12 @@ test('project detail lookup scopes an attacker-supplied id to the authenticated 
     const res = createResponse();
     await handler({
       params: { id: '64f000000000000000000099' },
+      projectObjectId: new mongoose.Types.ObjectId('64f000000000000000000099'),
       userId: '64f000000000000000000001',
     }, res);
 
     assert.deepEqual(query, {
-      _id: '64f000000000000000000099',
+      _id: new mongoose.Types.ObjectId('64f000000000000000000099'),
       userId: '64f000000000000000000001',
     });
     assert.equal(res.statusCode, 404);
@@ -100,6 +102,23 @@ test('project CRUD rejects malformed ids before reaching ownership queries', () 
   }
 });
 
+test('project CRUD rejects object id selector injection before ownership queries', () => {
+  for (const method of ['get', 'put', 'delete']) {
+    const layer = projectRoutes.stack.find((item) => (
+      item.route?.path === '/:id' && item.route?.methods?.[method]
+    ));
+    const validation = layer.route.stack[1].handle;
+    const res = createResponse();
+    let nextCalled = false;
+
+    validation({ params: { id: { $ne: null } } }, res, () => { nextCalled = true; });
+
+    assert.equal(nextCalled, false);
+    assert.equal(res.statusCode, 404);
+    assert.deepEqual(res.body, { message: 'Projeto não encontrado.' });
+  }
+});
+
 test('project delete fails closed before cascading when ownership does not match', async () => {
   const originalFindOne = Project.findOne;
   const handler = getRouteHandler(projectRoutes, '/:id', 'delete');
@@ -114,11 +133,12 @@ test('project delete fails closed before cascading when ownership does not match
     const res = createResponse();
     await handler({
       params: { id: '64f000000000000000000099' },
+      projectObjectId: new mongoose.Types.ObjectId('64f000000000000000000099'),
       userId: '64f000000000000000000001',
     }, res);
 
     assert.deepEqual(query, {
-      _id: '64f000000000000000000099',
+      _id: new mongoose.Types.ObjectId('64f000000000000000000099'),
       userId: '64f000000000000000000001',
     });
     assert.equal(res.statusCode, 404);
@@ -144,8 +164,8 @@ test('runtime storage always adds project and collection scope', async () => {
     );
 
     assert.deepEqual(query, {
-      _id: '64f000000000000000000099',
-      projectId: '64f000000000000000000001',
+      _id: new mongoose.Types.ObjectId('64f000000000000000000099'),
+      projectId: new mongoose.Types.ObjectId('64f000000000000000000001'),
       collection: 'orders',
     });
     assert.throws(

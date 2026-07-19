@@ -3,10 +3,12 @@ const fs = require('fs/promises');
 const path = require('path');
 const test = require('node:test');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const Stripe = require('stripe');
 
 const authMiddleware = require('../middleware/authMiddleware');
 const authRoutes = require('../routes/authRoutes');
+const adminRoutes = require('../routes/adminRoutes');
 const billingRoutes = require('../routes/billingRoutes');
 const projectRoutes = require('../routes/projectRoutes');
 const Project = require('../models/Project');
@@ -17,6 +19,12 @@ const User = require('../models/User');
 const {
   publishProjectBuild,
 } = require('../utils/projectPublication');
+const {
+  buildRuntimeEqualityFilter,
+} = require('../utils/runtimeValidation');
+const {
+  runtimeUpdate,
+} = require('../utils/runtimeStore');
 const { verifyRuntimeAuthToken } = require('../utils/runtimeAuth');
 const { assertSafeRuntimeBody } = require('../utils/runtimeValidation');
 const { timingSafeEqualString } = require('../utils/timingSafe');
@@ -57,6 +65,14 @@ function getBillingRouteStack(pathname, method) {
   ));
 
   return layer.route.stack.map((item) => item.handle);
+}
+
+function getRouteHandler(router, pathname, method) {
+  const layer = router.stack.find((item) => (
+    item.route?.path === pathname && item.route?.methods?.[method]
+  ));
+
+  return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
 async function runHandler(handler, req) {
@@ -100,6 +116,46 @@ test('runtime body validation rejects prototype-pollution keys at any depth', ()
   assert.equal(assertSafeRuntimeBody({ nested: { safe: true } }), true);
   assert.equal(assertSafeRuntimeBody(constructorPayload), false);
   assert.equal(assertSafeRuntimeBody(protoPayload), false);
+});
+
+test('runtime query validation rejects Mongo selector, regex and code operators', () => {
+  assert.equal(buildRuntimeEqualityFilter({ email: 'person@example.test' })['data.email'], 'person@example.test');
+  assert.equal(buildRuntimeEqualityFilter({ $or: [{ role: 'admin' }] }), null);
+  assert.equal(buildRuntimeEqualityFilter({ $where: 'sleep(1000)' }), null);
+  assert.equal(buildRuntimeEqualityFilter({ email: { $regex: '(a+)+$' } }), null);
+  assert.equal(buildRuntimeEqualityFilter({ 'email.$ne': 'x' }), null);
+});
+
+test('runtime store rejects update operators, owner/project swaps and aggregate-style payloads', () => {
+  assert.throws(
+    () => runtimeUpdate(
+      '64f000000000000000000001',
+      'orders',
+      { _id: '64f000000000000000000002' },
+      { $set: { userId: '64f000000000000000000099' } }
+    ),
+    /unsafe keys/
+  );
+
+  assert.throws(
+    () => runtimeUpdate(
+      '64f000000000000000000001',
+      'orders',
+      { _id: '64f000000000000000000002' },
+      { projectId: '64f000000000000000000099' }
+    ),
+    /unsafe keys/
+  );
+
+  assert.throws(
+    () => runtimeUpdate(
+      '64f000000000000000000001',
+      'orders',
+      { $match: { projectId: { $ne: null } } },
+      { status: 'paid' }
+    ),
+    /unsafe keys/
+  );
 });
 
 test('timing-safe string comparison fails closed for malformed and unequal values', () => {
@@ -176,6 +232,82 @@ test('login does not disclose whether an account is missing or provider-only', a
     });
   } finally {
     User.findOne = originalFindOne;
+  }
+});
+
+test('login rejects Mongo selector injection before querying users', async () => {
+  const originalFindOne = User.findOne;
+  const handler = getAuthRouteHandler('/login', 'post');
+  let queried = false;
+
+  User.findOne = async () => {
+    queried = true;
+    return null;
+  };
+
+  try {
+    const res = createResponse();
+    await handler({
+      body: {
+        email: { $ne: null },
+        password: 'not-the-password',
+      },
+    }, res);
+
+    assert.equal(res.statusCode, 400);
+    assert.equal(queried, false);
+  } finally {
+    User.findOne = originalFindOne;
+  }
+});
+
+test('admin project aggregate pipeline is static and ignores request filters', async () => {
+  const originalFind = Project.find;
+  const originalAggregate = require('../models/ProjectChangeRequest').aggregate;
+  const ProjectChangeRequest = require('../models/ProjectChangeRequest');
+  const handler = getRouteHandler(adminRoutes, '/projects', 'get');
+  let pipeline;
+
+  Project.find = () => ({
+    sort: async () => [{
+      _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+      toObject: () => ({ _id: '64f000000000000000000001' }),
+    }],
+  });
+  ProjectChangeRequest.aggregate = async (capturedPipeline) => {
+    pipeline = capturedPipeline;
+    return [];
+  };
+
+  try {
+    const res = createResponse();
+    await handler({
+      query: {
+        $match: { projectId: { $ne: null } },
+        pipeline: [{ $where: 'sleep(1000)' }],
+      },
+      protocol: 'https',
+      get: () => 'backend.example.test',
+    }, res);
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(pipeline, [
+      {
+        $match: {
+          status: 'pending',
+          projectId: { $in: [new mongoose.Types.ObjectId('64f000000000000000000001')] },
+        },
+      },
+      {
+        $group: {
+          _id: '$projectId',
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+  } finally {
+    Project.find = originalFind;
+    ProjectChangeRequest.aggregate = originalAggregate;
   }
 });
 

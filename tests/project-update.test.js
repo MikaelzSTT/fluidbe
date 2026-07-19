@@ -34,6 +34,7 @@ async function runPut(body, findOneAndUpdate) {
   const handler = getProjectPutHandler();
   const req = {
     params: { id: '64f000000000000000000001' },
+    projectObjectId: new mongoose.Types.ObjectId('64f000000000000000000001'),
     userId: '64f000000000000000000002',
     body,
   };
@@ -68,7 +69,7 @@ test('project PUT accepts partial update without name', async () => {
 
   assert.equal(res.statusCode, 200);
   assert.deepEqual(captured[0], {
-    _id: '64f000000000000000000001',
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
     userId: '64f000000000000000000002',
   });
   assert.deepEqual(captured[1], { $set: { prompt: 'Refine the dashboard' } });
@@ -205,7 +206,9 @@ test('project PUT preserves normal wizard update fields and drops draft metadata
       description: 'Premium delivery app',
       prompt: 'Build a premium food delivery app',
       type: 'web-app',
-      settings: { theme: 'light', primaryColor: '#2563eb', language: 'pt-BR' },
+      'settings.theme': 'light',
+      'settings.primaryColor': '#2563eb',
+      'settings.language': 'pt-BR',
       status: 'done',
       generation_status: 'done',
       generationStatus: 'done',
@@ -243,4 +246,33 @@ test('project PUT ignores build artifacts and preview token URLs', async () => {
   });
   assert.equal(JSON.stringify(update).includes('previewToken'), false);
   assert.equal(JSON.stringify(update).includes('artifactFiles'), false);
+});
+
+test('project PUT rejects Mongo update operators before querying', async () => {
+  let queried = false;
+  const res = await runPut({
+    $set: {
+      userId: '64f000000000000000000099',
+    },
+    prompt: 'Do not persist',
+  }, async () => {
+    queried = true;
+    return null;
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.deepEqual(res.body, { message: 'Payload de atualização contém campos inválidos.' });
+  assert.equal(queried, false);
+});
+
+test('project update rejects nested Mongo and prototype-pollution keys', () => {
+  assert.equal(projectRoutes.buildProjectUpdate({
+    settings: {
+      $where: 'sleep(1000)',
+    },
+  }), null);
+
+  assert.equal(projectRoutes.buildProjectUpdate(
+    JSON.parse('{"settings":{"constructor":{"prototype":{"polluted":true}}}}')
+  ), null);
 });

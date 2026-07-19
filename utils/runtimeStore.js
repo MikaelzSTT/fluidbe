@@ -1,5 +1,11 @@
 const RuntimeDocument = require('../models/RuntimeDocument');
 const mongoose = require('mongoose');
+const {
+  containsUnsafeMongoKey,
+  isPlainObject,
+} = require('./mongoSafety');
+
+const SAFE_RUNTIME_DATA_PATH = /^data\.[A-Za-z0-9_-]+$/;
 
 function assertProjectId(projectId) {
   if (!projectId) {
@@ -33,14 +39,67 @@ function assertNoOwnerOverride(value) {
   }
 }
 
+function toRuntimeObjectId(value, fieldName) {
+  if (value instanceof mongoose.Types.ObjectId) {
+    return value;
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(value)) {
+    throw new Error(`Runtime ${fieldName} is invalid.`);
+  }
+
+  return new mongoose.Types.ObjectId(value);
+}
+
+function isSafeRuntimeFilterValue(value) {
+  return (
+    value instanceof mongoose.Types.ObjectId ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null
+  );
+}
+
+function normalizeRuntimeFilter(filter = {}) {
+  if (!isPlainObject(filter) || containsUnsafeMongoKey(filter, { allowDots: true })) {
+    throw new Error('Runtime filter contains unsafe keys.');
+  }
+
+  const normalizedFilter = {};
+
+  for (const [key, value] of Object.entries(filter)) {
+    if (key === 'projectId' || key === 'collection') {
+      throw new Error('Runtime scope overrides are not allowed.');
+    }
+
+    if (key === '_id' || key === 'ownerId') {
+      normalizedFilter[key] = toRuntimeObjectId(value, key);
+      continue;
+    }
+
+    if (!SAFE_RUNTIME_DATA_PATH.test(key)) {
+      throw new Error('Runtime filter contains unsupported fields.');
+    }
+
+    if (!isSafeRuntimeFilterValue(value)) {
+      throw new Error('Runtime filter values must be primitive.');
+    }
+
+    normalizedFilter[key] = value;
+  }
+
+  return normalizedFilter;
+}
+
 function scopedQuery(projectId, collection, filter = {}) {
   assertProjectId(projectId);
   assertCollection(collection);
-  assertNoProjectOverride(filter);
+  const normalizedFilter = normalizeRuntimeFilter(filter);
 
   return {
-    ...filter,
-    projectId,
+    ...normalizedFilter,
+    projectId: toRuntimeObjectId(projectId, 'projectId'),
     collection,
   };
 }
@@ -66,11 +125,16 @@ function runtimeFindOne(projectId, collection, filter = {}) {
 function runtimeCreate(projectId, collection, data = {}, options = {}) {
   assertProjectId(projectId);
   assertCollection(collection);
+
+  if (!isPlainObject(data) || containsUnsafeMongoKey(data, { blockOwnerId: true, blockProjectId: true })) {
+    throw new Error('Runtime document body contains unsafe keys.');
+  }
+
   assertNoProjectOverride(data);
   assertNoOwnerOverride(data);
 
   const document = {
-    projectId,
+    projectId: toRuntimeObjectId(projectId, 'projectId'),
     collection,
     data,
   };
@@ -87,6 +151,10 @@ function runtimeCreate(projectId, collection, data = {}, options = {}) {
 }
 
 function runtimeUpdate(projectId, collection, filter = {}, update = {}) {
+  if (!isPlainObject(update) || containsUnsafeMongoKey(update, { blockOwnerId: true, blockProjectId: true })) {
+    throw new Error('Runtime document update contains unsafe keys.');
+  }
+
   assertNoProjectOverride(update);
   assertNoOwnerOverride(update);
 

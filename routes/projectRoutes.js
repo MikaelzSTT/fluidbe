@@ -38,6 +38,10 @@ const {
 } = require('../utils/projectNaming');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
 const { deleteProjectsData } = require('../utils/projectDeletion');
+const {
+  containsUnsafeMongoKey,
+  isPlainObject,
+} = require('../utils/mongoSafety');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -86,7 +90,11 @@ const PROJECT_UPDATE_FIELDS = new Set([
   'generation_status',
   'prompt',
   'type',
-  'settings',
+]);
+const PROJECT_SETTINGS_UPDATE_FIELDS = new Set([
+  'theme',
+  'primaryColor',
+  'language',
 ]);
 const PUBLISHED_PROJECT_LIMITS = {
   free: 0,
@@ -810,7 +818,11 @@ function buildStatusError(projectBuild, buildJob) {
 
 function buildProjectUpdate(body) {
   const update = {};
-  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const source = isPlainObject(body) ? body : {};
+
+  if (containsUnsafeMongoKey(source, { blockProjectId: true })) {
+    return null;
+  }
 
   for (const field of PROJECT_UPDATE_FIELDS) {
     if (
@@ -818,6 +830,21 @@ function buildProjectUpdate(body) {
       source[field] !== undefined
     ) {
       update[field] = source[field];
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(source, 'settings')) {
+    if (!isPlainObject(source.settings)) {
+      return null;
+    }
+
+    for (const field of PROJECT_SETTINGS_UPDATE_FIELDS) {
+      if (
+        Object.prototype.hasOwnProperty.call(source.settings, field) &&
+        source.settings[field] !== undefined
+      ) {
+        update[`settings.${field}`] = source.settings[field];
+      }
     }
   }
 
@@ -849,6 +876,7 @@ function validateOwnedProjectId(req, res, next) {
     return res.status(404).json({ message: 'Projeto não encontrado.' });
   }
 
+  req.projectObjectId = new mongoose.Types.ObjectId(req.params.id);
   return next();
 }
 
@@ -1168,8 +1196,9 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'ID de projeto inválido.' });
     }
 
+    const projectObjectId = new mongoose.Types.ObjectId(req.params.id);
     const project = await Project.findOne({
-      _id: req.params.id,
+      _id: projectObjectId,
       userId: req.userId,
     });
 
@@ -1625,7 +1654,7 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
 router.get('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const project = await Project.findOne({
-      _id: req.params.id,
+      _id: req.projectObjectId,
       userId: req.userId,
     });
 
@@ -1645,13 +1674,17 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const update = buildProjectUpdate(req.body);
 
+    if (!update) {
+      return res.status(400).json({ message: 'Payload de atualização contém campos inválidos.' });
+    }
+
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ message: 'Nenhum campo válido enviado para atualização.' });
     }
 
     const project = await Project.findOneAndUpdate(
       {
-        _id: req.params.id,
+        _id: req.projectObjectId,
         userId: req.userId,
       },
       { $set: update },
@@ -1677,7 +1710,7 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
 router.delete('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
     const project = await Project.findOne({
-      _id: req.params.id,
+      _id: req.projectObjectId,
       userId: req.userId,
     });
 

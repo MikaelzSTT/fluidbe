@@ -1,4 +1,8 @@
 const RESERVED_QUERY_KEYS = new Set(['limit', 'skip']);
+const {
+  containsUnsafeMongoKey,
+  isPlainObject,
+} = require('./mongoSafety');
 const BLOCKED_COLLECTIONS = new Set([
   'users',
   'projects',
@@ -13,7 +17,6 @@ const BLOCKED_COLLECTIONS = new Set([
 
 const SAFE_COLLECTION_PATTERN = /^[a-z0-9_-]+$/;
 const SAFE_FIELD_PATTERN = /^[A-Za-z0-9_-]+$/;
-const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function validateCollectionName(collection) {
   if (
@@ -25,39 +28,6 @@ function validateCollectionName(collection) {
   }
 
   return collection;
-}
-
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function containsUnsafeKey(value, { blockOwnerId = false, blockProjectId = false } = {}) {
-  if (Array.isArray(value)) {
-    return value.some((item) => containsUnsafeKey(item, { blockOwnerId, blockProjectId }));
-  }
-
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-
-  return Object.entries(value).some(([key, nestedValue]) => {
-    if (
-      key.startsWith('$') ||
-      key.includes('.') ||
-      UNSAFE_OBJECT_KEYS.has(key) ||
-      (blockProjectId && key === 'projectId') ||
-      (blockOwnerId && key === 'ownerId')
-    ) {
-      return true;
-    }
-
-    return containsUnsafeKey(nestedValue, { blockOwnerId, blockProjectId });
-  });
 }
 
 function isPrimitiveFilterValue(value) {
@@ -94,6 +64,10 @@ function normalizeQueryValue(value) {
 }
 
 function buildRuntimeEqualityFilter(query = {}) {
+  if (!isPlainObject(query) || containsUnsafeMongoKey(query)) {
+    return null;
+  }
+
   const filter = {};
 
   for (const [key, rawValue] of Object.entries(query)) {
@@ -131,7 +105,7 @@ function assertSafeRuntimeBody(body) {
     return false;
   }
 
-  return !containsUnsafeKey(body, { blockOwnerId: true, blockProjectId: true });
+  return !containsUnsafeMongoKey(body, { blockOwnerId: true, blockProjectId: true });
 }
 
 module.exports = {
