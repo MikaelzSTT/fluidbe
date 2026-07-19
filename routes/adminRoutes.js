@@ -13,9 +13,15 @@ const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
+const User = require('../models/User');
+const {
+  ADMIN_PERMISSIONS,
+  ADMIN_ROLES,
+  requireAdmin,
+  revokeAdminSessionsForUser,
+} = require('../middleware/adminAuth');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
-const { timingSafeEqualString } = require('../utils/timingSafe');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
@@ -356,16 +362,6 @@ function removePublicPublishFields(update) {
   }
 }
 
-function requireAdmin(req, res, next) {
-  const adminToken = process.env.ADMIN_TOKEN;
-
-  if (!adminToken || !timingSafeEqualString(req.headers['x-admin-token'], adminToken)) {
-    return res.status(401).json({ message: 'Admin não autorizado' });
-  }
-
-  return next();
-}
-
 function normalizeConnectorProvider(provider) {
   return String(provider || '')
     .trim()
@@ -450,6 +446,75 @@ function validateObjectIdParam(paramName, message) {
 
     return next();
   };
+}
+
+function parsePositiveInt(value, fallback, max) {
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return Math.min(parsed, max);
+}
+
+function sanitizeAdminPermissions(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const allowed = new Set(ADMIN_PERMISSIONS);
+  const permissions = [];
+
+  for (const item of value) {
+    if (typeof item !== 'string' || !allowed.has(item)) {
+      return null;
+    }
+
+    if (!permissions.includes(item)) {
+      permissions.push(item);
+    }
+  }
+
+  return permissions;
+}
+
+async function ensureCanChangeAdminRole(req, targetUser, nextRole) {
+  if (targetUser.role !== 'admin' || nextRole === 'admin') {
+    return { ok: true };
+  }
+
+  const remainingAdmins = await User.countDocuments({
+    _id: { $ne: targetUser._id },
+    role: 'admin',
+    deletedAt: null,
+  });
+
+  if (remainingAdmins <= 0) {
+    return {
+      ok: false,
+      status: 409,
+      message: 'LAST_ACTIVE_ADMIN_REQUIRED',
+    };
+  }
+
+  if (
+    req.adminAuth?.adminUserId &&
+    String(req.adminAuth.adminUserId) === String(targetUser._id) &&
+    req.body?.confirmSelfDemotion !== 'DEMOTE_SELF'
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'SELF_DEMOTION_CONFIRMATION_REQUIRED',
+    };
+  }
+
+  return { ok: true };
 }
 
 function getLegacyBuildJobStatus(projectBuildStatus) {
@@ -2581,10 +2646,28 @@ async function applyLatestPendingBuild(projectId, update) {
   applyPublishedBuildFields(latestPendingBuild, update);
 }
 
+router.get('/status', requireAdmin, async (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      admin: {
+        actorType: req.adminAuth?.actorType || null,
+        userId: req.adminAuth?.adminUserId ? String(req.adminAuth.adminUserId) : null,
+        permission: req.adminAuth?.permission || null,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
 router.get('/change-requests', requireAdmin, async (req, res) => {
   try {
     const query = {};
     const status = String(req.query.status || '').trim();
+    const limit = parsePositiveInt(req.query.limit, 100, 100);
 
     if (status) {
       if (!CHANGE_REQUEST_STATUSES.includes(status)) {
@@ -2597,15 +2680,21 @@ router.get('/change-requests', requireAdmin, async (req, res) => {
       query.status = status;
     }
 
-    const changeRequests = await ProjectChangeRequest.find(query)
+    const changeRequestQuery = ProjectChangeRequest.find(query)
       .sort({ createdAt: -1, _id: -1 })
       .populate('projectId', 'name title prompt status generationStatus generation_status')
-      .populate('userId', 'name email')
-      .lean();
+      .populate('userId', 'name email');
+
+    if (typeof changeRequestQuery.limit === 'function') {
+      changeRequestQuery.limit(limit);
+    }
+
+    const changeRequests = await changeRequestQuery.lean();
 
     return res.json({
       success: true,
       changeRequests,
+      limit,
     });
   } catch (error) {
     return res.status(500).json({
@@ -2616,10 +2705,17 @@ router.get('/change-requests', requireAdmin, async (req, res) => {
 
 router.get('/projects', requireAdmin, async (req, res) => {
   try {
-    const projects = await Project.find().sort({
+    const limit = parsePositiveInt(req.query.limit, 100, 100);
+    const projectQuery = Project.find().sort({
       updatedAt: -1,
       createdAt: -1,
     });
+
+    if (typeof projectQuery.limit === 'function') {
+      projectQuery.limit(limit);
+    }
+
+    const projects = await projectQuery;
     const pendingChangeRequestCounts = await ProjectChangeRequest.aggregate([
       {
         $match: {
@@ -2640,6 +2736,7 @@ router.get('/projects', requireAdmin, async (req, res) => {
 
     return res.json({
       success: true,
+      limit,
       projects: projects.map((project) => ({
         ...withAbsoluteProjectBuildUrls(req, project),
         pendingChangeRequestCount: pendingCountByProjectId.get(String(project._id)) || 0,
@@ -2651,6 +2748,111 @@ router.get('/projects', requireAdmin, async (req, res) => {
     });
   }
 });
+
+router.patch(
+  '/users/:userId/role',
+  requireAdmin,
+  validateObjectIdParam('userId', 'ID de usuário inválido.'),
+  async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
+
+      if (!body) {
+        return res.status(400).json({ message: 'Requisição inválida.' });
+      }
+
+      const allowedFields = new Set(['role', 'permissions', 'confirmSelfDemotion']);
+      const unknownFields = Object.keys(body).filter((field) => !allowedFields.has(field));
+
+      if (unknownFields.length > 0) {
+        return res.status(400).json({ message: 'Requisição inválida.' });
+      }
+
+      const nextRole = typeof body.role === 'string' ? body.role.trim().toLowerCase() : null;
+
+      if (!ADMIN_ROLES.includes(nextRole)) {
+        return res.status(400).json({
+          message: 'Role inválida.',
+          allowedRoles: ADMIN_ROLES,
+        });
+      }
+
+      const permissions = sanitizeAdminPermissions(body.permissions);
+
+      if (permissions === null) {
+        return res.status(400).json({
+          message: 'Permissões inválidas.',
+          allowedPermissions: ADMIN_PERMISSIONS,
+        });
+      }
+
+      const targetUser = await User.findById(req.params.userId).select('role admin deletedAt');
+
+      if (!targetUser || targetUser.deletedAt) {
+        return res.status(404).json({ message: 'Usuário não encontrado.' });
+      }
+
+      const changeCheck = await ensureCanChangeAdminRole(req, targetUser, nextRole);
+
+      if (!changeCheck.ok) {
+        return res.status(changeCheck.status).json({ message: changeCheck.message });
+      }
+
+      const now = new Date();
+      const previousRole = targetUser.role || 'user';
+      const previousPermissions = Array.isArray(targetUser.admin?.permissions)
+        ? [...targetUser.admin.permissions]
+        : [];
+
+      targetUser.role = nextRole;
+
+      if (nextRole === 'admin') {
+        const grantedPermissions = permissions === undefined ? ADMIN_PERMISSIONS : permissions;
+        targetUser.admin = {
+          ...(targetUser.admin?.toObject ? targetUser.admin.toObject() : targetUser.admin || {}),
+          permissions: grantedPermissions,
+          grantedAt: targetUser.admin?.grantedAt || now,
+          grantedBy: targetUser.admin?.grantedBy || req.adminAuth?.adminUserId || undefined,
+          revokedAt: undefined,
+          revokedBy: undefined,
+          updatedAt: now,
+        };
+      } else {
+        targetUser.admin = {
+          ...(targetUser.admin?.toObject ? targetUser.admin.toObject() : targetUser.admin || {}),
+          permissions: [],
+          revokedAt: now,
+          revokedBy: req.adminAuth?.adminUserId || undefined,
+          updatedAt: now,
+        };
+      }
+
+      await targetUser.save();
+
+      if (
+        previousRole === 'admin' &&
+        (
+          nextRole !== 'admin' ||
+          JSON.stringify(previousPermissions.slice().sort()) !==
+            JSON.stringify((targetUser.admin?.permissions || []).slice().sort())
+        )
+      ) {
+        await revokeAdminSessionsForUser(targetUser._id, 'admin_role_changed');
+      }
+
+      return res.json({
+        ok: true,
+        userId: String(targetUser._id),
+        role: targetUser.role,
+        permissions: targetUser.admin?.permissions || [],
+      });
+    } catch (error) {
+      return res.status(500).json({
+        message: 'Erro interno do servidor.',
+      });
+    }
+  }
+);
 
 router.get('/projects/:id/files', requireAdmin, validateProjectId, async (req, res) => {
   try {

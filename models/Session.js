@@ -21,6 +21,9 @@ const sessionSchema = new mongoose.Schema({
     type: String,
     trim: true,
   },
+  mfaVerifiedAt: {
+    type: Date,
+  },
   createdAt: {
     type: Date,
     default: Date.now,
@@ -38,6 +41,15 @@ const sessionSchema = new mongoose.Schema({
     default: null,
   },
   revokedReason: {
+    type: String,
+    trim: true,
+    default: null,
+  },
+  adminRevokedAt: {
+    type: Date,
+    default: null,
+  },
+  adminRevokedReason: {
     type: String,
     trim: true,
     default: null,

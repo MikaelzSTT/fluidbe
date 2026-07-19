@@ -4,6 +4,7 @@ const Session = require('../models/Session');
 
 const AUTH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
 const AUTH_TOKEN_EXPIRES_IN = '7d';
+const SESSION_MFA_CAPTURE_WINDOW_MS = 60 * 1000;
 
 function serializePreferences(preferences) {
   return {
@@ -60,6 +61,25 @@ function hashIp(req) {
   return crypto.createHmac('sha256', secret).update(ip).digest('hex');
 }
 
+function getSessionMfaVerifiedAt(user, now) {
+  if (!user?.twoFactor?.enabled || !user.twoFactor.lastVerifiedAt) {
+    return undefined;
+  }
+
+  const lastVerifiedAt = new Date(user.twoFactor.lastVerifiedAt);
+  const lastVerifiedMs = lastVerifiedAt.getTime();
+
+  if (
+    !Number.isFinite(lastVerifiedMs) ||
+    lastVerifiedMs > now.getTime() + 5000 ||
+    now.getTime() - lastVerifiedMs > SESSION_MFA_CAPTURE_WINDOW_MS
+  ) {
+    return undefined;
+  }
+
+  return lastVerifiedAt;
+}
+
 async function createAuthSession(user, req) {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + AUTH_TOKEN_TTL_SECONDS * 1000);
@@ -73,6 +93,7 @@ async function createAuthSession(user, req) {
     jti,
     userAgent,
     ipHash: hashIp(req),
+    mfaVerifiedAt: getSessionMfaVerifiedAt(user, now),
     createdAt: now,
     lastSeenAt: now,
     expiresAt,

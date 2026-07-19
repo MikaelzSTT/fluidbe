@@ -64,6 +64,38 @@ const userSchema = new mongoose.Schema(
       default: 'free',
     },
 
+    role: {
+      type: String,
+      enum: ['user', 'admin'],
+      default: 'user',
+      index: true,
+    },
+
+    admin: {
+      permissions: {
+        type: [String],
+        enum: ['admin:read', 'admin:write', 'admin:build', 'admin:users', 'admin:secrets'],
+        default: [],
+      },
+      grantedAt: {
+        type: Date,
+      },
+      grantedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+      revokedAt: {
+        type: Date,
+      },
+      revokedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+      updatedAt: {
+        type: Date,
+      },
+    },
+
     profile: {
       displayName: {
         type: String,
@@ -247,5 +279,6 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.index({ deletedAt: 1, deletedIdentityHashes: 1 });
+userSchema.index({ role: 1, deletedAt: 1 });
 
 module.exports = mongoose.model('User', userSchema);

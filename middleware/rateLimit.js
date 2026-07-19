@@ -44,10 +44,17 @@ function getAdminTokenKey(req) {
   const token = req.headers['x-admin-token'];
 
   if (!token) {
+    const authHeader = req.headers.authorization;
+    const [scheme, bearerToken] = typeof authHeader === 'string' ? authHeader.split(/\s+/) : [];
+
+    if (scheme === 'Bearer' && bearerToken) {
+      return `bearer:${crypto.createHash('sha256').update(String(bearerToken)).digest('hex')}`;
+    }
+
     return 'anonymous';
   }
 
-  return crypto.createHash('sha256').update(String(token)).digest('hex');
+  return `legacy:${crypto.createHash('sha256').update(String(token)).digest('hex')}`;
 }
 
 function getRateLimitKeySecret() {
