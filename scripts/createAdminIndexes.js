@@ -3,8 +3,22 @@ const mongoose = require('mongoose');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const Session = require('../models/Session');
 const User = require('../models/User');
+const {
+  ensureIndexes,
+  findExistingIndexesByName,
+  logExistingIndexMatches,
+  validateDateFieldValues,
+} = require('../utils/adminIndexManager');
 
 dotenv.config();
+
+const TARGET_INDEX_NAME = 'expiresAt_1';
+
+const ADMIN_INDEX_MODELS = [
+  AdminAuditLog,
+  Session,
+  User,
+];
 
 async function main() {
   if (!process.env.MONGODB_URI) {
@@ -13,13 +27,19 @@ async function main() {
 
   await mongoose.connect(process.env.MONGODB_URI);
 
-  await Promise.all([
-    AdminAuditLog.createIndexes(),
-    Session.createIndexes(),
-    User.createIndexes(),
-  ]);
+  const existingTargetIndexes = await findExistingIndexesByName(ADMIN_INDEX_MODELS, TARGET_INDEX_NAME);
+  logExistingIndexMatches({
+    logger: console,
+    indexName: TARGET_INDEX_NAME,
+    matches: existingTargetIndexes,
+  });
 
-  console.log('Admin, session, and user indexes created or already present.');
+  await validateDateFieldValues(Session, 'expiresAt');
+  console.log('Verified sessions.expiresAt contains Date values in all existing documents.');
+
+  await ensureIndexes(ADMIN_INDEX_MODELS);
+
+  console.log('Admin, session, and user indexes are created or already functionally equivalent.');
 }
 
 main()
