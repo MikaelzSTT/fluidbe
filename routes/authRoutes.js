@@ -902,6 +902,37 @@ async function verifyTwoFactorCredential(user, code, options = {}) {
   return { valid: false, usedRecoveryCode: false };
 }
 
+async function markCurrentSessionMfaVerified(req, user, verifiedAt) {
+  if (!req.session?._id) {
+    return false;
+  }
+
+  req.session.mfaVerifiedAt = verifiedAt;
+  req.session.lastSeenAt = verifiedAt;
+
+  if (typeof req.session.save === 'function') {
+    await req.session.save();
+    return true;
+  }
+
+  const result = await Session.updateOne(
+    {
+      _id: req.session._id,
+      userId: user._id,
+      revokedAt: null,
+      expiresAt: { $gt: verifiedAt },
+    },
+    {
+      $set: {
+        mfaVerifiedAt: verifiedAt,
+        lastSeenAt: verifiedAt,
+      },
+    }
+  );
+
+  return Boolean(result.modifiedCount || result.matchedCount);
+}
+
 router.get('/google', (req, res) => {
   const config = getGoogleOAuthConfig();
 
@@ -1150,6 +1181,57 @@ router.post('/me/2fa/disable', authMiddleware, twoFactorDisableRateLimit, async 
     return res.json({
       ok: true,
       message: 'TWO_FACTOR_DISABLED',
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.post('/me/2fa/step-up', authMiddleware, twoFactorVerifyLoginRateLimit, async (req, res) => {
+  try {
+    const body = getObjectBody(req.body);
+    const user = await findAuthenticatedUser(req, res);
+
+    if (!user) {
+      return undefined;
+    }
+
+    if (!user.twoFactor?.enabled) {
+      return jsonCode(res, 403, 'TWO_FACTOR_REQUIRED');
+    }
+
+    const verification = await verifyTwoFactorCredential(user, body?.code, {
+      allowRecovery: true,
+      markRecoveryUsed: true,
+    });
+
+    if (!verification.valid) {
+      return jsonCode(res, 400, 'INVALID_TWO_FACTOR_CODE');
+    }
+
+    const now = new Date();
+    user.twoFactor.lastVerifiedAt = now;
+
+    if (verification.usedRecoveryCode) {
+      await user.save();
+    } else {
+      await User.updateOne(
+        { _id: user._id },
+        { $set: { 'twoFactor.lastVerifiedAt': now } }
+      );
+    }
+
+    const sessionUpdated = await markCurrentSessionMfaVerified(req, user, now);
+
+    if (!sessionUpdated) {
+      return jsonCode(res, 401, 'SESSION_INVALID');
+    }
+
+    return res.json({
+      ok: true,
+      message: 'TWO_FACTOR_VERIFIED',
     });
   } catch (error) {
     return res.status(500).json({

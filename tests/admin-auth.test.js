@@ -4,6 +4,7 @@ const http = require('http');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const test = require('node:test');
+const { generateSync } = require('otplib');
 
 const adminRoutes = require('../routes/adminRoutes');
 const AdminAuditLog = require('../models/AdminAuditLog');
@@ -916,6 +917,285 @@ async function requestJson(baseUrl, path, options = {}) {
     body,
   };
 }
+
+test('Google admin login requires Fluid step-up MFA before admin access', async () => {
+  const previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    TWO_FACTOR_SECRET_KEY: process.env.TWO_FACTOR_SECRET_KEY,
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    GOOGLE_CALLBACK_URL: process.env.GOOGLE_CALLBACK_URL,
+    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
+    ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
+  };
+  const originalFetch = global.fetch;
+  const originalUserFindOne = User.findOne;
+  const originalUserFindById = User.findById;
+  const originalUserExists = User.exists;
+  const originalUserUpdateOne = User.updateOne;
+  const originalSessionCreate = Session.create;
+  const originalSessionFindOne = Session.findOne;
+  const originalSessionUpdateOne = Session.updateOne;
+  const originalAuditCreate = AdminAuditLog.create;
+  const originalAuditFindOne = AdminAuditLog.findOne;
+  const originalConsoleWarn = console.warn;
+  const app = await startTestApp();
+
+  process.env.JWT_SECRET = 'google-admin-flow-jwt-secret';
+  process.env.TWO_FACTOR_SECRET_KEY = 'google-admin-flow-2fa-secret';
+  process.env.GOOGLE_CLIENT_ID = 'google-client-id';
+  process.env.GOOGLE_CLIENT_SECRET = 'google-client-secret';
+  process.env.GOOGLE_CALLBACK_URL = `${app.baseUrl}/api/auth/google/callback`;
+  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
+  process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
+
+  const totpSecret = 'S47NGTYLRNCFTSKGFW3FXLFED24EQ3TT';
+  const sessionsByJti = new Map();
+  const warnings = [];
+  const user = {
+    _id: USER_ID,
+    name: 'Google Admin',
+    email: 'google-admin@example.com',
+    googleId: 'google-subject-1',
+    avatar: '',
+    emailVerified: true,
+    providers: ['google'],
+    role: 'admin',
+    admin: {
+      permissions: ADMIN_PERMISSIONS,
+      grantedAt: new Date(Date.now() - 2000),
+    },
+    deletedAt: null,
+    onboardingComplete: true,
+    profile: {},
+    preferences: {},
+    twoFactor: {
+      enabled: true,
+      secretEnc: encryptTotpSecret(totpSecret),
+      lastVerifiedAt: null,
+      recoveryCodes: [],
+    },
+    save: async function saveUser() {
+      return this;
+    },
+  };
+
+  function selectable(document) {
+    return {
+      ...document,
+      select: async () => document,
+    };
+  }
+
+  global.fetch = async (url, options) => {
+    const normalizedUrl = String(url);
+
+    if (normalizedUrl === 'https://oauth2.googleapis.com/token') {
+      return {
+        ok: true,
+        json: async () => ({
+          access_token: 'google-access-token',
+          id_token: jwt.sign(
+            {
+              iss: 'https://accounts.google.com',
+              aud: process.env.GOOGLE_CLIENT_ID,
+              sub: user.googleId,
+              amr: ['mfa'],
+              acr: 'urn:forged:mfa',
+            },
+            'untrusted-oauth-claim'
+          ),
+        }),
+      };
+    }
+
+    if (normalizedUrl === 'https://www.googleapis.com/oauth2/v3/userinfo') {
+      return {
+        ok: true,
+        json: async () => ({
+          sub: user.googleId,
+          email: user.email,
+          email_verified: true,
+          name: user.name,
+          picture: '',
+          amr: ['mfa'],
+          acr: 'urn:forged:mfa',
+        }),
+      };
+    }
+
+    return originalFetch(url, options);
+  };
+  User.findOne = async (query) => {
+    if (query?.googleId === user.googleId || query?.email === user.email) {
+      return user;
+    }
+
+    return null;
+  };
+  User.findById = () => selectable(user);
+  User.exists = async () => null;
+  User.updateOne = async (query, update) => {
+    if (String(query?._id) === USER_ID && update?.$set?.['twoFactor.lastVerifiedAt']) {
+      user.twoFactor.lastVerifiedAt = update.$set['twoFactor.lastVerifiedAt'];
+    }
+
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+  Session.create = async (payload) => {
+    const session = {
+      _id: `google-session-${sessionsByJti.size + 1}`,
+      ...payload,
+      createdAt: payload.createdAt || new Date(),
+      expiresAt: payload.expiresAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      revokedAt: null,
+      adminRevokedAt: null,
+    };
+    sessionsByJti.set(session.jti, session);
+    return session;
+  };
+  Session.findOne = async (query) => {
+    const session = sessionsByJti.get(query?.jti);
+
+    if (!session || String(query?.userId) !== USER_ID) {
+      return null;
+    }
+
+    if (query.revokedAt === null && session.revokedAt) {
+      return null;
+    }
+
+    if (query.adminRevokedAt === null && session.adminRevokedAt) {
+      return null;
+    }
+
+    if (query.expiresAt?.$gt && !(session.expiresAt > query.expiresAt.$gt)) {
+      return null;
+    }
+
+    return session;
+  };
+  Session.updateOne = async (query, update) => {
+    const session = Array.from(sessionsByJti.values()).find((item) => String(item._id) === String(query?._id));
+
+    if (!session || String(query?.userId) !== USER_ID) {
+      return { matchedCount: 0, modifiedCount: 0 };
+    }
+
+    session.mfaVerifiedAt = update.$set.mfaVerifiedAt;
+    session.lastSeenAt = update.$set.lastSeenAt;
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+  AdminAuditLog.findOne = () => ({
+    sort: async () => null,
+  });
+  AdminAuditLog.create = async () => ({ _id: 'google-admin-audit' });
+  console.warn = (message, metadata) => {
+    if (message === 'Admin authorization denied.') {
+      warnings.push(metadata);
+      return;
+    }
+
+    originalConsoleWarn(message, metadata);
+  };
+
+  try {
+    const start = await originalFetch(`${app.baseUrl}/api/auth/google?redirect=/admin.html`, {
+      redirect: 'manual',
+    });
+    const authLocation = start.headers.get('location');
+    const state = new URL(authLocation).searchParams.get('state');
+    const stateCookie = start.headers.get('set-cookie').split(';')[0];
+
+    const callback = await originalFetch(`${app.baseUrl}/api/auth/google/callback?code=oauth-code&state=${encodeURIComponent(state)}`, {
+      headers: {
+        Cookie: stateCookie,
+      },
+      redirect: 'manual',
+    });
+    const redirectLocation = callback.headers.get('location');
+    const fragment = new URL(redirectLocation).hash.slice(1);
+    const token = new URLSearchParams(fragment).get('token');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    const session = sessionsByJti.get(decoded.jti);
+
+    assert.ok(token);
+    assert.equal(session.mfaVerifiedAt, undefined);
+
+    const denied = await originalFetch(`${app.baseUrl}/api/admin/status`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Request-Id': 'google-admin-no-fluid-mfa',
+      },
+    });
+    assert.equal(denied.status, 403);
+    assert.deepEqual(await denied.json(), { message: 'Admin não autorizado' });
+    assert.equal(warnings.at(-1).requestId, 'google-admin-no-fluid-mfa');
+    assert.equal(warnings.at(-1).reason, 'mfa_not_verified');
+    assert.equal(JSON.stringify(warnings).includes(user.email), false);
+    assert.equal(JSON.stringify(warnings).includes(decoded.jti), false);
+
+    const invalidStepUp = await requestJson(app.baseUrl, '/api/auth/me/2fa/step-up', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: {
+        code: '000000',
+      },
+    });
+    assert.equal(invalidStepUp.status, 400);
+    assert.equal(session.mfaVerifiedAt, undefined);
+
+    const stillDenied = await originalFetch(`${app.baseUrl}/api/admin/status`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Request-Id': 'google-admin-invalid-step-up',
+      },
+    });
+    assert.equal(stillDenied.status, 403);
+    assert.equal(warnings.at(-1).reason, 'mfa_not_verified');
+
+    const validStepUp = await requestJson(app.baseUrl, '/api/auth/me/2fa/step-up', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: {
+        code: generateSync({ secret: totpSecret }),
+      },
+    });
+    assert.equal(validStepUp.status, 200);
+    assert.ok(session.mfaVerifiedAt);
+    assert.ok(session.createdAt >= user.admin.grantedAt);
+
+    const allowed = await requestJson(app.baseUrl, '/api/admin/status', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.body.ok, true);
+  } finally {
+    await app.close();
+    global.fetch = originalFetch;
+    User.findOne = originalUserFindOne;
+    User.findById = originalUserFindById;
+    User.exists = originalUserExists;
+    User.updateOne = originalUserUpdateOne;
+    Session.create = originalSessionCreate;
+    Session.findOne = originalSessionFindOne;
+    Session.updateOne = originalSessionUpdateOne;
+    AdminAuditLog.create = originalAuditCreate;
+    AdminAuditLog.findOne = originalAuditFindOne;
+    console.warn = originalConsoleWarn;
+
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 
 test('full admin flow uses per-session MFA, admin grant time, revocation, audit and legacy-off behavior', async () => {
   const previousEnv = {

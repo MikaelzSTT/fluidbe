@@ -34,6 +34,18 @@ function safeAdminMessage(res, statusCode) {
   return res.status(statusCode).json({ message: 'Admin não autorizado' });
 }
 
+function logAdminAuthDenial(req, reason) {
+  console.warn('Admin authorization denied.', {
+    requestId: req.adminRequestId || null,
+    reason,
+  });
+}
+
+function denyAdmin(req, res, statusCode, reason) {
+  logAdminAuthDenial(req, reason);
+  return safeAdminMessage(res, statusCode);
+}
+
 function normalizeIp(ip) {
   return String(ip || '')
     .trim()
@@ -299,6 +311,15 @@ function hasAdminPermission(user, permission) {
   return permissions.includes(permission);
 }
 
+function getAdminPermissionDenialReason(user, permission) {
+  if (!user || user.role !== 'admin' || user.deletedAt) {
+    return 'not_admin';
+  }
+
+  const permissions = Array.isArray(user.admin?.permissions) ? user.admin.permissions : [];
+  return permissions.includes(permission) ? null : 'permission_denied';
+}
+
 function isMfaVerifiedForSession(user, session, now) {
   if (!user.twoFactor?.enabled || !session?.mfaVerifiedAt || !session?.createdAt) {
     return false;
@@ -386,14 +407,14 @@ function legacyAdminAllowedForMetadata(req, res, metadata) {
     return true;
   }
 
-  return safeAdminMessage(res, 403);
+  return denyAdmin(req, res, 403, 'permission_denied');
 }
 
 async function authenticateUserAdmin(req, res, metadata) {
   const token = getBearerToken(req);
 
   if (!token) {
-    return safeAdminMessage(res, 401);
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
   let decoded;
@@ -401,11 +422,11 @@ async function authenticateUserAdmin(req, res, metadata) {
   try {
     decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
   } catch (error) {
-    return safeAdminMessage(res, 401);
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
   if (!decoded?.id || !decoded?.jti || decoded.runtimeUserId || !mongoose.Types.ObjectId.isValid(decoded.id)) {
-    return safeAdminMessage(res, 401);
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
   const now = new Date();
@@ -418,27 +439,29 @@ async function authenticateUserAdmin(req, res, metadata) {
   });
 
   if (!session) {
-    return safeAdminMessage(res, 401);
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
   const user = await User.findById(decoded.id).select(
     'role admin.permissions admin.grantedAt deletedAt twoFactor.enabled'
   );
 
-  if (!hasAdminPermission(user, metadata.permission)) {
-    return safeAdminMessage(res, 403);
+  const permissionDenialReason = getAdminPermissionDenialReason(user, metadata.permission);
+
+  if (permissionDenialReason) {
+    return denyAdmin(req, res, 403, permissionDenialReason);
   }
 
   if (!isSessionAfterAdminGrant(user, session)) {
-    return safeAdminMessage(res, 403);
+    return denyAdmin(req, res, 403, 'pre_promotion_session');
   }
 
   if (!isMfaVerifiedForSession(user, session, now)) {
-    return safeAdminMessage(res, 403);
+    return denyAdmin(req, res, 403, 'mfa_not_verified');
   }
 
   if (metadata.recentReauthRequired && !hasRecentAdminReauth(session, now)) {
-    return safeAdminMessage(res, 403);
+    return denyAdmin(req, res, 403, 'reauth_expired');
   }
 
   req.adminAuth = {
