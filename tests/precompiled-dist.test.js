@@ -95,6 +95,13 @@ function getFinalRouteHandler(routePath) {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
+function getFinalGetRouteHandler(routePath) {
+  const layer = adminRoutes.stack.find((item) => (
+    item.route?.path === routePath && item.route?.methods?.get
+  ));
+  return layer.route.stack[layer.route.stack.length - 1].handle;
+}
+
 test('valid precompiled dist ZIP is validated and published with the build worker disabled', async () => {
   const root = await makeTempDir('fluid-precompiled-valid');
 
@@ -108,12 +115,13 @@ test('valid precompiled dist ZIP is validated and published with the build worke
       { name: 'assets/app.css', content: 'body { color: #111; }' },
     ]);
 
-    await extractPrecompiledDistZipSafely(zipPath, extractedDir);
+    const manifest = await extractPrecompiledDistZipSafely(zipPath, extractedDir);
     const validation = await validateDistDirectory(extractedDir);
     const security = await assertPrecompiledDistSecurityAllowsPublication(validation);
     await publishValidatedDist(extractedDir, publishedDir);
 
     assert.equal(adminRoutes.reactViteBuildHelpers.buildWorkerEnabled, false);
+    assert.equal(manifest.format, 'direct_dist');
     assert.equal(security.status, 'passed');
     assert.match(await fs.readFile(path.join(publishedDir, 'index.html'), 'utf8'), /id="root"/);
     assert.equal(
@@ -185,6 +193,7 @@ test('precompiled dist API creates a workerless draft that the publication flow 
 
     assert.equal(res.statusCode, 201);
     assert.equal(res.body.flow, 'precompiled_dist');
+    assert.equal(res.body.detectedFormat, 'direct_dist');
     assert.equal(res.body.requiresBuildWorker, false);
     assert.equal(res.body.publicationRequired, true);
     assert.equal(savedBuild.status, 'draft');
@@ -222,13 +231,72 @@ test('precompiled dist API creates a workerless draft that the publication flow 
   }
 });
 
-test('precompiled dist ZIP without root index.html is rejected', async () => {
-  const root = await makeTempDir('fluid-precompiled-index');
+test('project ZIP with dist/index.html is accepted and non-dist content is ignored', async () => {
+  const root = await makeTempDir('fluid-precompiled-project');
+
+  try {
+    const zipPath = path.join(root, 'dist.zip');
+    const extractedDir = path.join(root, 'isolated-dist');
+    const markerPath = path.join(root, 'postinstall-ran');
+    await writeZip(zipPath, [
+      { name: 'dist/index.html', content: '<div id="root"></div><script src="./assets/app.js"></script>' },
+      { name: 'dist/assets/app.js', content: 'document.querySelector("#root").textContent = "ready";' },
+      { name: 'src/main.jsx', content: 'const apiKey = "sk-proj-secret-outside-dist-123456";' },
+      { name: 'node_modules/pkg/index.js', content: 'throw new Error("ignored");' },
+      {
+        name: 'package.json',
+        content: JSON.stringify({
+          scripts: {
+            postinstall: `node -e "require('fs').writeFileSync('${markerPath}', 'ran')"`,
+          },
+        }),
+      },
+    ]);
+
+    const manifest = inspectPrecompiledDistZip(zipPath);
+    assert.equal(manifest.format, 'project_with_dist');
+    await extractPrecompiledDistZipSafely(zipPath, extractedDir);
+    const validation = await validateDistDirectory(extractedDir);
+    const security = await assertPrecompiledDistSecurityAllowsPublication(validation);
+
+    assert.equal(security.status, 'passed');
+    assert.equal(await fs.readFile(path.join(extractedDir, 'index.html'), 'utf8'), '<div id="root"></div><script src="./assets/app.js"></script>');
+    assert.equal(fsSync.existsSync(path.join(extractedDir, 'src')), false);
+    assert.equal(fsSync.existsSync(path.join(extractedDir, 'node_modules')), false);
+    assert.equal(fsSync.existsSync(path.join(extractedDir, 'package.json')), false);
+    assert.equal(fsSync.existsSync(markerPath), false);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('precompiled project ZIP with multiple valid dist directories is rejected', async () => {
+  const root = await makeTempDir('fluid-precompiled-multiple-dist');
 
   try {
     const zipPath = path.join(root, 'dist.zip');
     await writeZip(zipPath, [
-      { name: 'dist/index.html', content: '<div>wrapped dist is outside the expected root</div>' },
+      { name: 'dist/index.html', content: '<div>root dist</div>' },
+      { name: 'packages/app/dist/index.html', content: '<div>nested dist</div>' },
+    ]);
+
+    assert.throws(
+      () => inspectPrecompiledDistZip(zipPath),
+      (error) => error.code === INVALID_PRECOMPILED_DIST_CODE && error.reason === 'ambiguous_dist'
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('precompiled project ZIP with dist but without dist/index.html is rejected', async () => {
+  const root = await makeTempDir('fluid-precompiled-missing-dist-index');
+
+  try {
+    const zipPath = path.join(root, 'dist.zip');
+    await writeZip(zipPath, [
+      { name: 'index.html', content: '<div>must not be used when dist exists</div>' },
+      { name: 'dist/assets/app.js', content: 'console.log("missing dist index");' },
     ]);
 
     assert.throws(
@@ -240,7 +308,25 @@ test('precompiled dist ZIP without root index.html is rejected', async () => {
   }
 });
 
-test('package and source ZIP content is rejected without executing lifecycle scripts', async () => {
+test('precompiled ZIP with unexpectedly nested dist is rejected', async () => {
+  const root = await makeTempDir('fluid-precompiled-nested-dist');
+
+  try {
+    const zipPath = path.join(root, 'dist.zip');
+    await writeZip(zipPath, [
+      { name: 'dist/dist/index.html', content: '<div>nested dist</div>' },
+    ]);
+
+    assert.throws(
+      () => inspectPrecompiledDistZip(zipPath),
+      (error) => error.code === INVALID_PRECOMPILED_DIST_CODE && error.reason === 'nested_dist'
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('direct dist ZIP with package and source content is rejected without executing lifecycle scripts', async () => {
   const root = await makeTempDir('fluid-precompiled-source');
 
   try {
@@ -343,12 +429,27 @@ test('precompiled dist rejects dangerous extensions and configured size or count
       }),
       (error) => error.code === INVALID_PRECOMPILED_DIST_CODE && error.reason === 'entry_limit'
     );
+
+    const projectLimitZip = path.join(root, 'project-limit.zip');
+    await writeZip(projectLimitZip, [
+      { name: 'dist/index.html', content: '<div>ok</div>' },
+      { name: 'src/ignored.js', content: 'console.log("ignored but still counted by ZIP limits");' },
+    ]);
+    assert.throws(
+      () => inspectPrecompiledDistZip(projectLimitZip, {
+        maxZipFiles: 1,
+        maxFiles: 10,
+        maxFileBytes: 1024,
+        maxTotalBytes: 4096,
+      }),
+      (error) => error.code === INVALID_PRECOMPILED_DIST_CODE && error.reason === 'size_or_encryption_limit'
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
 
-test('critical secret anywhere in precompiled text blocks publication', async () => {
+test('critical secret inside the detected dist blocks publication', async () => {
   const root = await makeTempDir('fluid-precompiled-secret');
 
   try {
@@ -384,7 +485,25 @@ test('Admin API exposes the workerless dist flow and keeps source ZIP worker-gat
   assert.ok(routePaths.includes('/projects/:id/react-vite/dist'));
   assert.match(source, /ZIP de código-fonte React\/Vite exige um build worker sandboxado/);
   assert.match(source, /dist pré-compilado/);
+  assert.match(source, /PRECOMPILED_DIST_FORMATS/);
   assert.equal(source.includes('return runLegacyReactViteBuild(req, res'), false);
+
+  const statusReq = {
+    adminAuth: {
+      actorType: 'admin',
+      adminUserId: new mongoose.Types.ObjectId(),
+      permission: 'owner',
+    },
+  };
+  const statusRes = createResponse();
+  await getFinalGetRouteHandler('/status')(statusReq, statusRes);
+  assert.deepEqual(
+    statusRes.body.reactVite.precompiledDist.acceptedFormats,
+    ['direct_dist', 'project_with_dist']
+  );
+  assert.equal(statusRes.body.reactVite.sourceZip.enabled, false);
+  assert.equal(statusRes.body.reactVite.precompiledDist.requiresBuildWorker, false);
+  assert.match(statusRes.body.reactVite.precompiledDist.message, /nada é executado/);
 
   const uploadDir = await makeTempDir('fluid-source-worker-disabled');
   const req = {

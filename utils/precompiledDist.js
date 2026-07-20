@@ -13,8 +13,12 @@ const MAX_PRECOMPILED_DIST_TOTAL_BYTES = Number(
 );
 const MAX_PRECOMPILED_DIST_COMPRESSION_RATIO = 100;
 const INVALID_PRECOMPILED_DIST_MESSAGE =
-  'ZIP de dist inválido. Envie somente os arquivos estáticos compilados, com index.html na raiz.';
+  'ZIP de dist inválido. Envie arquivos estáticos compilados com index.html na raiz ou um projeto React/Vite com dist/index.html.';
 const INVALID_PRECOMPILED_DIST_CODE = 'INVALID_PRECOMPILED_DIST_ZIP';
+const PRECOMPILED_DIST_FORMATS = Object.freeze({
+  DIRECT_DIST: 'direct_dist',
+  PROJECT_WITH_DIST: 'project_with_dist',
+});
 
 const ALLOWED_STATIC_EXTENSIONS = new Set([
   '.avif', '.bmp', '.css', '.csv', '.eot', '.gif', '.html', '.ico', '.jpeg', '.jpg',
@@ -110,6 +114,22 @@ function assertStaticFilePath(relativePath) {
   }
 }
 
+function isPathInsideRoot(relativePath, rootPath) {
+  return rootPath === '' || relativePath === rootPath || relativePath.startsWith(`${rootPath}/`);
+}
+
+function stripRootPath(relativePath, rootPath) {
+  if (!rootPath) {
+    return relativePath;
+  }
+
+  if (relativePath === rootPath) {
+    return '';
+  }
+
+  return relativePath.slice(rootPath.length + 1);
+}
+
 function hasExecutableSignature(data) {
   if (!Buffer.isBuffer(data) || data.length < 2) {
     return false;
@@ -141,6 +161,7 @@ function hasExecutableSignature(data) {
 function inspectPrecompiledDistZip(zipPath, options = {}) {
   const maxFiles = Number(options.maxFiles || MAX_PRECOMPILED_DIST_FILES);
   const maxEntries = Number(options.maxEntries || MAX_PRECOMPILED_DIST_ENTRIES);
+  const maxZipFiles = Number(options.maxZipFiles || maxEntries);
   const maxFileBytes = Number(options.maxFileBytes || MAX_PRECOMPILED_DIST_FILE_BYTES);
   const maxTotalBytes = Number(options.maxTotalBytes || MAX_PRECOMPILED_DIST_TOTAL_BYTES);
   let zip;
@@ -168,13 +189,18 @@ function inspectPrecompiledDistZip(zipPath, options = {}) {
 
   const inspectedEntries = [];
   const paths = new Map();
-  let fileCount = 0;
-  let totalBytes = 0;
-  let hasIndex = false;
+  const validDistRoots = new Set();
+  let zipFileCount = 0;
+  let zipTotalBytes = 0;
+  let rootIndex = false;
+  let topLevelDist = false;
+  let nestedDist = false;
 
   for (const entry of entries) {
     const relativePath = normalizedZipPath(entry.entryName);
     const pathKey = relativePath.toLowerCase();
+    const segments = relativePath.split('/');
+    const lowerSegments = segments.map((segment) => segment.toLowerCase());
 
     if (paths.has(pathKey)) {
       throw createInvalidPrecompiledDistError('duplicate_path');
@@ -182,25 +208,26 @@ function inspectPrecompiledDistZip(zipPath, options = {}) {
 
     assertRegularNonExecutableEntry(entry);
     paths.set(pathKey, entry.isDirectory ? 'directory' : 'file');
+    topLevelDist ||= lowerSegments[0] === 'dist';
+    nestedDist ||= lowerSegments.some((segment, index) => segment === 'dist' && index > 0);
 
     if (entry.isDirectory) {
       inspectedEntries.push({ entry, relativePath, isDirectory: true });
       continue;
     }
 
-    assertStaticFilePath(relativePath);
-    fileCount += 1;
+    zipFileCount += 1;
     const uncompressedBytes = Number(entry.header.size);
     const compressedBytes = Number(entry.header.compressedSize);
 
     if (
-      fileCount > maxFiles ||
+      zipFileCount > maxZipFiles ||
       !Number.isSafeInteger(uncompressedBytes) ||
       !Number.isSafeInteger(compressedBytes) ||
       uncompressedBytes < 0 ||
       compressedBytes < 0 ||
       uncompressedBytes > maxFileBytes ||
-      totalBytes + uncompressedBytes > maxTotalBytes ||
+      zipTotalBytes + uncompressedBytes > maxTotalBytes ||
       (uncompressedBytes > 0 &&
         uncompressedBytes / Math.max(compressedBytes, 1) > MAX_PRECOMPILED_DIST_COMPRESSION_RATIO) ||
       (Number(entry.header.flags) & 0x1) !== 0
@@ -208,13 +235,17 @@ function inspectPrecompiledDistZip(zipPath, options = {}) {
       throw createInvalidPrecompiledDistError('size_or_encryption_limit');
     }
 
-    hasIndex ||= relativePath === 'index.html';
-    totalBytes += uncompressedBytes;
-    inspectedEntries.push({ entry, relativePath, isDirectory: false, size: uncompressedBytes });
-  }
+    rootIndex ||= relativePath === 'index.html';
+    if (segments[segments.length - 1] === 'index.html') {
+      for (let index = 0; index < lowerSegments.length - 1; index += 1) {
+        if (lowerSegments[index] === 'dist' && index === lowerSegments.length - 2) {
+          validDistRoots.add(segments.slice(0, index + 1).join('/'));
+        }
+      }
+    }
 
-  if (!hasIndex) {
-    throw createInvalidPrecompiledDistError('missing_index');
+    zipTotalBytes += uncompressedBytes;
+    inspectedEntries.push({ entry, relativePath, isDirectory: false, size: uncompressedBytes });
   }
 
   for (const relativePath of paths.keys()) {
@@ -227,7 +258,71 @@ function inspectPrecompiledDistZip(zipPath, options = {}) {
     }
   }
 
-  return { entries: inspectedEntries, fileCount, totalBytes };
+  if (validDistRoots.size > 1) {
+    throw createInvalidPrecompiledDistError('ambiguous_dist');
+  }
+
+  let format;
+  let selectedRoot = '';
+
+  if (validDistRoots.has('dist')) {
+    format = PRECOMPILED_DIST_FORMATS.PROJECT_WITH_DIST;
+    selectedRoot = 'dist';
+  } else if (validDistRoots.size === 1 || nestedDist) {
+    throw createInvalidPrecompiledDistError('nested_dist');
+  } else if (topLevelDist) {
+    throw createInvalidPrecompiledDistError('missing_index');
+  } else if (rootIndex) {
+    format = PRECOMPILED_DIST_FORMATS.DIRECT_DIST;
+  } else {
+    throw createInvalidPrecompiledDistError('missing_index');
+  }
+
+  const selectedEntries = [];
+  let fileCount = 0;
+  let totalBytes = 0;
+  let hasIndex = false;
+
+  for (const inspected of inspectedEntries) {
+    if (!isPathInsideRoot(inspected.relativePath, selectedRoot)) {
+      continue;
+    }
+
+    const publishPath = stripRootPath(inspected.relativePath, selectedRoot);
+    if (!publishPath) {
+      continue;
+    }
+
+    if (publishPath.split('/').some((segment) => segment.toLowerCase() === 'dist')) {
+      throw createInvalidPrecompiledDistError('nested_dist');
+    }
+
+    if (!inspected.isDirectory) {
+      assertStaticFilePath(publishPath);
+      fileCount += 1;
+      if (fileCount > maxFiles || totalBytes + inspected.size > maxTotalBytes) {
+        throw createInvalidPrecompiledDistError('size_or_encryption_limit');
+      }
+      hasIndex ||= publishPath === 'index.html';
+      totalBytes += inspected.size;
+    }
+
+    selectedEntries.push({ ...inspected, relativePath: publishPath });
+  }
+
+  if (!hasIndex) {
+    throw createInvalidPrecompiledDistError('missing_index');
+  }
+
+  return {
+    entries: selectedEntries,
+    fileCount,
+    format,
+    totalBytes,
+    zipEntryCount: entries.length,
+    zipFileCount,
+    zipTotalBytes,
+  };
 }
 
 async function extractPrecompiledDistZipSafely(zipPath, destinationDir, options = {}) {
@@ -311,6 +406,7 @@ module.exports = {
   ALLOWED_STATIC_EXTENSIONS,
   INVALID_PRECOMPILED_DIST_CODE,
   INVALID_PRECOMPILED_DIST_MESSAGE,
+  PRECOMPILED_DIST_FORMATS,
   assertPrecompiledDistSecurityAllowsPublication,
   extractPrecompiledDistZipSafely,
   inspectPrecompiledDistZip,

@@ -37,6 +37,7 @@ const {
 const {
   INVALID_PRECOMPILED_DIST_CODE,
   INVALID_PRECOMPILED_DIST_MESSAGE,
+  PRECOMPILED_DIST_FORMATS,
   assertPrecompiledDistSecurityAllowsPublication,
   extractPrecompiledDistZipSafely,
 } = require('../utils/precompiledDist');
@@ -2656,6 +2657,8 @@ router.get('/status', requireAdmin, async (req, res) => {
           enabled: true,
           requiresBuildWorker: false,
           endpoint: '/api/admin/projects/:id/react-vite/dist',
+          acceptedFormats: Object.values(PRECOMPILED_DIST_FORMATS),
+          message: 'Aceita dist pré-compilado direto ou ZIP de projeto com dist/index.html; nada é executado no servidor.',
         },
       },
     });
@@ -3301,7 +3304,7 @@ router.post(
     let buildSaved = false;
 
     try {
-      await extractPrecompiledDistZipSafely(req.file.path, extractedDistDir);
+      const precompiledManifest = await extractPrecompiledDistZipSafely(req.file.path, extractedDistDir);
       await validateDistDirectory(extractedDistDir);
 
       if (await fixDistIndexAssetPaths(extractedDistDir)) {
@@ -3320,8 +3323,8 @@ router.post(
         fullHtml,
         artifactFiles: artifactSnapshot.files,
         logs: artifactSnapshot.complete
-          ? 'Dist React/Vite pré-compilado validado sem executar código no servidor.'
-          : `Dist React/Vite pré-compilado validado; ${artifactSnapshot.skippedFiles} arquivo(s) não foram copiados para o fallback MongoDB.`,
+          ? `Dist React/Vite pré-compilado validado (${precompiledManifest.format}) sem executar código no servidor.`
+          : `Dist React/Vite pré-compilado validado (${precompiledManifest.format}); ${artifactSnapshot.skippedFiles} arquivo(s) não foram copiados para o fallback MongoDB.`,
       });
 
       const previewUrl = `/builds/${project._id}/${build._id}/index.html`;
@@ -3350,6 +3353,7 @@ router.post(
       return res.status(201).json({
         success: true,
         flow: 'precompiled_dist',
+        detectedFormat: precompiledManifest.format,
         requiresBuildWorker: false,
         publicationRequired: true,
         publishEndpoint: `/api/admin/projects/${project._id}/builds/${build._id}/publish`,
