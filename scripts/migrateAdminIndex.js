@@ -1,16 +1,16 @@
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const AdminAuditLog = require('../models/AdminAuditLog');
-const Session = require('../models/Session');
-const User = require('../models/User');
+const AdminSession = require('../models/AdminSession');
+const AdminUser = require('../models/AdminUser');
 const { migrateIndex, validateDateFieldValues } = require('../utils/adminIndexManager');
 
 dotenv.config();
 
 const ADMIN_INDEX_MODELS = [
   AdminAuditLog,
-  Session,
-  User,
+  AdminSession,
+  AdminUser,
 ];
 
 function getArg(name) {
@@ -29,8 +29,8 @@ function usage() {
   console.error(
     [
       'Usage:',
-      '  node scripts/migrateAdminIndex.js --collection sessions --index expiresAt_1',
-      '  node scripts/migrateAdminIndex.js --collection sessions --index expiresAt_1 --confirm',
+      '  node scripts/migrateAdminIndex.js --collection adminsessions --index expiresAt_1',
+      '  node scripts/migrateAdminIndex.js --collection adminsessions --index expiresAt_1 --confirm',
       '',
       'Without --confirm this script only prints the current and expected index definitions.',
       'With --confirm it drops only the named index, recreates it from the schema, and verifies the result.',
@@ -55,9 +55,9 @@ async function main() {
 
   await mongoose.connect(process.env.MONGODB_URI);
 
-  if (collectionName === 'sessions' && indexName === 'expiresAt_1') {
-    await validateDateFieldValues(Session, 'expiresAt');
-    console.log('Verified sessions.expiresAt contains Date values in all existing documents.');
+  if (collectionName === 'adminsessions' && indexName === 'expiresAt_1') {
+    await validateDateFieldValues(AdminSession, 'expiresAt');
+    console.log('Verified adminsessions.expiresAt contains Date values in all existing documents.');
   }
 
   await migrateIndex(ADMIN_INDEX_MODELS, {

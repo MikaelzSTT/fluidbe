@@ -14,12 +14,7 @@ const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const User = require('../models/User');
-const {
-  ADMIN_PERMISSIONS,
-  ADMIN_ROLES,
-  requireAdmin,
-  revokeAdminSessionsForUser,
-} = require('../middleware/adminAuth');
+const { requireAdmin } = require('../middleware/adminAuth');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
@@ -456,65 +451,6 @@ function parsePositiveInt(value, fallback, max) {
   }
 
   return Math.min(parsed, max);
-}
-
-function sanitizeAdminPermissions(value) {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!Array.isArray(value)) {
-    return null;
-  }
-
-  const allowed = new Set(ADMIN_PERMISSIONS);
-  const permissions = [];
-
-  for (const item of value) {
-    if (typeof item !== 'string' || !allowed.has(item)) {
-      return null;
-    }
-
-    if (!permissions.includes(item)) {
-      permissions.push(item);
-    }
-  }
-
-  return permissions;
-}
-
-async function ensureCanChangeAdminRole(req, targetUser, nextRole) {
-  if (targetUser.role !== 'admin' || nextRole === 'admin') {
-    return { ok: true };
-  }
-
-  const remainingAdmins = await User.countDocuments({
-    _id: { $ne: targetUser._id },
-    role: 'admin',
-    deletedAt: null,
-  });
-
-  if (remainingAdmins <= 0) {
-    return {
-      ok: false,
-      status: 409,
-      message: 'LAST_ACTIVE_ADMIN_REQUIRED',
-    };
-  }
-
-  if (
-    req.adminAuth?.adminUserId &&
-    String(req.adminAuth.adminUserId) === String(targetUser._id) &&
-    req.body?.confirmSelfDemotion !== 'DEMOTE_SELF'
-  ) {
-    return {
-      ok: false,
-      status: 400,
-      message: 'SELF_DEMOTION_CONFIRMATION_REQUIRED',
-    };
-  }
-
-  return { ok: true };
 }
 
 function getLegacyBuildJobStatus(projectBuildStatus) {
@@ -2749,110 +2685,13 @@ router.get('/projects', requireAdmin, async (req, res) => {
   }
 });
 
-router.patch(
-  '/users/:userId/role',
-  requireAdmin,
-  validateObjectIdParam('userId', 'ID de usuário inválido.'),
-  async (req, res) => {
-    try {
-      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
-
-      if (!body) {
-        return res.status(400).json({ message: 'Requisição inválida.' });
-      }
-
-      const allowedFields = new Set(['role', 'permissions', 'confirmSelfDemotion']);
-      const unknownFields = Object.keys(body).filter((field) => !allowedFields.has(field));
-
-      if (unknownFields.length > 0) {
-        return res.status(400).json({ message: 'Requisição inválida.' });
-      }
-
-      const nextRole = typeof body.role === 'string' ? body.role.trim().toLowerCase() : null;
-
-      if (!ADMIN_ROLES.includes(nextRole)) {
-        return res.status(400).json({
-          message: 'Role inválida.',
-          allowedRoles: ADMIN_ROLES,
-        });
-      }
-
-      const permissions = sanitizeAdminPermissions(body.permissions);
-
-      if (permissions === null) {
-        return res.status(400).json({
-          message: 'Permissões inválidas.',
-          allowedPermissions: ADMIN_PERMISSIONS,
-        });
-      }
-
-      const targetUser = await User.findById(req.params.userId).select('role admin deletedAt');
-
-      if (!targetUser || targetUser.deletedAt) {
-        return res.status(404).json({ message: 'Usuário não encontrado.' });
-      }
-
-      const changeCheck = await ensureCanChangeAdminRole(req, targetUser, nextRole);
-
-      if (!changeCheck.ok) {
-        return res.status(changeCheck.status).json({ message: changeCheck.message });
-      }
-
-      const now = new Date();
-      const previousRole = targetUser.role || 'user';
-      const previousPermissions = Array.isArray(targetUser.admin?.permissions)
-        ? [...targetUser.admin.permissions]
-        : [];
-
-      targetUser.role = nextRole;
-
-      if (nextRole === 'admin') {
-        const grantedPermissions = permissions === undefined ? ADMIN_PERMISSIONS : permissions;
-        targetUser.admin = {
-          ...(targetUser.admin?.toObject ? targetUser.admin.toObject() : targetUser.admin || {}),
-          permissions: grantedPermissions,
-          grantedAt: targetUser.admin?.grantedAt || now,
-          grantedBy: targetUser.admin?.grantedBy || req.adminAuth?.adminUserId || undefined,
-          revokedAt: undefined,
-          revokedBy: undefined,
-          updatedAt: now,
-        };
-      } else {
-        targetUser.admin = {
-          ...(targetUser.admin?.toObject ? targetUser.admin.toObject() : targetUser.admin || {}),
-          permissions: [],
-          revokedAt: now,
-          revokedBy: req.adminAuth?.adminUserId || undefined,
-          updatedAt: now,
-        };
-      }
-
-      await targetUser.save();
-
-      if (
-        previousRole === 'admin' &&
-        (
-          nextRole !== 'admin' ||
-          JSON.stringify(previousPermissions.slice().sort()) !==
-            JSON.stringify((targetUser.admin?.permissions || []).slice().sort())
-        )
-      ) {
-        await revokeAdminSessionsForUser(targetUser._id, 'admin_role_changed');
-      }
-
-      return res.json({
-        ok: true,
-        userId: String(targetUser._id),
-        role: targetUser.role,
-        permissions: targetUser.admin?.permissions || [],
-      });
-    } catch (error) {
-      return res.status(500).json({
-        message: 'Erro interno do servidor.',
-      });
-    }
-  }
-);
+router.patch('/users/:userId/role', requireAdmin, validateObjectIdParam('userId', 'ID de usuário inválido.'), async (req, res) => (
+  res.status(410).json({
+    ok: false,
+    code: 'PUBLIC_USER_ADMIN_ROLE_DISABLED',
+    message: 'PUBLIC_USER_ADMIN_ROLE_DISABLED',
+  })
+));
 
 router.get('/projects/:id/files', requireAdmin, validateProjectId, async (req, res) => {
   try {

@@ -4,14 +4,14 @@ const adminAuditLogSchema = new mongoose.Schema(
   {
     adminUserId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      ref: 'AdminUser',
       default: null,
       immutable: true,
       index: true,
     },
     actorType: {
       type: String,
-      enum: ['user', 'legacy_token'],
+      enum: ['admin_user', 'legacy_token', 'user'],
       required: true,
       immutable: true,
     },

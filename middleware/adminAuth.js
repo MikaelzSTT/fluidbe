@@ -1,22 +1,17 @@
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const AdminAuditLog = require('../models/AdminAuditLog');
-const Session = require('../models/Session');
-const User = require('../models/User');
+const AdminSession = require('../models/AdminSession');
+const AdminUser = require('../models/AdminUser');
 const { getClientIp } = require('./rateLimit');
+const {
+  getAdminReauthTtlMs,
+  getAdminSessionTtlMs,
+  verifyAdminToken,
+} = require('../utils/adminIdentity');
 const { timingSafeEqualString } = require('../utils/timingSafe');
 
-const ADMIN_ROLES = Object.freeze(['user', 'admin']);
-const ADMIN_PERMISSIONS = Object.freeze([
-  'admin:read',
-  'admin:write',
-  'admin:build',
-  'admin:users',
-  'admin:secrets',
-]);
-const ADMIN_SESSION_TTL_MS = Number(process.env.ADMIN_SESSION_TTL_MS || 20 * 60 * 1000);
-const ADMIN_REAUTH_TTL_MS = Number(process.env.ADMIN_REAUTH_TTL_MS || 5 * 60 * 1000);
+const { ADMIN_PERMISSIONS } = AdminUser;
 const MFA_LOGIN_CLOCK_SKEW_MS = 5 * 1000;
 
 function getBearerToken(req) {
@@ -191,8 +186,8 @@ function getRequestHash(req, metadata) {
 }
 
 function getAdminActorKey(req) {
-  if (req.adminAuth?.actorType === 'user') {
-    return `user:${String(req.adminAuth.adminUserId || '')}`;
+  if (req.adminAuth?.actorType === 'admin_user') {
+    return `admin_user:${String(req.adminAuth.adminUserId || '')}`;
   }
 
   return 'legacy_token';
@@ -302,26 +297,26 @@ function getRouteMetadata(req) {
   };
 }
 
-function hasAdminPermission(user, permission) {
-  if (!user || user.role !== 'admin' || user.deletedAt) {
+function hasAdminPermission(adminUser, permission) {
+  if (!adminUser || !adminUser.active) {
     return false;
   }
 
-  const permissions = Array.isArray(user.admin?.permissions) ? user.admin.permissions : [];
+  const permissions = Array.isArray(adminUser.permissions) ? adminUser.permissions : [];
   return permissions.includes(permission);
 }
 
-function getAdminPermissionDenialReason(user, permission) {
-  if (!user || user.role !== 'admin' || user.deletedAt) {
+function getAdminPermissionDenialReason(adminUser, permission) {
+  if (!adminUser || !adminUser.active) {
     return 'not_admin';
   }
 
-  const permissions = Array.isArray(user.admin?.permissions) ? user.admin.permissions : [];
+  const permissions = Array.isArray(adminUser.permissions) ? adminUser.permissions : [];
   return permissions.includes(permission) ? null : 'permission_denied';
 }
 
-function isMfaVerifiedForSession(user, session, now) {
-  if (!user.twoFactor?.enabled || !session?.mfaVerifiedAt || !session?.createdAt) {
+function isMfaVerifiedForSession(adminUser, session, now) {
+  if (!adminUser.mfa?.enabled || !session?.mfaVerifiedAt || !session?.createdAt) {
     return false;
   }
 
@@ -333,28 +328,13 @@ function isMfaVerifiedForSession(user, session, now) {
   }
 
   return lastVerifiedAt + MFA_LOGIN_CLOCK_SKEW_MS >= sessionCreatedAt
-    && now.getTime() - sessionCreatedAt <= ADMIN_SESSION_TTL_MS;
+    && now.getTime() - sessionCreatedAt <= getAdminSessionTtlMs();
 }
 
 function hasRecentAdminReauth(session, now) {
   const lastVerifiedAt = new Date(session?.mfaVerifiedAt || 0).getTime();
 
-  return Number.isFinite(lastVerifiedAt) && now.getTime() - lastVerifiedAt <= ADMIN_REAUTH_TTL_MS;
-}
-
-function isSessionAfterAdminGrant(user, session) {
-  if (!user.admin?.grantedAt || !session?.createdAt) {
-    return false;
-  }
-
-  const grantedAt = new Date(user.admin.grantedAt).getTime();
-  const sessionCreatedAt = new Date(session.createdAt).getTime();
-
-  if (!Number.isFinite(grantedAt) || !Number.isFinite(sessionCreatedAt)) {
-    return false;
-  }
-
-  return sessionCreatedAt + MFA_LOGIN_CLOCK_SKEW_MS >= grantedAt;
+  return Number.isFinite(lastVerifiedAt) && now.getTime() - lastVerifiedAt <= getAdminReauthTtlMs();
 }
 
 async function authenticateLegacyAdmin(req) {
@@ -410,7 +390,7 @@ function legacyAdminAllowedForMetadata(req, res, metadata) {
   return denyAdmin(req, res, 403, 'permission_denied');
 }
 
-async function authenticateUserAdmin(req, res, metadata) {
+async function authenticateAdminSession(req, res, metadata) {
   const token = getBearerToken(req);
 
   if (!token) {
@@ -420,21 +400,25 @@ async function authenticateUserAdmin(req, res, metadata) {
   let decoded;
 
   try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    decoded = verifyAdminToken(token);
   } catch (error) {
     return denyAdmin(req, res, 401, 'missing_session');
   }
 
-  if (!decoded?.id || !decoded?.jti || decoded.runtimeUserId || !mongoose.Types.ObjectId.isValid(decoded.id)) {
+  if (
+    !decoded?.sub ||
+    !decoded?.jti ||
+    decoded.typ !== 'admin' ||
+    !mongoose.Types.ObjectId.isValid(decoded.sub)
+  ) {
     return denyAdmin(req, res, 401, 'missing_session');
   }
 
   const now = new Date();
-  const session = await Session.findOne({
+  const session = await AdminSession.findOne({
     jti: decoded.jti,
-    userId: decoded.id,
+    adminUserId: decoded.sub,
     revokedAt: null,
-    adminRevokedAt: null,
     expiresAt: { $gt: now },
   });
 
@@ -442,21 +426,15 @@ async function authenticateUserAdmin(req, res, metadata) {
     return denyAdmin(req, res, 401, 'missing_session');
   }
 
-  const user = await User.findById(decoded.id).select(
-    'role admin.permissions admin.grantedAt deletedAt twoFactor.enabled'
-  );
+  const adminUser = await AdminUser.findById(decoded.sub).select('active permissions mfa.enabled');
 
-  const permissionDenialReason = getAdminPermissionDenialReason(user, metadata.permission);
+  const permissionDenialReason = getAdminPermissionDenialReason(adminUser, metadata.permission);
 
   if (permissionDenialReason) {
     return denyAdmin(req, res, 403, permissionDenialReason);
   }
 
-  if (!isSessionAfterAdminGrant(user, session)) {
-    return denyAdmin(req, res, 403, 'pre_promotion_session');
-  }
-
-  if (!isMfaVerifiedForSession(user, session, now)) {
+  if (!isMfaVerifiedForSession(adminUser, session, now)) {
     return denyAdmin(req, res, 403, 'mfa_not_verified');
   }
 
@@ -465,12 +443,12 @@ async function authenticateUserAdmin(req, res, metadata) {
   }
 
   req.adminAuth = {
-    actorType: 'user',
-    adminUserId: user._id,
+    actorType: 'admin_user',
+    adminUserId: adminUser._id,
     sessionId: session._id,
     permission: metadata.permission,
   };
-  req.adminUser = user;
+  req.adminUser = adminUser;
   req.adminSession = session;
   return true;
 }
@@ -646,7 +624,7 @@ async function requireAdmin(req, res, next) {
     req.adminAuditMetadata = metadata;
 
     if (!await authenticateLegacyAdmin(req)) {
-      const authenticated = await authenticateUserAdmin(req, res, metadata);
+      const authenticated = await authenticateAdminSession(req, res, metadata);
 
       if (authenticated !== true) {
         return undefined;
@@ -673,21 +651,20 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-async function revokeAdminSessionsForUser(userId, reason) {
-  if (!mongoose.Types.ObjectId.isValid(userId)) {
+async function revokeAdminSessionsForAdminUser(adminUserId, reason) {
+  if (!mongoose.Types.ObjectId.isValid(adminUserId)) {
     return 0;
   }
 
-  const result = await Session.updateMany(
+  const result = await AdminSession.updateMany(
     {
-      userId,
+      adminUserId,
       revokedAt: null,
-      adminRevokedAt: null,
     },
     {
       $set: {
-        adminRevokedAt: new Date(),
-        adminRevokedReason: reason,
+        revokedAt: new Date(),
+        revokedReason: reason,
       },
     }
   );
@@ -697,11 +674,10 @@ async function revokeAdminSessionsForUser(userId, reason) {
 
 module.exports = {
   ADMIN_PERMISSIONS,
-  ADMIN_ROLES,
   getRouteMetadata,
   hasAdminPermission,
   beginCriticalAdminAudit,
   recordAdminAudit,
   requireAdmin,
-  revokeAdminSessionsForUser,
+  revokeAdminSessionsForAdminUser,
 };

@@ -25,7 +25,6 @@ const {
   verifyTotpCode,
 } = require('../utils/twoFactor');
 const { createRateLimit } = require('../middleware/rateLimit');
-const { revokeAdminSessionsForUser } = require('../middleware/adminAuth');
 const { deleteProjectsData } = require('../utils/projectDeletion');
 
 const router = express.Router();
@@ -127,6 +126,10 @@ function normalizeFrontendRedirectPath(value) {
     const parsed = new URL(trimmed, getFrontendUrl());
 
     if (parsed.origin !== getFrontendUrl() || !parsed.pathname.startsWith('/')) {
+      return DEFAULT_OAUTH_REDIRECT_PATH;
+    }
+
+    if (/^\/(?:admin|wizard)(?:\.html|\/|$)/i.test(parsed.pathname)) {
       return DEFAULT_OAUTH_REDIRECT_PATH;
     }
 
@@ -1065,7 +1068,6 @@ router.post('/me/2fa/setup', authMiddleware, async (req, res) => {
     };
 
     await user.save();
-    await revokeAdminSessionsForUser(user._id, 'two_factor_enabled');
 
     return res.json({
       ok: true,
@@ -1176,7 +1178,6 @@ router.post('/me/2fa/disable', authMiddleware, twoFactorDisableRateLimit, async 
 
     clearTwoFactor(user);
     await user.save();
-    await revokeAdminSessionsForUser(user._id, 'two_factor_disabled');
 
     return res.json({
       ok: true,
@@ -1270,7 +1271,6 @@ router.post('/me/2fa/recovery-codes/regenerate', authMiddleware, async (req, res
     user.twoFactor.recoveryCodes = await hashRecoveryCodes(recoveryCodes);
     user.twoFactor.lastVerifiedAt = new Date();
     await user.save();
-    await revokeAdminSessionsForUser(user._id, 'two_factor_recovery_codes_regenerated');
 
     return res.json({
       ok: true,
@@ -1332,7 +1332,6 @@ router.patch('/me/password', authMiddleware, passwordChangeRateLimit, async (req
     await user.save();
     await Promise.all([
       revokeOtherSessions(user._id, req.session?._id, 'password_changed'),
-      revokeAdminSessionsForUser(user._id, 'password_changed'),
     ]);
 
     return res.json({
@@ -1478,12 +1477,6 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
     user.providers = [];
     user.onboardingComplete = false;
     user.plan = 'free';
-    user.role = 'user';
-    user.admin = {
-      permissions: [],
-      revokedAt: now,
-      updatedAt: now,
-    };
     user.profile = {
       displayName: 'Deleted user',
       bio: '',

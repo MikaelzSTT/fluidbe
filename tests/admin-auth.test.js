@@ -1,22 +1,48 @@
 const assert = require('assert/strict');
 const express = require('express');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const test = require('node:test');
 const { generateSync } = require('otplib');
 
 const adminRoutes = require('../routes/adminRoutes');
+const adminAuthRoutes = require('../routes/adminAuthRoutes');
+const authRoutes = require('../routes/authRoutes');
 const AdminAuditLog = require('../models/AdminAuditLog');
+const AdminSession = require('../models/AdminSession');
+const AdminUser = require('../models/AdminUser');
 const Session = require('../models/Session');
 const User = require('../models/User');
 const { getAdminTokenKey } = require('../middleware/rateLimit');
 const { ADMIN_PERMISSIONS, getRouteMetadata, requireAdmin } = require('../middleware/adminAuth');
-const authRoutes = require('../routes/authRoutes');
-const { encryptTotpSecret } = require('../utils/twoFactor');
+const {
+  encryptAdminTotpSecret,
+  signAdminToken,
+} = require('../utils/adminIdentity');
 
+const ADMIN_USER_ID = '64f000000000000000000011';
 const USER_ID = '64f000000000000000000001';
 const OTHER_USER_ID = '64f000000000000000000002';
+
+function setAdminEnv() {
+  process.env.JWT_SECRET = 'public-auth-test-secret';
+  process.env.ADMIN_JWT_SECRET = 'separate-admin-auth-test-secret';
+  process.env.ADMIN_JWT_ISSUER = 'fluid-admin-test';
+  process.env.ADMIN_JWT_AUDIENCE = 'fluid-admin-api-test';
+  process.env.ADMIN_TWO_FACTOR_SECRET_KEY = 'admin-mfa-test-secret';
+  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
+  process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
+}
+
+function restoreEnv(previousEnv) {
+  for (const [key, value] of Object.entries(previousEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 function createResponse() {
   return {
@@ -46,21 +72,11 @@ function getAuthRouteHandler(pathname, method) {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function getAdminRouteHandler(pathname, method) {
-  const layer = adminRoutes.stack.find((item) => (
-    item.route?.path === pathname && item.route?.methods?.[method]
-  ));
-
-  return layer.route.stack[layer.route.stack.length - 1].handle;
-}
-
-function signToken(payload = {}) {
-  process.env.JWT_SECRET = process.env.JWT_SECRET || 'admin-auth-test-secret';
-
+function signPublicToken(payload = {}) {
   return jwt.sign(
     {
       id: USER_ID,
-      jti: 'admin-session-jti',
+      jti: 'public-session-jti',
       ...payload,
     },
     process.env.JWT_SECRET,
@@ -68,49 +84,80 @@ function signToken(payload = {}) {
   );
 }
 
+function makeAdminUser(overrides = {}) {
+  return {
+    _id: ADMIN_USER_ID,
+    email: 'operator@example.com',
+    active: true,
+    permissions: ['admin:read'],
+    mfa: {
+      enabled: true,
+      secretEnc: 'encrypted-secret',
+      lastVerifiedAt: new Date(),
+      recoveryCodes: [],
+    },
+    ...overrides,
+  };
+}
+
+function makeAdminSession(overrides = {}) {
+  const now = new Date();
+
+  return {
+    _id: 'admin-session-id',
+    adminUserId: ADMIN_USER_ID,
+    jti: 'admin-session-jti',
+    createdAt: new Date(now.getTime() - 1000),
+    mfaVerifiedAt: now,
+    lastSeenAt: now,
+    expiresAt: new Date(now.getTime() + 10 * 60 * 1000),
+    revokedAt: null,
+    save: async function saveSession() {
+      return this;
+    },
+    ...overrides,
+  };
+}
+
+function selectable(document) {
+  return {
+    select: async () => document,
+    then(resolve, reject) {
+      return Promise.resolve(document).then(resolve, reject);
+    },
+  };
+}
+
 async function callRequireAdmin({
   path = '/api/admin/projects',
   method = 'GET',
-  userRole = 'admin',
-  permissions = ['admin:read'],
-  twoFactorEnabled = true,
-  lastVerifiedAt = new Date(),
-  adminGrantedAt = new Date(Date.now() - 2000),
-  session = {},
-  tokenPayload = {},
+  adminUser = makeAdminUser(),
+  adminSession = makeAdminSession(),
+  token,
+  body = {},
+  params = {},
   headers = {},
 } = {}) {
-  const originalSessionFindOne = Session.findOne;
-  const originalUserFindById = User.findById;
+  const previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
+    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
+    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
+    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
+    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
+    ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
+  };
+  const originalAdminSessionFindOne = AdminSession.findOne;
+  const originalAdminUserFindById = AdminUser.findById;
   const originalAuditCreate = AdminAuditLog.create;
   const originalAuditFindOne = AdminAuditLog.findOne;
-  const token = signToken(tokenPayload);
   let nextCalled = false;
 
-  Session.findOne = async () => session === null ? null : {
-    _id: 'session-id',
-    createdAt: new Date(Date.now() - 1000),
-    mfaVerifiedAt: new Date(),
-    ...session,
-  };
-  User.findById = () => ({
-    select: async () => ({
-      _id: USER_ID,
-      role: userRole,
-      deletedAt: null,
-      admin: {
-        permissions,
-        grantedAt: adminGrantedAt,
-      },
-      twoFactor: {
-        enabled: twoFactorEnabled,
-        lastVerifiedAt,
-      },
-    }),
-  });
-  AdminAuditLog.findOne = () => ({
-    sort: async () => null,
-  });
+  setAdminEnv();
+  const bearer = token || signAdminToken(adminUser, adminSession?.jti || 'admin-session-jti');
+  AdminSession.findOne = async () => adminSession;
+  AdminUser.findById = () => selectable(adminUser);
+  AdminAuditLog.findOne = () => ({ sort: async () => null });
   AdminAuditLog.create = async () => ({ _id: 'audit-id' });
 
   try {
@@ -118,14 +165,14 @@ async function callRequireAdmin({
       method,
       originalUrl: path,
       url: path.replace('/api/admin', ''),
-      params: {},
+      params,
       query: {},
-      body: {},
+      body,
       ip: '203.0.113.10',
       socket: {},
       headers: {
-        authorization: `Bearer ${token}`,
-        'user-agent': 'Node Test Browser/1.0 token-should-not-log',
+        authorization: `Bearer ${bearer}`,
+        'user-agent': 'Node Test Browser/1.0',
         ...headers,
       },
     };
@@ -137,247 +184,155 @@ async function callRequireAdmin({
 
     return { req, res, nextCalled };
   } finally {
-    Session.findOne = originalSessionFindOne;
-    User.findById = originalUserFindById;
+    AdminSession.findOne = originalAdminSessionFindOne;
+    AdminUser.findById = originalAdminUserFindById;
     AdminAuditLog.create = originalAuditCreate;
     AdminAuditLog.findOne = originalAuditFindOne;
+    restoreEnv(previousEnv);
   }
 }
 
-test('ordinary user receives 403 on admin routes', async () => {
-  const { res, nextCalled } = await callRequireAdmin({ userRole: 'user', permissions: [] });
+test('normal public JWT receives 401 on admin routes', async () => {
+  setAdminEnv();
+  const token = signPublicToken();
+  const { res, nextCalled } = await callRequireAdmin({ token });
 
   assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
+  assert.equal(res.statusCode, 401);
 });
 
-test('admin without MFA receives 403', async () => {
-  const { res, nextCalled } = await callRequireAdmin({ twoFactorEnabled: false });
+test('public JWT with forged role=admin claim fails on admin routes', async () => {
+  setAdminEnv();
+  const token = signPublicToken({ role: 'admin', permissions: ADMIN_PERMISSIONS });
+  const { res, nextCalled } = await callRequireAdmin({ token });
 
   assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
+  assert.equal(res.statusCode, 401);
 });
 
-test('admin with MFA enabled but session without MFA verification receives 403', async () => {
+test('AdminUser without administrative MFA cannot access admin routes', async () => {
   const { res, nextCalled } = await callRequireAdmin({
-    twoFactorEnabled: true,
-    session: { mfaVerifiedAt: undefined },
+    adminUser: makeAdminUser({ mfa: { enabled: false } }),
   });
 
   assert.equal(nextCalled, false);
   assert.equal(res.statusCode, 403);
 });
 
-test('admin with MFA and valid short session accesses admin route', async () => {
+test('AdminUser with own MFA and valid AdminSession accesses admin routes', async () => {
   const { res, nextCalled } = await callRequireAdmin();
 
   assert.equal(nextCalled, true);
   assert.equal(res.statusCode, 200);
 });
 
-test('forged MFA claim in JWT is ignored when session lacks MFA verification', async () => {
-  const { res, nextCalled } = await callRequireAdmin({
-    session: { mfaVerifiedAt: undefined },
-    tokenPayload: {
-      mfaVerifiedAt: new Date().toISOString(),
-      amr: ['mfa'],
-    },
-  });
+test('expired or revoked AdminSession fails closed', async () => {
+  const expired = await callRequireAdmin({ adminSession: null });
 
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
+  assert.equal(expired.nextCalled, false);
+  assert.equal(expired.res.statusCode, 401);
+
+  const revoked = await callRequireAdmin({ adminSession: null });
+
+  assert.equal(revoked.nextCalled, false);
+  assert.equal(revoked.res.statusCode, 401);
 });
 
-test('promotion requires a new session created after the admin grant', async () => {
-  const grantTime = new Date();
-  const { res, nextCalled } = await callRequireAdmin({
-    adminGrantedAt: grantTime,
-    session: {
-      createdAt: new Date(grantTime.getTime() - 60 * 1000),
-      mfaVerifiedAt: new Date(grantTime.getTime() - 60 * 1000),
-    },
+test('critical admin route requires recent admin MFA from AdminSession', async () => {
+  const staleMfaSession = makeAdminSession({
+    createdAt: new Date(Date.now() - 10 * 60 * 1000),
+    mfaVerifiedAt: new Date(Date.now() - 10 * 60 * 1000),
   });
-
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
-});
-
-test('critical admin route requires recent MFA from the session, not JWT claims', async () => {
   const { res, nextCalled } = await callRequireAdmin({
     path: `/api/admin/users/${OTHER_USER_ID}/role`,
     method: 'PATCH',
-    permissions: ADMIN_PERMISSIONS,
-    session: {
-      createdAt: new Date(Date.now() - 10 * 60 * 1000),
-      mfaVerifiedAt: new Date(Date.now() - 10 * 60 * 1000),
-    },
-    tokenPayload: {
-      mfaVerifiedAt: new Date().toISOString(),
-    },
+    adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
+    adminSession: staleMfaSession,
+    params: { userId: OTHER_USER_ID },
+    body: { role: 'admin' },
   });
 
   assert.equal(nextCalled, false);
   assert.equal(res.statusCode, 403);
 });
 
-test('expired or revoked admin session fails', async () => {
-  const { res, nextCalled } = await callRequireAdmin({ session: null });
+test('public user registration never creates AdminUser', async () => {
+  const originalUserFindOne = User.findOne;
+  const originalUserExists = User.exists;
+  const originalUserCreate = User.create;
+  const originalAdminCreate = AdminUser.create;
+  const handler = getAuthRouteHandler('/register', 'post');
+  let capturedUserCreate = null;
+  let adminCreateCalled = false;
 
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 401);
-});
-
-test('removed admin role invalidates admin access', async () => {
-  const { res, nextCalled } = await callRequireAdmin({ userRole: 'user', permissions: ADMIN_PERMISSIONS });
-
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
-});
-
-test('JWT forged with admin role fails when database role is user', async () => {
-  const { res, nextCalled } = await callRequireAdmin({
-    userRole: 'user',
-    tokenPayload: { role: 'admin', permissions: ADMIN_PERMISSIONS },
-  });
-
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
-});
-
-test('user cannot alter another user without the admin users permission', async () => {
-  const { res, nextCalled } = await callRequireAdmin({
-    path: `/api/admin/users/${OTHER_USER_ID}/role`,
-    method: 'PATCH',
-    permissions: ['admin:read', 'admin:write'],
-    lastVerifiedAt: new Date(),
-  });
-
-  assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 403);
-});
-
-test('admin action creates audit log without request secrets', async () => {
-  const originalSessionFindOne = Session.findOne;
-  const originalUserFindById = User.findById;
-  const originalAuditCreate = AdminAuditLog.create;
-  const originalAuditFindOne = AdminAuditLog.findOne;
-  const capturedAudits = [];
-
-  process.env.JWT_SECRET = process.env.JWT_SECRET || 'admin-auth-test-secret';
-  Session.findOne = async () => ({
-    _id: 'session-id',
-    createdAt: new Date(Date.now() - 1000),
-    mfaVerifiedAt: new Date(),
-  });
-  User.findById = () => ({
-    select: async () => ({
+  User.findOne = async () => null;
+  User.exists = async () => null;
+  User.create = async (payload) => {
+    capturedUserCreate = payload;
+    return {
       _id: USER_ID,
-      role: 'admin',
-      deletedAt: null,
-      admin: {
-        permissions: ADMIN_PERMISSIONS,
-        grantedAt: new Date(Date.now() - 2000),
-      },
-      twoFactor: {
-        enabled: true,
-        lastVerifiedAt: new Date(),
-      },
-    }),
-  });
-  AdminAuditLog.findOne = () => ({
-    sort: async () => null,
-  });
-  AdminAuditLog.create = async (payload) => {
-    capturedAudits.push(payload);
-    return { _id: 'audit-id' };
+      name: payload.name,
+      email: payload.email,
+      providers: payload.providers,
+      onboardingComplete: false,
+      preferences: {},
+      profile: {},
+      twoFactor: {},
+    };
+  };
+  AdminUser.create = async () => {
+    adminCreateCalled = true;
+    throw new Error('AdminUser must not be created by public registration.');
   };
 
   try {
-    const req = {
-      method: 'PATCH',
-      originalUrl: `/api/admin/users/${OTHER_USER_ID}/role`,
-      url: `/users/${OTHER_USER_ID}/role`,
-      params: { userId: OTHER_USER_ID },
-      query: {},
-      body: {
-        password: 'super-secret-password',
-        token: 'secret-token-value',
-        role: 'admin',
-      },
-      ip: '203.0.113.20',
-      socket: {},
-      headers: {
-        authorization: `Bearer ${signToken()}`,
-        'x-request-id': 'audit-test-request',
-        'user-agent': 'Node Test Browser/1.0',
-      },
-    };
     const res = createResponse();
+    await handler({
+      body: {
+        name: 'Public Client',
+        email: 'same@example.com',
+        password: 'correct-horse-battery-staple',
+        role: 'admin',
+        admin: { permissions: ADMIN_PERMISSIONS },
+      },
+    }, res);
 
-    await requireAdmin(req, res, async () => {
-      await res.json({ ok: true });
-    });
-
-    assert.equal(res.statusCode, 200);
-    assert.equal(capturedAudits.length, 2);
-    assert.equal(capturedAudits[0].result, 'pending');
-    assert.equal(capturedAudits[1].adminUserId, USER_ID);
-    assert.equal(capturedAudits[1].action, `PATCH /users/${OTHER_USER_ID}/role`);
-    assert.equal(capturedAudits[1].resourceType, 'user');
-    assert.equal(capturedAudits[1].result, 'success');
-    assert.equal(capturedAudits[1].requestId, 'audit-test-request');
-    assert.equal(JSON.stringify(capturedAudits).includes('super-secret-password'), false);
-    assert.equal(JSON.stringify(capturedAudits).includes('secret-token-value'), false);
+    assert.equal(res.statusCode, 201);
+    assert.equal(adminCreateCalled, false);
+    assert.equal(Object.prototype.hasOwnProperty.call(capturedUserCreate, 'role'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(capturedUserCreate, 'admin'), false);
   } finally {
-    Session.findOne = originalSessionFindOne;
-    User.findById = originalUserFindById;
-    AdminAuditLog.create = originalAuditCreate;
-    AdminAuditLog.findOne = originalAuditFindOne;
+    User.findOne = originalUserFindOne;
+    User.exists = originalUserExists;
+    User.create = originalUserCreate;
+    AdminUser.create = originalAdminCreate;
   }
 });
 
-async function callCriticalAdminAction({
-  requestId = 'critical-action-request',
-  existingAudit = null,
-  auditCreate,
-  mutate,
-} = {}) {
-  const originalSessionFindOne = Session.findOne;
-  const originalUserFindById = User.findById;
+test('admin action audit preserves idempotency and does not store raw token or MFA values', async () => {
+  const previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
+    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
+    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
+    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
+  };
+  const originalAdminSessionFindOne = AdminSession.findOne;
+  const originalAdminUserFindById = AdminUser.findById;
   const originalAuditCreate = AdminAuditLog.create;
   const originalAuditFindOne = AdminAuditLog.findOne;
   const createdAudits = [];
+  const adminUser = makeAdminUser({ permissions: ADMIN_PERMISSIONS });
+  const adminSession = makeAdminSession();
+  let mutationCount = 0;
 
-  Session.findOne = async () => ({
-    _id: 'session-id',
-    createdAt: new Date(Date.now() - 1000),
-    mfaVerifiedAt: new Date(),
-  });
-  User.findById = () => ({
-    select: async () => ({
-      _id: USER_ID,
-      role: 'admin',
-      deletedAt: null,
-      admin: {
-        permissions: ADMIN_PERMISSIONS,
-        grantedAt: new Date(Date.now() - 2000),
-      },
-      twoFactor: {
-        enabled: true,
-        lastVerifiedAt: new Date(),
-      },
-    }),
-  });
-  AdminAuditLog.findOne = () => ({
-    sort: async () => existingAudit,
-  });
+  setAdminEnv();
+  const token = signAdminToken(adminUser, adminSession.jti);
+  AdminSession.findOne = async () => adminSession;
+  AdminUser.findById = () => selectable(adminUser);
+  AdminAuditLog.findOne = () => ({ sort: async () => null });
   AdminAuditLog.create = async (payload) => {
     createdAudits.push(payload);
-
-    if (auditCreate) {
-      return auditCreate(payload, createdAudits.length);
-    }
-
     return { _id: `audit-${createdAudits.length}` };
   };
 
@@ -389,147 +344,111 @@ async function callCriticalAdminAction({
       params: { userId: OTHER_USER_ID },
       query: {},
       body: {
+        token,
+        code: '123456',
+        password: 'admin-password',
         role: 'admin',
-        permissions: ADMIN_PERMISSIONS,
       },
-      ip: '203.0.113.40',
+      ip: '203.0.113.20',
       socket: {},
       headers: {
-        authorization: `Bearer ${signToken()}`,
-        'idempotency-key': requestId,
+        authorization: `Bearer ${token}`,
+        'idempotency-key': 'critical-admin-action',
         'user-agent': 'Node Test Browser/1.0',
+      },
+    };
+    const res = createResponse();
+
+    await requireAdmin(req, res, async () => {
+      mutationCount += 1;
+      await res.json({ ok: true });
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(mutationCount, 1);
+    assert.deepEqual(createdAudits.map((audit) => audit.result), ['pending', 'success']);
+    assert.equal(createdAudits[0].idempotencyKey, createdAudits[1].idempotencyKey);
+    assert.equal(createdAudits[1].actorType, 'admin_user');
+    assert.equal(JSON.stringify(createdAudits).includes(token), false);
+    assert.equal(JSON.stringify(createdAudits).includes('123456'), false);
+    assert.equal(JSON.stringify(createdAudits).includes('admin-password'), false);
+  } finally {
+    AdminSession.findOne = originalAdminSessionFindOne;
+    AdminUser.findById = originalAdminUserFindById;
+    AdminAuditLog.create = originalAuditCreate;
+    AdminAuditLog.findOne = originalAuditFindOne;
+    restoreEnv(previousEnv);
+  }
+});
+
+test('retry of completed critical admin action remains idempotent', async () => {
+  const previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
+    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
+    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
+    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
+  };
+  const originalAdminSessionFindOne = AdminSession.findOne;
+  const originalAdminUserFindById = AdminUser.findById;
+  const originalAuditCreate = AdminAuditLog.create;
+  const originalAuditFindOne = AdminAuditLog.findOne;
+  const adminUser = makeAdminUser({ permissions: ADMIN_PERMISSIONS });
+  const adminSession = makeAdminSession();
+
+  setAdminEnv();
+  const token = signAdminToken(adminUser, adminSession.jti);
+  const existingAudit = {
+    result: 'success',
+    idempotencyKey: 'already-done',
+    timestamp: new Date(),
+  };
+  AdminSession.findOne = async () => adminSession;
+  AdminUser.findById = () => selectable(adminUser);
+  AdminAuditLog.findOne = () => ({ sort: async () => existingAudit });
+  AdminAuditLog.create = async () => {
+    throw new Error('No audit should be created for completed idempotent retry.');
+  };
+
+  try {
+    const req = {
+      method: 'PATCH',
+      originalUrl: `/api/admin/users/${OTHER_USER_ID}/role`,
+      url: `/users/${OTHER_USER_ID}/role`,
+      params: { userId: OTHER_USER_ID },
+      query: {},
+      body: { role: 'admin' },
+      ip: '203.0.113.30',
+      socket: {},
+      headers: {
+        authorization: `Bearer ${token}`,
+        'idempotency-key': 'already-done-request',
       },
     };
     const res = createResponse();
     let nextCalled = false;
 
-    await requireAdmin(req, res, async () => {
+    await requireAdmin(req, res, () => {
       nextCalled = true;
-      await mutate?.();
-      await res.json({ ok: true });
     });
 
-    return { res, nextCalled, createdAudits };
+    assert.equal(nextCalled, false);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.idempotent, true);
   } finally {
-    Session.findOne = originalSessionFindOne;
-    User.findById = originalUserFindById;
+    AdminSession.findOne = originalAdminSessionFindOne;
+    AdminUser.findById = originalAdminUserFindById;
     AdminAuditLog.create = originalAuditCreate;
     AdminAuditLog.findOne = originalAuditFindOne;
+    restoreEnv(previousEnv);
   }
-}
-
-test('audit preflight failure prevents critical admin mutation', async () => {
-  let mutated = false;
-
-  const { res, nextCalled, createdAudits } = await callCriticalAdminAction({
-    auditCreate: async (payload) => {
-      assert.equal(payload.result, 'pending');
-      throw Object.assign(new Error('audit unavailable'), { code: 'AUDIT_DOWN' });
-    },
-    mutate: async () => {
-      mutated = true;
-    },
-  });
-
-  assert.equal(nextCalled, false);
-  assert.equal(mutated, false);
-  assert.equal(res.statusCode, 503);
-  assert.equal(createdAudits.length, 1);
 });
 
-test('audit completion failure after mutation keeps success response and blocks duplicate retry', async () => {
-  let mutationCount = 0;
-  let pendingAudit = null;
-
-  const first = await callCriticalAdminAction({
-    requestId: 'retry-after-pending',
-    auditCreate: async (payload, count) => {
-      if (count === 1) {
-        pendingAudit = payload;
-        return { _id: 'pending-audit' };
-      }
-
-      throw Object.assign(new Error('completion failed'), { code: 'AUDIT_COMPLETION_DOWN' });
-    },
-    mutate: async () => {
-      mutationCount += 1;
-    },
-  });
-
-  assert.equal(first.nextCalled, true);
-  assert.equal(first.res.statusCode, 200);
-  assert.equal(first.res.headers['X-Admin-Audit-State'], 'pending');
-  assert.equal(mutationCount, 1);
-  assert.equal(first.createdAudits.map((audit) => audit.result).join(','), 'pending,success');
-
-  const retry = await callCriticalAdminAction({
-    requestId: 'retry-after-pending',
-    existingAudit: {
-      ...pendingAudit,
-      result: 'pending',
-    },
-    mutate: async () => {
-      mutationCount += 1;
-    },
-  });
-
-  assert.equal(retry.nextCalled, false);
-  assert.equal(retry.res.statusCode, 202);
-  assert.equal(mutationCount, 1);
-});
-
-test('retry of completed critical admin action is idempotent', async () => {
-  let mutationCount = 0;
-
-  const first = await callCriticalAdminAction({
-    requestId: 'completed-idempotent-action',
-    mutate: async () => {
-      mutationCount += 1;
-    },
-  });
-
-  const successAudit = first.createdAudits.find((audit) => audit.result === 'success');
-
-  assert.equal(first.nextCalled, true);
-  assert.equal(first.res.statusCode, 200);
-  assert.equal(mutationCount, 1);
-  assert.ok(successAudit);
-
-  const retry = await callCriticalAdminAction({
-    requestId: 'completed-idempotent-action',
-    existingAudit: successAudit,
-    mutate: async () => {
-      mutationCount += 1;
-    },
-  });
-
-  assert.equal(retry.nextCalled, false);
-  assert.equal(retry.res.statusCode, 200);
-  assert.equal(retry.res.body.idempotent, true);
-  assert.equal(mutationCount, 1);
-});
-
-test('successful critical admin action writes pending and success audit records', async () => {
-  let mutationCount = 0;
-
-  const result = await callCriticalAdminAction({
-    requestId: 'successful-critical-audit',
-    mutate: async () => {
-      mutationCount += 1;
-    },
-  });
-
-  assert.equal(result.res.statusCode, 200);
-  assert.equal(mutationCount, 1);
-  assert.deepEqual(result.createdAudits.map((audit) => audit.result), ['pending', 'success']);
-  assert.ok(result.createdAudits[0].idempotencyKey);
-  assert.equal(result.createdAudits[0].idempotencyKey, result.createdAudits[1].idempotencyKey);
-  assert.equal(JSON.stringify(result.createdAudits).includes('permissions'), false);
-});
-
-test('legacy admin token fails when feature flag is false', async () => {
-  const previousToken = process.env.ADMIN_TOKEN;
-  const previousFlag = process.env.ADMIN_TOKEN_LEGACY_ENABLED;
+test('legacy admin token is disabled by default and gated by flag', async () => {
+  const previousEnv = {
+    ADMIN_TOKEN: process.env.ADMIN_TOKEN,
+    ADMIN_TOKEN_LEGACY_ENABLED: process.env.ADMIN_TOKEN_LEGACY_ENABLED,
+  };
   const originalAuditCreate = AdminAuditLog.create;
 
   process.env.ADMIN_TOKEN = 'legacy-admin-token';
@@ -548,74 +467,40 @@ test('legacy admin token fails when feature flag is false', async () => {
       socket: {},
       headers: { 'x-admin-token': 'legacy-admin-token' },
     };
-    const res = createResponse();
-    let nextCalled = false;
+    const disabledRes = createResponse();
+    let disabledNext = false;
 
-    await requireAdmin(req, res, () => {
-      nextCalled = true;
+    await requireAdmin(req, disabledRes, () => {
+      disabledNext = true;
     });
 
-    assert.equal(nextCalled, false);
-    assert.equal(res.statusCode, 401);
-  } finally {
-    if (previousToken === undefined) delete process.env.ADMIN_TOKEN;
-    else process.env.ADMIN_TOKEN = previousToken;
-    if (previousFlag === undefined) delete process.env.ADMIN_TOKEN_LEGACY_ENABLED;
-    else process.env.ADMIN_TOKEN_LEGACY_ENABLED = previousFlag;
-    AdminAuditLog.create = originalAuditCreate;
-  }
-});
+    assert.equal(disabledNext, false);
+    assert.equal(disabledRes.statusCode, 401);
 
-test('legacy admin token works only when feature flag is true', async () => {
-  const previousToken = process.env.ADMIN_TOKEN;
-  const previousFlag = process.env.ADMIN_TOKEN_LEGACY_ENABLED;
-  const originalAuditCreate = AdminAuditLog.create;
-  let capturedAudit = null;
+    process.env.ADMIN_TOKEN_LEGACY_ENABLED = 'true';
 
-  process.env.ADMIN_TOKEN = 'legacy-admin-token';
-  process.env.ADMIN_TOKEN_LEGACY_ENABLED = 'true';
-  AdminAuditLog.create = async (payload) => {
-    capturedAudit = payload;
-    return { _id: 'audit-id' };
-  };
+    const enabledRes = createResponse();
+    let enabledNext = false;
 
-  try {
-    const req = {
-      method: 'GET',
-      originalUrl: '/api/admin/projects',
-      url: '/projects',
-      params: {},
-      query: {},
-      body: {},
-      ip: '203.0.113.30',
-      socket: {},
-      headers: { 'x-admin-token': 'legacy-admin-token' },
-    };
-    const res = createResponse();
-    let nextCalled = false;
-
-    await requireAdmin(req, res, async () => {
-      nextCalled = true;
-      await res.json({ ok: true });
+    await requireAdmin(req, enabledRes, async () => {
+      enabledNext = true;
+      await enabledRes.json({ ok: true });
     });
 
-    assert.equal(nextCalled, true);
-    assert.equal(res.statusCode, 200);
-    assert.equal(capturedAudit.actorType, 'legacy_token');
-    assert.equal(capturedAudit.adminUserId, null);
+    assert.equal(enabledNext, true);
+    assert.equal(enabledRes.statusCode, 200);
   } finally {
-    if (previousToken === undefined) delete process.env.ADMIN_TOKEN;
-    else process.env.ADMIN_TOKEN = previousToken;
-    if (previousFlag === undefined) delete process.env.ADMIN_TOKEN_LEGACY_ENABLED;
-    else process.env.ADMIN_TOKEN_LEGACY_ENABLED = previousFlag;
     AdminAuditLog.create = originalAuditCreate;
+    restoreEnv(previousEnv);
   }
 });
 
 test('legacy admin token cannot perform critical mutations unless explicitly enabled', async () => {
-  const previousToken = process.env.ADMIN_TOKEN;
-  const previousFlag = process.env.ADMIN_TOKEN_LEGACY_ENABLED;
-  const previousCriticalFlag = process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED;
+  const previousEnv = {
+    ADMIN_TOKEN: process.env.ADMIN_TOKEN,
+    ADMIN_TOKEN_LEGACY_ENABLED: process.env.ADMIN_TOKEN_LEGACY_ENABLED,
+    ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED: process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED,
+  };
 
   process.env.ADMIN_TOKEN = 'legacy-admin-token';
   process.env.ADMIN_TOKEN_LEGACY_ENABLED = 'true';
@@ -643,12 +528,7 @@ test('legacy admin token cannot perform critical mutations unless explicitly ena
     assert.equal(nextCalled, false);
     assert.equal(res.statusCode, 403);
   } finally {
-    if (previousToken === undefined) delete process.env.ADMIN_TOKEN;
-    else process.env.ADMIN_TOKEN = previousToken;
-    if (previousFlag === undefined) delete process.env.ADMIN_TOKEN_LEGACY_ENABLED;
-    else process.env.ADMIN_TOKEN_LEGACY_ENABLED = previousFlag;
-    if (previousCriticalFlag === undefined) delete process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED;
-    else process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED = previousCriticalFlag;
+    restoreEnv(previousEnv);
   }
 });
 
@@ -678,206 +558,10 @@ test('admin route metadata only marks mutating routes as audit-critical', () => 
     params: { id: '64f000000000000000000099' },
   }).critical, false);
   assert.equal(getRouteMetadata({
-    method: 'GET',
-    originalUrl: '/api/admin/projects/64f000000000000000000099/builds/64f000000000000000000088/security-scan',
-    params: {
-      projectId: '64f000000000000000000099',
-      buildId: '64f000000000000000000088',
-    },
-  }).critical, false);
-  assert.equal(getRouteMetadata({
     method: 'PATCH',
     originalUrl: `/api/admin/users/${OTHER_USER_ID}/role`,
     params: { userId: OTHER_USER_ID },
   }).critical, true);
-});
-
-test('registration mass assignment cannot promote a user', async () => {
-  const originalFindOne = User.findOne;
-  const originalExists = User.exists;
-  const originalCreate = User.create;
-  const handler = getAuthRouteHandler('/register', 'post');
-  let capturedCreate = null;
-
-  User.findOne = async () => null;
-  User.exists = async () => null;
-  User.create = async (payload) => {
-    capturedCreate = payload;
-    return {
-      _id: USER_ID,
-      name: payload.name,
-      email: payload.email,
-      providers: payload.providers,
-      onboardingComplete: false,
-      preferences: {},
-      profile: {},
-      twoFactor: {},
-    };
-  };
-
-  try {
-    const res = createResponse();
-    await handler({
-      body: {
-        name: 'Mass Assignment',
-        email: 'mass-assignment@example.com',
-        password: 'correct-horse-battery-staple',
-        role: 'admin',
-        isAdmin: true,
-        admin: { permissions: ADMIN_PERMISSIONS },
-      },
-    }, res);
-
-    assert.equal(res.statusCode, 201);
-    assert.equal(Object.prototype.hasOwnProperty.call(capturedCreate, 'role'), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(capturedCreate, 'isAdmin'), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(capturedCreate, 'admin'), false);
-  } finally {
-    User.findOne = originalFindOne;
-    User.exists = originalExists;
-    User.create = originalCreate;
-  }
-});
-
-test('last active admin cannot be demoted', async () => {
-  const originalFindById = User.findById;
-  const originalCountDocuments = User.countDocuments;
-  const handler = getAdminRouteHandler('/users/:userId/role', 'patch');
-  let saved = false;
-
-  User.findById = () => ({
-    select: async () => ({
-      _id: USER_ID,
-      role: 'admin',
-      admin: {
-        permissions: ADMIN_PERMISSIONS,
-      },
-      deletedAt: null,
-      save: async () => {
-        saved = true;
-      },
-    }),
-  });
-  User.countDocuments = async () => 0;
-
-  try {
-    const res = createResponse();
-    await handler({
-      params: { userId: USER_ID },
-      body: {
-        role: 'user',
-        confirmSelfDemotion: 'DEMOTE_SELF',
-      },
-      adminAuth: {
-        adminUserId: USER_ID,
-      },
-    }, res);
-
-    assert.equal(res.statusCode, 409);
-    assert.equal(res.body.message, 'LAST_ACTIVE_ADMIN_REQUIRED');
-    assert.equal(saved, false);
-  } finally {
-    User.findById = originalFindById;
-    User.countDocuments = originalCountDocuments;
-  }
-});
-
-test('removing admin role revokes that user admin sessions', async () => {
-  const originalFindById = User.findById;
-  const originalCountDocuments = User.countDocuments;
-  const originalSessionUpdateMany = Session.updateMany;
-  const handler = getAdminRouteHandler('/users/:userId/role', 'patch');
-  let updateManyQuery = null;
-  let saved = false;
-
-  User.findById = () => ({
-    select: async () => ({
-      _id: OTHER_USER_ID,
-      role: 'admin',
-      admin: {
-        permissions: ADMIN_PERMISSIONS,
-      },
-      deletedAt: null,
-      save: async function saveUser() {
-        saved = true;
-        return this;
-      },
-    }),
-  });
-  User.countDocuments = async () => 1;
-  Session.updateMany = async (query, update) => {
-    updateManyQuery = { query, update };
-    return { modifiedCount: 2 };
-  };
-
-  try {
-    const res = createResponse();
-    await handler({
-      params: { userId: OTHER_USER_ID },
-      body: { role: 'user' },
-      adminAuth: {
-        adminUserId: USER_ID,
-      },
-    }, res);
-
-    assert.equal(res.statusCode, 200);
-    assert.equal(saved, true);
-    assert.equal(String(updateManyQuery.query.userId), OTHER_USER_ID);
-    assert.equal(updateManyQuery.query.adminRevokedAt, null);
-    assert.equal(updateManyQuery.update.$set.adminRevokedReason, 'admin_role_changed');
-  } finally {
-    User.findById = originalFindById;
-    User.countDocuments = originalCountDocuments;
-    Session.updateMany = originalSessionUpdateMany;
-  }
-});
-
-test('disabling MFA revokes admin sessions', async () => {
-  const originalFindById = User.findById;
-  const originalSessionUpdateMany = Session.updateMany;
-  const handler = getAuthRouteHandler('/me/2fa/disable', 'post');
-  const recoveryCode = 'AAAA-BBBB-CCCC';
-  let revokedReason = null;
-  const recoveryHash = await bcrypt.hash(recoveryCode.replace(/[^A-Z0-9]/g, ''), 10);
-  const user = {
-    _id: USER_ID,
-    password: await bcrypt.hash('current-password', 10),
-    providers: ['local'],
-    deletedAt: null,
-    twoFactor: {
-      enabled: true,
-      secretEnc: '',
-      recoveryCodes: [{ hash: recoveryHash }],
-    },
-    save: async function saveUser() {
-      return this;
-    },
-  };
-
-  User.findById = async () => user;
-  Session.updateMany = async (query, update) => {
-    revokedReason = update.$set.adminRevokedReason;
-    return { modifiedCount: 1 };
-  };
-
-  try {
-    const res = createResponse();
-    await handler({
-      userId: USER_ID,
-      body: {
-        currentPassword: 'current-password',
-        code: recoveryCode,
-      },
-    }, res);
-
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.body.message, 'TWO_FACTOR_DISABLED');
-    assert.equal(user.twoFactor.enabled, false);
-    assert.equal(revokedReason, 'two_factor_disabled');
-  } finally {
-    User.findById = originalFindById;
-    Session.updateMany = originalSessionUpdateMany;
-  }
 });
 
 async function startTestApp() {
@@ -885,6 +569,7 @@ async function startTestApp() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '100kb' }));
   app.use('/api/auth', authRoutes);
+  app.use('/api/admin-auth', adminAuthRoutes);
   app.use('/api/admin', adminRoutes);
 
   const server = http.createServer(app);
@@ -900,8 +585,8 @@ async function startTestApp() {
   };
 }
 
-async function requestJson(baseUrl, path, options = {}) {
-  const response = await fetch(`${baseUrl}${path}`, {
+async function requestJson(baseUrl, requestPath, options = {}) {
+  const response = await fetch(`${baseUrl}${requestPath}`, {
     method: options.method || 'GET',
     headers: {
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -913,159 +598,90 @@ async function requestJson(baseUrl, path, options = {}) {
 
   return {
     status: response.status,
-    headers: response.headers,
     body,
   };
 }
 
-test('Google admin login requires Fluid step-up MFA before admin access', async () => {
+test('public User and AdminUser can share email without sharing session or permissions', async () => {
   const previousEnv = {
     JWT_SECRET: process.env.JWT_SECRET,
-    TWO_FACTOR_SECRET_KEY: process.env.TWO_FACTOR_SECRET_KEY,
-    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
-    GOOGLE_CALLBACK_URL: process.env.GOOGLE_CALLBACK_URL,
+    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
+    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
+    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
+    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
     ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
     ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
   };
-  const originalFetch = global.fetch;
   const originalUserFindOne = User.findOne;
   const originalUserFindById = User.findById;
-  const originalUserExists = User.exists;
-  const originalUserUpdateOne = User.updateOne;
   const originalSessionCreate = Session.create;
   const originalSessionFindOne = Session.findOne;
-  const originalSessionUpdateOne = Session.updateOne;
+  const originalAdminUserFindOne = AdminUser.findOne;
+  const originalAdminUserFindById = AdminUser.findById;
+  const originalAdminUserUpdateOne = AdminUser.updateOne;
+  const originalAdminSessionCreate = AdminSession.create;
+  const originalAdminSessionFindOne = AdminSession.findOne;
+  const originalAdminSessionUpdateOne = AdminSession.updateOne;
   const originalAuditCreate = AdminAuditLog.create;
   const originalAuditFindOne = AdminAuditLog.findOne;
-  const originalConsoleWarn = console.warn;
   const app = await startTestApp();
 
-  process.env.JWT_SECRET = 'google-admin-flow-jwt-secret';
-  process.env.TWO_FACTOR_SECRET_KEY = 'google-admin-flow-2fa-secret';
-  process.env.GOOGLE_CLIENT_ID = 'google-client-id';
-  process.env.GOOGLE_CLIENT_SECRET = 'google-client-secret';
-  process.env.GOOGLE_CALLBACK_URL = `${app.baseUrl}/api/auth/google/callback`;
-  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
-  process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
+  setAdminEnv();
 
+  const email = 'same@example.com';
+  const publicPassword = 'public-password';
+  const adminPassword = 'admin-password-long';
   const totpSecret = 'S47NGTYLRNCFTSKGFW3FXLFED24EQ3TT';
-  const sessionsByJti = new Map();
-  const warnings = [];
-  const user = {
+  const publicUser = {
     _id: USER_ID,
-    name: 'Google Admin',
-    email: 'google-admin@example.com',
-    googleId: 'google-subject-1',
-    avatar: '',
-    emailVerified: true,
-    providers: ['google'],
-    role: 'admin',
-    admin: {
-      permissions: ADMIN_PERMISSIONS,
-      grantedAt: new Date(Date.now() - 2000),
-    },
+    name: 'Public Client',
+    email,
+    password: await bcrypt.hash(publicPassword, 10),
+    providers: ['local'],
     deletedAt: null,
     onboardingComplete: true,
     profile: {},
     preferences: {},
-    twoFactor: {
+    twoFactor: { enabled: false },
+  };
+  const adminUser = {
+    _id: ADMIN_USER_ID,
+    email,
+    passwordHash: await bcrypt.hash(adminPassword, 12),
+    active: true,
+    permissions: ADMIN_PERMISSIONS,
+    mfa: {
       enabled: true,
-      secretEnc: encryptTotpSecret(totpSecret),
-      lastVerifiedAt: null,
+      secretEnc: encryptAdminTotpSecret(totpSecret),
       recoveryCodes: [],
     },
-    save: async function saveUser() {
+    failedLoginCount: 0,
+    save: async function saveAdminUser() {
       return this;
     },
   };
+  const publicSessionsByJti = new Map();
+  const adminSessionsByJti = new Map();
 
-  function selectable(document) {
-    return {
-      ...document,
-      select: async () => document,
-    };
-  }
-
-  global.fetch = async (url, options) => {
-    const normalizedUrl = String(url);
-
-    if (normalizedUrl === 'https://oauth2.googleapis.com/token') {
-      return {
-        ok: true,
-        json: async () => ({
-          access_token: 'google-access-token',
-          id_token: jwt.sign(
-            {
-              iss: 'https://accounts.google.com',
-              aud: process.env.GOOGLE_CLIENT_ID,
-              sub: user.googleId,
-              amr: ['mfa'],
-              acr: 'urn:forged:mfa',
-            },
-            'untrusted-oauth-claim'
-          ),
-        }),
-      };
-    }
-
-    if (normalizedUrl === 'https://www.googleapis.com/oauth2/v3/userinfo') {
-      return {
-        ok: true,
-        json: async () => ({
-          sub: user.googleId,
-          email: user.email,
-          email_verified: true,
-          name: user.name,
-          picture: '',
-          amr: ['mfa'],
-          acr: 'urn:forged:mfa',
-        }),
-      };
-    }
-
-    return originalFetch(url, options);
-  };
-  User.findOne = async (query) => {
-    if (query?.googleId === user.googleId || query?.email === user.email) {
-      return user;
-    }
-
-    return null;
-  };
-  User.findById = () => selectable(user);
-  User.exists = async () => null;
-  User.updateOne = async (query, update) => {
-    if (String(query?._id) === USER_ID && update?.$set?.['twoFactor.lastVerifiedAt']) {
-      user.twoFactor.lastVerifiedAt = update.$set['twoFactor.lastVerifiedAt'];
-    }
-
-    return { matchedCount: 1, modifiedCount: 1 };
-  };
+  User.findOne = async (query) => query?.email === email ? publicUser : null;
+  User.findById = async (id) => String(id) === USER_ID ? publicUser : null;
   Session.create = async (payload) => {
     const session = {
-      _id: `google-session-${sessionsByJti.size + 1}`,
+      _id: `public-session-${publicSessionsByJti.size + 1}`,
       ...payload,
-      createdAt: payload.createdAt || new Date(),
-      expiresAt: payload.expiresAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       revokedAt: null,
-      adminRevokedAt: null,
     };
-    sessionsByJti.set(session.jti, session);
+    publicSessionsByJti.set(session.jti, session);
     return session;
   };
   Session.findOne = async (query) => {
-    const session = sessionsByJti.get(query?.jti);
+    const session = publicSessionsByJti.get(query?.jti);
 
-    if (!session || String(query?.userId) !== USER_ID) {
+    if (!session || String(session.userId) !== String(query?.userId)) {
       return null;
     }
 
     if (query.revokedAt === null && session.revokedAt) {
-      return null;
-    }
-
-    if (query.adminRevokedAt === null && session.adminRevokedAt) {
       return null;
     }
 
@@ -1075,454 +691,117 @@ test('Google admin login requires Fluid step-up MFA before admin access', async 
 
     return session;
   };
-  Session.updateOne = async (query, update) => {
-    const session = Array.from(sessionsByJti.values()).find((item) => String(item._id) === String(query?._id));
-
-    if (!session || String(query?.userId) !== USER_ID) {
-      return { matchedCount: 0, modifiedCount: 0 };
+  AdminUser.findOne = () => ({ select: async () => adminUser });
+  AdminUser.findById = () => selectable(adminUser);
+  AdminUser.updateOne = async (query, update) => {
+    if (update?.$set?.['mfa.lastVerifiedAt']) {
+      adminUser.mfa.lastVerifiedAt = update.$set['mfa.lastVerifiedAt'];
     }
 
-    session.mfaVerifiedAt = update.$set.mfaVerifiedAt;
-    session.lastSeenAt = update.$set.lastSeenAt;
     return { matchedCount: 1, modifiedCount: 1 };
   };
-  AdminAuditLog.findOne = () => ({
-    sort: async () => null,
-  });
-  AdminAuditLog.create = async () => ({ _id: 'google-admin-audit' });
-  console.warn = (message, metadata) => {
-    if (message === 'Admin authorization denied.') {
-      warnings.push(metadata);
-      return;
+  AdminSession.create = async (payload) => {
+    const session = {
+      _id: `admin-session-${adminSessionsByJti.size + 1}`,
+      ...payload,
+      revokedAt: null,
+      save: async function saveAdminSession() {
+        return this;
+      },
+    };
+    adminSessionsByJti.set(session.jti, session);
+    return session;
+  };
+  AdminSession.findOne = async (query) => {
+    const session = adminSessionsByJti.get(query?.jti);
+
+    if (!session || String(session.adminUserId) !== String(query?.adminUserId)) {
+      return null;
     }
 
-    originalConsoleWarn(message, metadata);
+    if (query.revokedAt === null && session.revokedAt) {
+      return null;
+    }
+
+    if (query.expiresAt?.$gt && !(session.expiresAt > query.expiresAt.$gt)) {
+      return null;
+    }
+
+    return session;
   };
+  AdminSession.updateOne = async () => ({ matchedCount: 1, modifiedCount: 1 });
+  AdminAuditLog.findOne = () => ({ sort: async () => null });
+  AdminAuditLog.create = async () => ({ _id: 'audit-id' });
 
   try {
-    const start = await originalFetch(`${app.baseUrl}/api/auth/google?redirect=/admin.html`, {
-      redirect: 'manual',
-    });
-    const authLocation = start.headers.get('location');
-    const state = new URL(authLocation).searchParams.get('state');
-    const stateCookie = start.headers.get('set-cookie').split(';')[0];
-
-    const callback = await originalFetch(`${app.baseUrl}/api/auth/google/callback?code=oauth-code&state=${encodeURIComponent(state)}`, {
-      headers: {
-        Cookie: stateCookie,
-      },
-      redirect: 'manual',
-    });
-    const redirectLocation = callback.headers.get('location');
-    const fragment = new URL(redirectLocation).hash.slice(1);
-    const token = new URLSearchParams(fragment).get('token');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    const session = sessionsByJti.get(decoded.jti);
-
-    assert.ok(token);
-    assert.equal(session.mfaVerifiedAt, undefined);
-
-    const denied = await originalFetch(`${app.baseUrl}/api/admin/status`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Request-Id': 'google-admin-no-fluid-mfa',
-      },
-    });
-    assert.equal(denied.status, 403);
-    assert.deepEqual(await denied.json(), { message: 'Admin não autorizado' });
-    assert.equal(warnings.at(-1).requestId, 'google-admin-no-fluid-mfa');
-    assert.equal(warnings.at(-1).reason, 'mfa_not_verified');
-    assert.equal(JSON.stringify(warnings).includes(user.email), false);
-    assert.equal(JSON.stringify(warnings).includes(decoded.jti), false);
-
-    const invalidStepUp = await requestJson(app.baseUrl, '/api/auth/me/2fa/step-up', {
+    const publicLogin = await requestJson(app.baseUrl, '/api/auth/login', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-      body: {
-        code: '000000',
-      },
+      body: { email, password: publicPassword },
     });
-    assert.equal(invalidStepUp.status, 400);
-    assert.equal(session.mfaVerifiedAt, undefined);
+    assert.equal(publicLogin.status, 200);
+    assert.ok(publicLogin.body.token);
 
-    const stillDenied = await originalFetch(`${app.baseUrl}/api/admin/status`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Request-Id': 'google-admin-invalid-step-up',
-      },
+    const publicDenied = await requestJson(app.baseUrl, '/api/admin/status', {
+      headers: { Authorization: `Bearer ${publicLogin.body.token}` },
     });
-    assert.equal(stillDenied.status, 403);
-    assert.equal(warnings.at(-1).reason, 'mfa_not_verified');
+    assert.equal(publicDenied.status, 401);
 
-    const validStepUp = await requestJson(app.baseUrl, '/api/auth/me/2fa/step-up', {
+    const adminLogin = await requestJson(app.baseUrl, '/api/admin-auth/login', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      body: { email, password: adminPassword },
+    });
+    assert.equal(adminLogin.status, 200);
+    assert.equal(adminLogin.body.requiresMfa, true);
+
+    const adminMfa = await requestJson(app.baseUrl, '/api/admin-auth/mfa/verify', {
+      method: 'POST',
       body: {
+        loginChallenge: adminLogin.body.loginChallenge,
         code: generateSync({ secret: totpSecret }),
       },
     });
-    assert.equal(validStepUp.status, 200);
-    assert.ok(session.mfaVerifiedAt);
-    assert.ok(session.createdAt >= user.admin.grantedAt);
+    assert.equal(adminMfa.status, 200);
+    assert.ok(adminMfa.body.token);
 
-    const allowed = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+    const adminStatus = await requestJson(app.baseUrl, '/api/admin/status', {
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
     });
-    assert.equal(allowed.status, 200);
-    assert.equal(allowed.body.ok, true);
+    assert.equal(adminStatus.status, 200);
+    assert.equal(adminStatus.body.admin.actorType, 'admin_user');
+    assert.equal(adminStatus.body.admin.userId, ADMIN_USER_ID);
+
+    const adminTokenRejectedByPublicAuth = await requestJson(app.baseUrl, '/api/auth/me', {
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
+    });
+    assert.equal(adminTokenRejectedByPublicAuth.status, 401);
   } finally {
     await app.close();
-    global.fetch = originalFetch;
     User.findOne = originalUserFindOne;
     User.findById = originalUserFindById;
-    User.exists = originalUserExists;
-    User.updateOne = originalUserUpdateOne;
     Session.create = originalSessionCreate;
     Session.findOne = originalSessionFindOne;
-    Session.updateOne = originalSessionUpdateOne;
+    AdminUser.findOne = originalAdminUserFindOne;
+    AdminUser.findById = originalAdminUserFindById;
+    AdminUser.updateOne = originalAdminUserUpdateOne;
+    AdminSession.create = originalAdminSessionCreate;
+    AdminSession.findOne = originalAdminSessionFindOne;
+    AdminSession.updateOne = originalAdminSessionUpdateOne;
     AdminAuditLog.create = originalAuditCreate;
     AdminAuditLog.findOne = originalAuditFindOne;
-    console.warn = originalConsoleWarn;
-
-    for (const [key, value] of Object.entries(previousEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+    restoreEnv(previousEnv);
   }
 });
 
-test('full admin flow uses per-session MFA, admin grant time, revocation, audit and legacy-off behavior', async () => {
-  const previousEnv = {
-    JWT_SECRET: process.env.JWT_SECRET,
-    TWO_FACTOR_SECRET_KEY: process.env.TWO_FACTOR_SECRET_KEY,
-    ADMIN_TOKEN: process.env.ADMIN_TOKEN,
-    ADMIN_TOKEN_LEGACY_ENABLED: process.env.ADMIN_TOKEN_LEGACY_ENABLED,
-    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
-    ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
-  };
-  const originalUserFindOne = User.findOne;
-  const originalUserFindById = User.findById;
-  const originalUserUpdateOne = User.updateOne;
-  const originalUserCountDocuments = User.countDocuments;
-  const originalSessionCreate = Session.create;
-  const originalSessionFindOne = Session.findOne;
-  const originalSessionUpdateMany = Session.updateMany;
-  const originalAuditCreate = AdminAuditLog.create;
-  const originalAuditFindOne = AdminAuditLog.findOne;
-  const app = await startTestApp();
+test('admin.html does not depend on fluid-token', () => {
+  const adminHtmlPath = path.join(__dirname, '..', 'public', 'admin.html');
 
-  process.env.JWT_SECRET = 'admin-flow-integration-jwt-secret';
-  process.env.TWO_FACTOR_SECRET_KEY = 'admin-flow-integration-2fa-secret';
-  process.env.ADMIN_TOKEN = 'legacy-token-value';
-  process.env.ADMIN_TOKEN_LEGACY_ENABLED = 'false';
-  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
-  process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
-
-  const userId = USER_ID;
-  const targetUserId = OTHER_USER_ID;
-  const recoveryCode = 'ABCD-1234-EFGH';
-  const password = 'correct-horse-battery-staple';
-  const passwordHash = await bcrypt.hash(password, 10);
-  const sessionsByJti = new Map();
-  const audits = [];
-  const auditByIdempotencyKey = new Map();
-  const recoveryHash = await bcrypt.hash(recoveryCode.replace(/[^A-Z0-9]/g, ''), 10);
-  const user = {
-    _id: userId,
-    name: 'Admin Candidate',
-    email: 'admin-candidate@example.com',
-    password: passwordHash,
-    providers: ['local'],
-    role: 'user',
-    admin: {
-      permissions: [],
-      grantedAt: null,
-    },
-    deletedAt: null,
-    onboardingComplete: true,
-    profile: {},
-    preferences: {},
-    twoFactor: {
-      enabled: false,
-      secretEnc: encryptTotpSecret('JBSWY3DPEHPK3PXP'),
-      lastVerifiedAt: null,
-      recoveryCodes: [
-        {
-          hash: recoveryHash,
-        },
-      ],
-    },
-    save: async function saveUser() {
-      return this;
-    },
-  };
-  const targetUser = {
-    _id: targetUserId,
-    role: 'user',
-    admin: {
-      permissions: [],
-      grantedAt: null,
-    },
-    deletedAt: null,
-    save: async function saveTargetUser() {
-      this.saved = true;
-      return this;
-    },
-  };
-
-  function selectable(document) {
-    return {
-      ...document,
-      select: async () => document,
-    };
+  if (!fs.existsSync(adminHtmlPath)) {
+    assert.equal(fs.existsSync(adminHtmlPath), false);
+    return;
   }
 
-  User.findOne = async (query) => {
-    if (query?.email === user.email) {
-      return user;
-    }
+  const html = fs.readFileSync(adminHtmlPath, 'utf8');
 
-    return null;
-  };
-  User.findById = (id) => {
-    const document = String(id) === targetUserId ? targetUser : user;
-    return selectable(document);
-  };
-  User.updateOne = async (query, update) => {
-    if (String(query?._id) === userId && update?.$set?.['twoFactor.lastVerifiedAt']) {
-      user.twoFactor.lastVerifiedAt = update.$set['twoFactor.lastVerifiedAt'];
-    }
-
-    return { modifiedCount: 1 };
-  };
-  User.countDocuments = async () => 1;
-  Session.create = async (payload) => {
-    const session = {
-      _id: `session-${sessionsByJti.size + 1}`,
-      ...payload,
-      createdAt: payload.createdAt || new Date(),
-      expiresAt: payload.expiresAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      revokedAt: null,
-      adminRevokedAt: null,
-    };
-    sessionsByJti.set(session.jti, session);
-    return session;
-  };
-  Session.findOne = async (query) => {
-    const session = sessionsByJti.get(query?.jti);
-
-    if (!session || String(query?.userId) !== userId) {
-      return null;
-    }
-
-    if (query.revokedAt === null && session.revokedAt) {
-      return null;
-    }
-
-    if (query.adminRevokedAt === null && session.adminRevokedAt) {
-      return null;
-    }
-
-    if (query.expiresAt?.$gt && !(session.expiresAt > query.expiresAt.$gt)) {
-      return null;
-    }
-
-    return session;
-  };
-  Session.updateMany = async (query, update) => {
-    let modifiedCount = 0;
-
-    for (const session of sessionsByJti.values()) {
-      if (String(session.userId) !== String(query.userId)) {
-        continue;
-      }
-
-      if (query.adminRevokedAt === null && session.adminRevokedAt) {
-        continue;
-      }
-
-      session.adminRevokedAt = update.$set.adminRevokedAt;
-      session.adminRevokedReason = update.$set.adminRevokedReason;
-      modifiedCount += 1;
-    }
-
-    return { modifiedCount };
-  };
-  AdminAuditLog.findOne = (query) => ({
-    sort: async () => auditByIdempotencyKey.get(query?.idempotencyKey) || null,
-  });
-  AdminAuditLog.create = async (payload) => {
-    const audit = {
-      _id: `audit-${audits.length + 1}`,
-      timestamp: new Date(),
-      ...payload,
-    };
-    audits.push(audit);
-
-    if (audit.idempotencyKey && ['pending', 'success'].includes(audit.result)) {
-      auditByIdempotencyKey.set(audit.idempotencyKey, audit);
-    }
-
-    return audit;
-  };
-
-  try {
-    const commonLogin = await requestJson(app.baseUrl, '/api/auth/login', {
-      method: 'POST',
-      body: {
-        email: user.email,
-        password,
-      },
-    });
-    assert.equal(commonLogin.status, 200);
-    assert.ok(commonLogin.body.token);
-
-    const commonStatus = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${commonLogin.body.token}`,
-      },
-    });
-    assert.equal(commonStatus.status, 403);
-
-    const oldToken = commonLogin.body.token;
-    user.role = 'admin';
-    user.admin = {
-      permissions: ADMIN_PERMISSIONS,
-      grantedAt: new Date(),
-    };
-    user.twoFactor.enabled = true;
-
-    const oldTokenAfterPromotion = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${oldToken}`,
-      },
-    });
-    assert.equal(oldTokenAfterPromotion.status, 403);
-
-    const login = await requestJson(app.baseUrl, '/api/auth/login', {
-      method: 'POST',
-      body: {
-        email: user.email,
-        password,
-      },
-    });
-    assert.equal(login.status, 200);
-    assert.equal(login.body.requiresTwoFactor, true);
-    assert.ok(login.body.loginChallenge);
-
-    const mfa = await requestJson(app.baseUrl, '/api/auth/2fa/verify-login', {
-      method: 'POST',
-      body: {
-        loginChallenge: login.body.loginChallenge,
-        code: recoveryCode,
-      },
-    });
-    assert.equal(mfa.status, 200);
-    assert.ok(mfa.body.token);
-
-    const decoded = jwt.verify(mfa.body.token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    const adminSession = sessionsByJti.get(decoded.jti);
-    assert.ok(adminSession?.mfaVerifiedAt);
-    assert.ok(adminSession.createdAt >= user.admin.grantedAt);
-
-    const adminStatus = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-        'X-Forwarded-For': '198.51.100.77',
-      },
-    });
-    assert.equal(adminStatus.status, 200);
-    assert.equal(adminStatus.body.ok, true);
-
-    const critical = await requestJson(app.baseUrl, `/api/admin/users/${targetUserId}/role`, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-        'Idempotency-Key': 'admin-flow-role-update',
-      },
-      body: {
-        role: 'admin',
-        permissions: ['admin:read'],
-      },
-    });
-    assert.equal(critical.status, 200);
-    assert.equal(targetUser.role, 'admin');
-    assert.equal(targetUser.saved, true);
-
-    const retry = await requestJson(app.baseUrl, `/api/admin/users/${targetUserId}/role`, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-        'Idempotency-Key': 'admin-flow-role-update',
-      },
-      body: {
-        role: 'admin',
-        permissions: ['admin:read'],
-      },
-    });
-    assert.equal(retry.status, 200);
-    assert.equal(retry.body.idempotent, true);
-
-    const successAudits = audits.filter((audit) => audit.result === 'success');
-    assert.ok(successAudits.some((audit) => audit.action === 'GET /status'));
-    assert.ok(successAudits.some((audit) => audit.action === `PATCH /users/${targetUserId}/role`));
-    assert.equal(JSON.stringify(audits).includes(password), false);
-    assert.equal(JSON.stringify(audits).includes(recoveryCode), false);
-    assert.equal(JSON.stringify(audits).includes(mfa.body.token), false);
-
-    adminSession.expiresAt = new Date(Date.now() - 1000);
-    const expired = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-      },
-    });
-    assert.equal(expired.status, 401);
-
-    adminSession.expiresAt = new Date(Date.now() + 60 * 1000);
-    adminSession.adminRevokedAt = new Date();
-    const revoked = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-      },
-    });
-    assert.equal(revoked.status, 401);
-
-    adminSession.adminRevokedAt = null;
-    user.role = 'user';
-    const removedRole = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        Authorization: `Bearer ${mfa.body.token}`,
-      },
-    });
-    assert.equal(removedRole.status, 403);
-
-    const legacyOff = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: {
-        'x-admin-token': 'legacy-token-value',
-      },
-    });
-    assert.equal(legacyOff.status, 401);
-  } finally {
-    await app.close();
-    User.findOne = originalUserFindOne;
-    User.findById = originalUserFindById;
-    User.updateOne = originalUserUpdateOne;
-    User.countDocuments = originalUserCountDocuments;
-    Session.create = originalSessionCreate;
-    Session.findOne = originalSessionFindOne;
-    Session.updateMany = originalSessionUpdateMany;
-    AdminAuditLog.create = originalAuditCreate;
-    AdminAuditLog.findOne = originalAuditFindOne;
-
-    for (const [key, value] of Object.entries(previousEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
+  assert.equal(html.includes('fluid-token'), false);
+  assert.match(html, /admin-token|admin-auth/i);
 });

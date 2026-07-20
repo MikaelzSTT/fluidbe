@@ -9,6 +9,7 @@ const authRoutes = require('./routes/authRoutes');
 const projectRoutes = require('./routes/projectRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const adminAuthRoutes = require('./routes/adminAuthRoutes');
 const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
 const billingRoutes = require('./routes/billingRoutes');
 const runtimeRoutes = require('./routes/runtimeRoutes');
@@ -659,7 +660,8 @@ async function authorizeBuildAccess(req, res, next) {
       return next();
     }
 
-    const isAdmin = Boolean(process.env.ADMIN_TOKEN)
+    const isAdmin = process.env.ADMIN_TOKEN_LEGACY_ENABLED === 'true'
+      && Boolean(process.env.ADMIN_TOKEN)
       && timingSafeEqualString(req.headers['x-admin-token'], process.env.ADMIN_TOKEN);
     const userId = await getBearerUserId(req);
 
@@ -916,6 +918,7 @@ app.use('/api/auth/register', registerRateLimit);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/chat', chatIpRateLimit, chatRoutes);
+app.use('/api/admin-auth', adminRateLimit, adminAuthRoutes);
 app.use('/api/admin', adminRateLimit, adminRoutes);
 app.use('/api/connectors', connectorRegistryRoutes);
 app.use('/api/runtime/:projectId', runtimeRoutes);

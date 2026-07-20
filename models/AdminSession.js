@@ -1,9 +1,9 @@
 const mongoose = require('mongoose');
 
-const sessionSchema = new mongoose.Schema({
-  userId: {
+const adminSessionSchema = new mongoose.Schema({
+  adminUserId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
+    ref: 'AdminUser',
     required: true,
     index: true,
   },
@@ -47,7 +47,7 @@ const sessionSchema = new mongoose.Schema({
   },
 });
 
-sessionSchema.index({ userId: 1, revokedAt: 1, expiresAt: 1 });
-sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+adminSessionSchema.index({ adminUserId: 1, revokedAt: 1, expiresAt: 1 });
+adminSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-module.exports = mongoose.model('Session', sessionSchema);
+module.exports = mongoose.model('AdminSession', adminSessionSchema);
