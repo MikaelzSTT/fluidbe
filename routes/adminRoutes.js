@@ -34,6 +34,12 @@ const {
   scanBuildSecurity: scanBuildSecurityShared,
   withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
 } = require('../utils/projectPublication');
+const {
+  INVALID_PRECOMPILED_DIST_CODE,
+  INVALID_PRECOMPILED_DIST_MESSAGE,
+  assertPrecompiledDistSecurityAllowsPublication,
+  extractPrecompiledDistZipSafely,
+} = require('../utils/precompiledDist');
 
 const router = express.Router();
 const reactViteUploadRateLimit = createRateLimit({
@@ -1256,6 +1262,37 @@ const reactViteUpload = multer({
   },
 });
 
+const precompiledDistUpload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, file, callback) => {
+      try {
+        const uploadKey = `dist-${Date.now()}-${new mongoose.Types.ObjectId()}`;
+        const uploadDir = path.join(REACT_VITE_STORAGE_DIR, req.params.id, uploadKey);
+
+        req.precompiledDistUploadDir = uploadDir;
+        await fs.mkdir(uploadDir, { recursive: true, mode: 0o700 });
+        callback(null, uploadDir);
+      } catch (error) {
+        callback(error);
+      }
+    },
+    filename: (req, file, callback) => {
+      callback(null, 'dist.zip');
+    },
+  }),
+  fileFilter: (req, file, callback) => {
+    if (path.extname(file.originalname).toLowerCase() !== '.zip') {
+      return callback(new Error(INVALID_PRECOMPILED_DIST_MESSAGE));
+    }
+
+    return callback(null, true);
+  },
+  limits: {
+    files: 1,
+    fileSize: MAX_DIST_TOTAL_BYTES,
+  },
+});
+
 function runReactViteUpload(req, res, next) {
   reactViteUpload.single('file')(req, res, async (error) => {
     if (!error) {
@@ -1268,6 +1305,24 @@ function runReactViteUpload(req, res, next) {
 
     return res.status(400).json({
       message: INVALID_REACT_VITE_ZIP_MESSAGE,
+    });
+  });
+}
+
+function runPrecompiledDistUpload(req, res, next) {
+  precompiledDistUpload.single('file')(req, res, async (error) => {
+    if (!error) {
+      return next();
+    }
+
+    if (req.precompiledDistUploadDir) {
+      await fs.rm(req.precompiledDistUploadDir, { recursive: true, force: true }).catch(() => {});
+    }
+
+    return res.status(400).json({
+      success: false,
+      code: INVALID_PRECOMPILED_DIST_CODE,
+      message: INVALID_PRECOMPILED_DIST_MESSAGE,
     });
   });
 }
@@ -2591,6 +2646,18 @@ router.get('/status', requireAdmin, async (req, res) => {
         userId: req.adminAuth?.adminUserId ? String(req.adminAuth.adminUserId) : null,
         permission: req.adminAuth?.permission || null,
       },
+      reactVite: {
+        sourceZip: {
+          enabled: BUILD_WORKER_ENABLED,
+          requiresSandboxedWorker: true,
+          endpoint: '/api/admin/projects/:id/react-vite',
+        },
+        precompiledDist: {
+          enabled: true,
+          requiresBuildWorker: false,
+          endpoint: '/api/admin/projects/:id/react-vite/dist',
+        },
+      },
     });
   } catch (error) {
     return res.status(500).json({
@@ -3123,9 +3190,10 @@ router.post(
         return res.status(503).json({
           success: false,
           code: 'BUILD_WORKER_REQUIRED',
-          message: process.env.NODE_ENV === 'production'
-            ? 'BUILD_WORKER_ENABLED=true é obrigatório em produção para builds React/Vite.'
-            : 'Build worker React/Vite não está habilitado; execução local síncrona está desabilitada.',
+          message:
+            'ZIP de código-fonte React/Vite exige um build worker sandboxado com BUILD_WORKER_ENABLED=true. ' +
+            'Com o worker desligado, envie um dist pré-compilado em ' +
+            '/api/admin/projects/:id/react-vite/dist; nenhum código do ZIP será executado no servidor.',
         });
       }
 
@@ -3205,6 +3273,124 @@ router.post(
       if (BUILD_WORKER_ENABLED) {
         await fs.rm(buildDir, { recursive: true, force: true }).catch(() => {});
       }
+    }
+  }
+);
+
+router.post(
+  '/projects/:id/react-vite/dist',
+  requireAdmin,
+  validateProjectId,
+  reactViteUploadRateLimit,
+  loadProject,
+  runPrecompiledDistUpload,
+  async (req, res) => {
+    if (!req.file || !req.precompiledDistUploadDir) {
+      return res.status(400).json({
+        success: false,
+        code: INVALID_PRECOMPILED_DIST_CODE,
+        message: INVALID_PRECOMPILED_DIST_MESSAGE,
+      });
+    }
+
+    const project = req.project;
+    const uploadDir = req.precompiledDistUploadDir;
+    const extractedDistDir = path.join(uploadDir, 'validated-dist');
+    let publicBuildDir = null;
+    let build = null;
+    let buildSaved = false;
+
+    try {
+      await extractPrecompiledDistZipSafely(req.file.path, extractedDistDir);
+      await validateDistDirectory(extractedDistDir);
+
+      if (await fixDistIndexAssetPaths(extractedDistDir)) {
+        await validateDistDirectory(extractedDistDir);
+      }
+
+      const validation = await validateDistDirectory(extractedDistDir);
+      const securityScan = await assertPrecompiledDistSecurityAllowsPublication(validation);
+
+      const fullHtml = await fs.readFile(path.join(extractedDistDir, 'index.html'), 'utf8');
+      const artifactSnapshot = await collectBuildArtifactFiles(extractedDistDir);
+      build = new ProjectBuild({
+        projectId: project._id,
+        type: 'react_vite',
+        status: 'draft',
+        fullHtml,
+        artifactFiles: artifactSnapshot.files,
+        logs: artifactSnapshot.complete
+          ? 'Dist React/Vite pré-compilado validado sem executar código no servidor.'
+          : `Dist React/Vite pré-compilado validado; ${artifactSnapshot.skippedFiles} arquivo(s) não foram copiados para o fallback MongoDB.`,
+      });
+
+      const previewUrl = `/builds/${project._id}/${build._id}/index.html`;
+      build.distUrl = previewUrl;
+      build.previewUrl = previewUrl;
+      build.buildUrl = previewUrl;
+      build.deployUrl = previewUrl;
+      publicBuildDir = path.join(PUBLIC_BUILDS_DIR, String(project._id), String(build._id));
+
+      await publishValidatedDist(extractedDistDir, publicBuildDir);
+      await build.save();
+      buildSaved = true;
+
+      await Project.findByIdAndUpdate(
+        project._id,
+        {
+          status: 'in_progress',
+          generation_status: 'in_progress',
+          generationStatus: 'in_progress',
+          reactVite: true,
+          'metadata.lastBuildAt': new Date(),
+        },
+        { runValidators: true }
+      );
+
+      return res.status(201).json({
+        success: true,
+        flow: 'precompiled_dist',
+        requiresBuildWorker: false,
+        publicationRequired: true,
+        publishEndpoint: `/api/admin/projects/${project._id}/builds/${build._id}/publish`,
+        buildId: String(build._id),
+        build: withAbsoluteBuildUrls(req, build),
+        security: securityScan,
+      });
+    } catch (error) {
+      if (buildSaved && build) {
+        await ProjectBuild.deleteOne({ _id: build._id, projectId: project._id }).catch(() => {});
+      }
+      if (publicBuildDir) {
+        await fs.rm(publicBuildDir, { recursive: true, force: true }).catch(() => {});
+      }
+
+      if (
+        error?.code === INVALID_PRECOMPILED_DIST_CODE ||
+        String(error?.message || '').startsWith('Build inválido:')
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: INVALID_PRECOMPILED_DIST_CODE,
+          message: INVALID_PRECOMPILED_DIST_MESSAGE,
+        });
+      }
+
+      if (error?.code === 'BUILD_SECURITY_BLOCKED') {
+        return res.status(409).json({
+          success: false,
+          code: error.code,
+          message: error.message,
+          security: error.security,
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: 'Erro interno do servidor.',
+      });
+    } finally {
+      await fs.rm(uploadDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 );
@@ -3669,6 +3855,7 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
 module.exports = router;
 module.exports.reactViteBuildHelpers = {
   applyTsconfigDeprecationFix,
+  buildWorkerEnabled: BUILD_WORKER_ENABLED,
   collectBuildArtifactFiles,
   collectProjectSourceFiles,
   ensureViteRelativeBase,

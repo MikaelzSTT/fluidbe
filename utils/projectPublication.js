@@ -432,10 +432,21 @@ function collectSecurityScanInputs(projectBuild) {
       return;
     }
 
-    inputs.push({
-      file: file || 'unknown',
-      content: text.slice(0, SECURITY_SCAN_MAX_TEXT_CHARS),
-    });
+    const overlapChars = 4096;
+    let offset = 0;
+
+    while (offset < text.length) {
+      inputs.push({
+        file: file || 'unknown',
+        content: text.slice(offset, offset + SECURITY_SCAN_MAX_TEXT_CHARS),
+      });
+
+      if (offset + SECURITY_SCAN_MAX_TEXT_CHARS >= text.length) {
+        break;
+      }
+
+      offset += SECURITY_SCAN_MAX_TEXT_CHARS - overlapChars;
+    }
   };
   const addFileInputs = (files, sourceLabel) => {
     (Array.isArray(files) ? files : []).forEach((file, index) => {
