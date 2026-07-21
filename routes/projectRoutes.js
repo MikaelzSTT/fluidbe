@@ -30,6 +30,10 @@ const {
   scanBuildSecurity,
 } = require('../utils/projectPublication');
 const {
+  isBuildUrlLike,
+  toDedicatedPreviewUrl,
+} = require('../utils/previewOrigin');
+const {
   extractExplicitAppName,
   extractExplicitProjectName,
   generateFallbackAppName,
@@ -666,9 +670,16 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  const absoluteValue = value.startsWith('/builds/')
-    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
-    : value;
+  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
+  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
+    return '';
+  }
+
+  const absoluteValue = dedicatedPreviewUrl !== value
+    ? dedicatedPreviewUrl
+    : value.startsWith('/builds/')
+      ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+      : value;
   return addBuildPreviewToken(absoluteValue);
 }
 

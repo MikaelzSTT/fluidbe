@@ -1,0 +1,232 @@
+const assert = require('assert/strict');
+const fs = require('fs/promises');
+const http = require('http');
+const path = require('path');
+const test = require('node:test');
+
+process.env.PREVIEW_BASE_URL = 'https://preview.askfluid.now';
+process.env.PREVIEW_ALLOWED_ORIGIN = 'https://preview.askfluid.now';
+process.env.BUILD_PREVIEW_SECRET = 'preview-origin-test-secret';
+
+const Project = require('../models/Project');
+const ProjectBuild = require('../models/ProjectBuild');
+const { app } = require('../server');
+const {
+  buildPreviewUrl,
+  buildPublishedProjectUrl,
+  parseBuildPathFromUrl,
+  toDedicatedPreviewUrl,
+} = require('../utils/previewOrigin');
+const { withAbsoluteBuildUrls } = require('../utils/projectPublication');
+
+const projectId = '64f000000000000000000101';
+const buildId = '64f000000000000000000102';
+const buildPath = `/builds/${projectId}/${buildId}/index.html`;
+const publicBuildRoot = path.join(__dirname, '..', 'public', 'builds', projectId, buildId);
+
+function listen() {
+  return new Promise((resolve) => {
+    const server = app.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function close(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function request(server, options) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: server.address().port,
+        method: 'GET',
+        ...options,
+        headers: {
+          Host: 'preview.askfluid.now',
+          ...(options.headers || {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function stubPublishedBuild() {
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const originalProjectFindById = Project.findById;
+
+  ProjectBuild.findOne = () => ({
+    sort() {
+      return this;
+    },
+    select() {
+      return this;
+    },
+    lean: async () => ({
+      _id: buildId,
+      projectId,
+      status: 'done',
+    }),
+  });
+  Project.findById = () => ({
+    select() {
+      return {
+        lean: async () => ({
+          _id: projectId,
+          userId: '64f000000000000000000103',
+          isPublished: true,
+          latestPublishedBuildId: buildId,
+        }),
+      };
+    },
+  });
+
+  return () => {
+    ProjectBuild.findOne = originalProjectBuildFindOne;
+    Project.findById = originalProjectFindById;
+  };
+}
+
+test('preview and published URLs use the dedicated preview origin', () => {
+  assert.equal(
+    buildPreviewUrl(projectId, buildId),
+    `https://preview.askfluid.now${buildPath}`
+  );
+  assert.equal(
+    buildPublishedProjectUrl('clean-app'),
+    'https://preview.askfluid.now/p/clean-app'
+  );
+
+  const payload = withAbsoluteBuildUrls(
+    {
+      protocol: 'https',
+      get: () => 'apps.askfluid.now.evil.example',
+    },
+    {
+      distUrl: buildPath,
+      previewUrl: `https://apps.askfluid.now${buildPath}`,
+      buildUrl: `https://evil.example${buildPath}`,
+      deployUrl: '',
+    }
+  );
+
+  assert.match(payload.distUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+  assert.match(payload.previewUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+  assert.match(payload.buildUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+  assert.doesNotMatch(payload.distUrl, /apps\.askfluid\.now/);
+  assert.doesNotMatch(payload.previewUrl, /apps\.askfluid\.now/);
+  assert.doesNotMatch(payload.buildUrl, /evil\.example/);
+});
+
+test('preview URL parsing rejects host injection and unsafe build paths', () => {
+  assert.equal(parseBuildPathFromUrl('/builds/not-an-object-id/build/index.html'), null);
+  assert.equal(parseBuildPathFromUrl(`/builds/${projectId}/../index.html`), null);
+  assert.equal(parseBuildPathFromUrl(`/builds/${projectId}/build.key/index.html`), null);
+  assert.equal(
+    toDedicatedPreviewUrl(`https://apps.askfluid.now.evil.example${buildPath}`),
+    `https://preview.askfluid.now${buildPath}`
+  );
+});
+
+test('preview host refuses API routes and credentialed CORS', async () => {
+  const server = await listen();
+
+  try {
+    const api = await request(server, {
+      path: '/api/auth/login',
+      headers: {
+        Origin: 'https://preview.askfluid.now',
+        Cookie: 'fluid_session=test',
+        Authorization: 'Bearer user.jwt',
+      },
+    });
+    assert.equal(api.statusCode, 404);
+    assert.equal(api.headers['access-control-allow-credentials'], undefined);
+
+    const preflight = await request(server, {
+      method: 'OPTIONS',
+      path: buildPath,
+      headers: {
+        Origin: 'https://preview.askfluid.now',
+        'Access-Control-Request-Method': 'GET',
+      },
+    });
+    assert.equal(preflight.statusCode, 204);
+    assert.equal(preflight.headers['access-control-allow-origin'], 'https://preview.askfluid.now');
+    assert.equal(preflight.headers['access-control-allow-credentials'], undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+test('preview host serves static build files without setting cookies', async () => {
+  const restore = stubPublishedBuild();
+  const server = await listen();
+
+  try {
+    await fs.mkdir(path.join(publicBuildRoot, 'assets'), { recursive: true });
+    await fs.writeFile(path.join(publicBuildRoot, 'index.html'), '<!doctype html><div id="root"></div>');
+    await fs.writeFile(path.join(publicBuildRoot, 'assets', 'app.js'), 'document.body.dataset.ready = "true";');
+
+    const index = await request(server, { path: buildPath });
+    assert.equal(index.statusCode, 200);
+    assert.match(index.body, /id="root"/);
+    assert.match(index.headers['content-security-policy'], /default-src 'none'/);
+    assert.equal(index.headers['referrer-policy'], 'no-referrer');
+    assert.equal(index.headers['x-content-type-options'], 'nosniff');
+    assert.equal(index.headers['cross-origin-resource-policy'], 'cross-origin');
+    assert.equal(index.headers['set-cookie'], undefined);
+    assert.equal(index.headers['access-control-allow-credentials'], undefined);
+
+    const asset = await request(server, { path: `/builds/${projectId}/${buildId}/assets/app.js` });
+    assert.equal(asset.statusCode, 200);
+    assert.match(asset.body, /dataset\.ready/);
+    assert.match(asset.headers['cache-control'], /immutable/);
+  } finally {
+    restore();
+    await close(server);
+    await fs.rm(path.join(__dirname, '..', 'public', 'builds', projectId), { recursive: true, force: true });
+  }
+});
+
+test('legacy app/API build route remains temporarily available with migration headers', async () => {
+  const restore = stubPublishedBuild();
+  const server = await listen();
+
+  try {
+    await fs.mkdir(publicBuildRoot, { recursive: true });
+    await fs.writeFile(path.join(publicBuildRoot, 'index.html'), '<main>legacy ok</main>');
+
+    const legacy = await request(server, {
+      path: buildPath,
+      headers: {
+        Host: 'apps.askfluid.now',
+      },
+    });
+
+    assert.equal(legacy.statusCode, 200);
+    assert.match(legacy.body, /legacy ok/);
+    assert.equal(legacy.headers.deprecation, 'true');
+    assert.equal(legacy.headers.sunset, '2026-08-31');
+    assert.match(legacy.headers.link, /^<https:\/\/preview\.askfluid\.now\/builds\//);
+  } finally {
+    restore();
+    await close(server);
+    await fs.rm(path.join(__dirname, '..', 'public', 'builds', projectId), { recursive: true, force: true });
+  }
+});

@@ -34,6 +34,15 @@ const {
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 const { payloadTooLargeHandler } = require('./utils/payloadErrors');
 const { timingSafeEqualString } = require('./utils/timingSafe');
+const {
+  buildPublishedProjectUrl,
+  getLegacyPreviewRemovalDate,
+  getPreviewAllowedOrigin,
+  getPreviewFrameAncestors,
+  isPreviewHost,
+  parseBuildPathFromUrl,
+  toDedicatedPreviewUrl,
+} = require('./utils/previewOrigin');
 
 
 dotenv.config();
@@ -82,6 +91,16 @@ const baseCorsOptions = {
 };
 function corsOptions(req, callback) {
   const origin = req.header('Origin');
+
+  if (isPreviewHost(req)) {
+    callback(null, {
+      ...baseCorsOptions,
+      origin: origin === getPreviewAllowedOrigin() ? origin : false,
+      credentials: false,
+    });
+    return;
+  }
+
   const isAllowedOrigin = allowedOrigins.includes(origin);
 
   callback(null, {
@@ -162,6 +181,10 @@ function isPublicAppHost(req) {
   return PUBLIC_APP_HOSTS.has(String(req.hostname || '').toLowerCase());
 }
 
+function isPreviewAllowedRoute(pathname) {
+  return pathname.startsWith('/builds/') || /^\/p\/[^/]+\/?$/.test(pathname);
+}
+
 function isPublicRuntimeApiRoute(pathname) {
   return pathname === '/api/runtime' || pathname.startsWith('/api/runtime/');
 }
@@ -198,6 +221,7 @@ function publicAppsOnly(req, res, next) {
 
   const pathname = req.path || '';
   const hostname = String(req.hostname || '').toLowerCase();
+  const legacyPreviewRoutesEnabled = process.env.LEGACY_PREVIEW_ROUTES_ENABLED !== 'false';
 
   if (hostname === APEX_CUSTOM_HOST) {
     if (isSettingsAccountRoute(pathname) || isSettingsDebugRoute(pathname)) {
@@ -210,10 +234,10 @@ function publicAppsOnly(req, res, next) {
 
   if (
     pathname === '/'
-    || /^\/p\/[^/]+\/?$/.test(pathname)
+    || (legacyPreviewRoutesEnabled && /^\/p\/[^/]+\/?$/.test(pathname))
     || isSettingsAccountRoute(pathname)
     || isSettingsDebugRoute(pathname)
-    || pathname.startsWith('/builds/')
+    || (legacyPreviewRoutesEnabled && pathname.startsWith('/builds/'))
     || isPublicFrontendApiRoute(pathname)
   ) {
     return next();
@@ -221,6 +245,73 @@ function publicAppsOnly(req, res, next) {
 
   console.log('publicAppsOnly blocked', req.hostname, req.path);
   return res.sendStatus(404);
+}
+
+function buildPreviewContentSecurityPolicy() {
+  const frameAncestors = getPreviewFrameAncestors();
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "form-action 'none'",
+    `frame-ancestors ${frameAncestors}`,
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "media-src 'self' data: blob:",
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    "connect-src 'self'",
+    'upgrade-insecure-requests',
+  ].join('; ');
+}
+
+function applyPreviewHostHeaders(req, res) {
+  res.setHeader('Content-Security-Policy', buildPreviewContentSecurityPolicy());
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader(
+    'Permissions-Policy',
+    'accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()'
+  );
+  res.removeHeader('Access-Control-Allow-Credentials');
+}
+
+function previewHostOnly(req, res, next) {
+  if (!isPreviewHost(req)) {
+    return next();
+  }
+
+  applyPreviewHostHeaders(req, res);
+
+  const pathname = req.path || '';
+
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    return res.sendStatus(404);
+  }
+
+  if (!isPreviewAllowedRoute(pathname)) {
+    return res.sendStatus(404);
+  }
+
+  return next();
+}
+
+function markLegacyPreviewRoute(req, res) {
+  if (isPreviewHost(req)) {
+    return;
+  }
+
+  const successorUrl = toDedicatedPreviewUrl(req.originalUrl || req.url || '');
+
+  res.setHeader('Deprecation', 'true');
+  res.setHeader('Sunset', getLegacyPreviewRemovalDate());
+
+  if (successorUrl && successorUrl !== (req.originalUrl || req.url || '')) {
+    res.setHeader('Link', `<${successorUrl}>; rel="successor-version"`);
+  }
 }
 
 function securityHeaders(req, res, next) {
@@ -328,7 +419,7 @@ function getPublishedSeo(project) {
 
 function getPublishedProjectUrl(project) {
   const slug = String(project?.slug || '').trim();
-  return slug ? `${PUBLIC_BASE_URL}/p/${encodeURIComponent(slug)}` : PUBLIC_BASE_URL;
+  return slug ? buildPublishedProjectUrl(slug) : PUBLIC_BASE_URL;
 }
 
 function getMetaTagMatcher(attributeName, attributeValue) {
@@ -400,39 +491,7 @@ function injectPublishedSeo(html, project) {
 }
 
 function parseBuildRequestPath(requestPath) {
-  let pathname;
-
-  try {
-    pathname = decodeURIComponent(new URL(requestPath, 'http://localhost').pathname);
-  } catch (error) {
-    return null;
-  }
-
-  if (!pathname.startsWith('/builds/')) {
-    return null;
-  }
-
-  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
-
-  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
-    return null;
-  }
-
-  const projectId = parts[0];
-  const buildKey = parts[1];
-  const artifactPath = parts.slice(2).join('/') || 'index.html';
-  const indexBuildUrl = `/builds/${projectId}/${buildKey}/index.html`;
-
-  if (artifactPath.split('/').some((segment) => segment === '..')) {
-    return null;
-  }
-
-  return {
-    projectId,
-    buildKey,
-    artifactPath,
-    indexBuildUrl,
-  };
+  return parseBuildPathFromUrl(requestPath);
 }
 
 async function getBearerUserId(req) {
@@ -497,10 +556,23 @@ function setSandboxBuildCorsHeaders(req, res) {
 
 function applyBuildArtifactCors(req, res, next) {
   setSandboxBuildCorsHeaders(req, res);
+  markLegacyPreviewRoute(req, res);
 
   if (req.buildAccess && req.buildAccess.isPublished !== true) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
+  } else if (
+    isPreviewHost(req) &&
+    req.buildAccess &&
+    req.buildAccess.parsedPath.artifactPath !== 'index.html'
+  ) {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  } else if (isPreviewHost(req)) {
+    res.setHeader('Cache-Control', 'no-cache');
+  }
+
+  if (isPreviewHost(req)) {
+    applyPreviewHostHeaders(req, res);
   }
 
   next();
@@ -637,13 +709,14 @@ async function authorizeBuildAccess(req, res, next) {
       return next();
     }
 
+    const previewHostRequest = isPreviewHost(req);
     const previewCookieName = 'fluid_build_preview';
     const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
-    const cookieToken = getCookie(req, previewCookieName);
+    const cookieToken = previewHostRequest ? '' : getCookie(req, previewCookieName);
     const previewToken = queryToken || cookieToken;
 
     if (verifyBuildPreviewToken(previewToken, parsedPath.projectId, parsedPath.buildKey)) {
-      if (queryToken) {
+      if (queryToken && !previewHostRequest) {
         res.cookie(previewCookieName, queryToken, {
           httpOnly: true,
           secure: process.env.NODE_ENV === 'production',
@@ -658,6 +731,10 @@ async function authorizeBuildAccess(req, res, next) {
         previewToken,
       };
       return next();
+    }
+
+    if (previewHostRequest) {
+      return res.sendStatus(404);
     }
 
     const isAdmin = process.env.ADMIN_TOKEN_LEGACY_ENABLED === 'true'
@@ -795,6 +872,7 @@ async function loadPublishedHtml(project) {
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
 app.use(securityHeaders);
+app.use(previewHostOnly);
 app.use(cors(corsOptions));
 app.options(/^\/builds\/.+$/, authorizeBuildAccess, applyBuildArtifactCors, (req, res) => {
   res.sendStatus(204);
@@ -936,15 +1014,6 @@ app.use((error, req, res, next) => {
   return res.status(500).json({ message: 'Erro interno do servidor.' });
 });
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log('MongoDB conectado');
-  })
-  .catch((err) => {
-    console.error('Erro MongoDB.', { name: err?.name || 'Error', code: err?.code || null });
-  });
-
 app.get('/', (req, res) => {
   if (isPublicAppHost(req)) {
     return res.sendStatus(404);
@@ -956,27 +1025,54 @@ app.get('/', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+function startServer() {
+  mongoose
+    .connect(process.env.MONGODB_URI)
+    .then(() => {
+      console.log('MongoDB conectado');
+    })
+    .catch((err) => {
+      console.error('Erro MongoDB.', { name: err?.name || 'Error', code: err?.code || null });
+    });
 
-const server = app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+  const PORT = process.env.PORT || 5000;
+  const server = app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+  });
 
-let shuttingDown = false;
-async function shutdown(signal) {
-  if (shuttingDown) {
-    return;
+  let shuttingDown = false;
+  async function shutdown(signal) {
+    if (shuttingDown) {
+      return;
+    }
+
+    shuttingDown = true;
+    console.log(`Recebido ${signal}, encerrando servidor.`);
+
+    server.close(async () => {
+      await closeRateLimitRedis().catch(() => {});
+      await mongoose.disconnect().catch(() => {});
+      process.exit(0);
+    });
   }
 
-  shuttingDown = true;
-  console.log(`Recebido ${signal}, encerrando servidor.`);
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
-  server.close(async () => {
-    await closeRateLimitRedis().catch(() => {});
-    await mongoose.disconnect().catch(() => {});
-    process.exit(0);
-  });
+  return server;
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  previewIsolationHelpers: {
+    buildPreviewContentSecurityPolicy,
+    corsOptions,
+    isPreviewAllowedRoute,
+    previewHostOnly,
+  },
+};

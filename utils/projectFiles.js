@@ -1,7 +1,7 @@
 const fs = require('fs/promises');
-const mongoose = require('mongoose');
 const path = require('path');
 const ProjectBuild = require('../models/ProjectBuild');
+const { parseBuildPathFromUrl } = require('./previewOrigin');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const REACT_VITE_STORAGE_DIR = path.join(ROOT_DIR, 'storage', 'react-vite-builds');
@@ -64,36 +64,7 @@ async function findProjectSourceRoot(sourceDir) {
 }
 
 function parsePublicBuildUrl(buildUrl) {
-  if (typeof buildUrl !== 'string') {
-    return null;
-  }
-
-  let pathname;
-
-  try {
-    pathname = decodeURIComponent(new URL(buildUrl, 'http://localhost').pathname);
-  } catch (error) {
-    return null;
-  }
-
-  if (!pathname.startsWith('/builds/')) {
-    return null;
-  }
-
-  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
-
-  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
-    return null;
-  }
-
-  const projectId = parts[0];
-  const buildKey = parts[1];
-
-  return {
-    projectId,
-    buildKey,
-    indexBuildUrl: `/builds/${projectId}/${buildKey}/index.html`,
-  };
+  return parseBuildPathFromUrl(buildUrl);
 }
 
 function normalizeProjectFilePath(requestPath = '') {

@@ -15,6 +15,7 @@ const {
 } = require('../utils/connectorInjection');
 const { createSourceContext } = require('../utils/sourceContext');
 const { generateFallbackAppName } = require('../utils/projectNaming');
+const { buildPreviewUrl } = require('../utils/previewOrigin');
 const { reactViteBuildHelpers } = require('../routes/adminRoutes');
 
 dotenv.config();
@@ -50,10 +51,6 @@ function wait(ms) {
 
 function buildWorkspacePath(jobId) {
   return path.join(os.tmpdir(), 'fluid-react-vite-worker', String(jobId));
-}
-
-function buildPreviewUrl(projectId, jobId) {
-  return `/builds/${projectId}/${jobId}/index.html`;
 }
 
 function reserveVisualPreviewContext(previewUrl) {

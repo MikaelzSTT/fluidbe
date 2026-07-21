@@ -35,6 +35,12 @@ const {
   withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
 } = require('../utils/projectPublication');
 const {
+  buildPreviewUrl,
+  isBuildUrlLike,
+  parseBuildPathFromUrl,
+  toDedicatedPreviewUrl,
+} = require('../utils/previewOrigin');
+const {
   INVALID_PRECOMPILED_DIST_CODE,
   INVALID_PRECOMPILED_DIST_MESSAGE,
   PRECOMPILED_DIST_FORMATS,
@@ -209,9 +215,16 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  const absoluteValue = value.startsWith('/builds/')
-    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
-    : value;
+  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
+  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
+    return '';
+  }
+
+  const absoluteValue = dedicatedPreviewUrl !== value
+    ? dedicatedPreviewUrl
+    : value.startsWith('/builds/')
+      ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+      : value;
   return addBuildPreviewToken(absoluteValue);
 }
 
@@ -722,36 +735,7 @@ function resolvePublicBuildIndexPath(buildUrl) {
 }
 
 function parsePublicBuildUrl(buildUrl) {
-  if (typeof buildUrl !== 'string') {
-    return null;
-  }
-
-  let pathname;
-
-  try {
-    pathname = decodeURIComponent(new URL(buildUrl, 'http://localhost').pathname);
-  } catch (error) {
-    return null;
-  }
-
-  if (!pathname.startsWith('/builds/')) {
-    return null;
-  }
-
-  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
-
-  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
-    return null;
-  }
-
-  const projectId = parts[0];
-  const buildKey = parts[1];
-
-  return {
-    projectId,
-    buildKey,
-    indexBuildUrl: `/builds/${projectId}/${buildKey}/index.html`,
-  };
+  return parseBuildPathFromUrl(buildUrl);
 }
 
 async function hasMongoBuildFallback(buildUrl) {
@@ -3327,7 +3311,7 @@ router.post(
           : `Dist React/Vite pré-compilado validado (${precompiledManifest.format}); ${artifactSnapshot.skippedFiles} arquivo(s) não foram copiados para o fallback MongoDB.`,
       });
 
-      const previewUrl = `/builds/${project._id}/${build._id}/index.html`;
+      const previewUrl = buildPreviewUrl(project._id, build._id);
       build.distUrl = previewUrl;
       build.previewUrl = previewUrl;
       build.buildUrl = previewUrl;

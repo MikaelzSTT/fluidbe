@@ -1,8 +1,5 @@
 const mongoose = require('mongoose');
-
-const PUBLIC_BASE_URL =
-  process.env.PUBLIC_BASE_URL ||
-  'https://apps.askfluid.now';
+const { buildPublishedProjectUrl } = require('../utils/previewOrigin');
 
 const projectSchema = new mongoose.Schema(
   {
@@ -331,7 +328,7 @@ const projectSchema = new mongoose.Schema(
 projectSchema.index({ slug: 1 }, { unique: true, sparse: true });
 
 projectSchema.virtual('publicUrl').get(function getPublicUrl() {
-  return this.slug ? `${PUBLIC_BASE_URL}/p/${this.slug}` : '';
+  return this.slug ? buildPublishedProjectUrl(this.slug) : '';
 });
 
 module.exports = mongoose.model('Project', projectSchema);

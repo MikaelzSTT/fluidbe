@@ -1,6 +1,5 @@
 const fs = require('fs/promises');
 const path = require('path');
-const mongoose = require('mongoose');
 const { addBuildPreviewToken } = require('./buildPreviewAccess');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
@@ -11,12 +10,15 @@ const {
   normalizeAppName,
   slugifyAppName,
 } = require('./projectNaming');
+const {
+  buildPublishedProjectUrl,
+  isBuildUrlLike,
+  parseBuildPathFromUrl,
+  toDedicatedPreviewUrl,
+} = require('./previewOrigin');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
-const PUBLIC_BASE_URL =
-  process.env.PUBLIC_BASE_URL ||
-  'https://apps.askfluid.now';
 const SECURITY_SCAN_MAX_FINDINGS = 50;
 const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
 
@@ -46,9 +48,16 @@ function toAbsoluteBackendUrl(req, value) {
     return value || '';
   }
 
-  const absoluteValue = value.startsWith('/builds/')
-    ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
-    : value;
+  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
+  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
+    return '';
+  }
+
+  const absoluteValue = dedicatedPreviewUrl !== value
+    ? dedicatedPreviewUrl
+    : value.startsWith('/builds/')
+      ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
+      : value;
   return addBuildPreviewToken(absoluteValue);
 }
 
@@ -145,7 +154,7 @@ async function applyPublicationFields(project, update) {
   mergeDeployUpdate(update, {
     isPublished: true,
     publishedAt,
-    url: `${PUBLIC_BASE_URL}/p/${slug}`,
+    url: buildPublishedProjectUrl(slug),
   });
 }
 
@@ -270,36 +279,7 @@ function resolvePublicBuildIndexPath(buildUrl) {
 }
 
 function parsePublicBuildUrl(buildUrl) {
-  if (typeof buildUrl !== 'string') {
-    return null;
-  }
-
-  let pathname;
-
-  try {
-    pathname = decodeURIComponent(new URL(buildUrl, 'http://localhost').pathname);
-  } catch (error) {
-    return null;
-  }
-
-  if (!pathname.startsWith('/builds/')) {
-    return null;
-  }
-
-  const parts = pathname.slice('/builds/'.length).split('/').filter(Boolean);
-
-  if (parts.length < 2 || !mongoose.Types.ObjectId.isValid(parts[0])) {
-    return null;
-  }
-
-  const projectId = parts[0];
-  const buildKey = parts[1];
-
-  return {
-    projectId,
-    buildKey,
-    indexBuildUrl: `/builds/${projectId}/${buildKey}/index.html`,
-  };
+  return parseBuildPathFromUrl(buildUrl);
 }
 
 async function hasMongoBuildFallback(buildUrl) {
