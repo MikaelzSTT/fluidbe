@@ -182,7 +182,7 @@ function isPublicAppHost(req) {
 }
 
 function isPreviewAllowedRoute(pathname) {
-  return pathname.startsWith('/builds/') || /^\/p\/[^/]+\/?$/.test(pathname);
+  return pathname.startsWith('/builds/') || pathname.startsWith('/p/');
 }
 
 function isPublicRuntimeApiRoute(pathname) {
@@ -315,6 +315,11 @@ function markLegacyPreviewRoute(req, res) {
 }
 
 function securityHeaders(req, res, next) {
+  if (isPreviewHost(req)) {
+    applyPreviewHostHeaders(req, res);
+    return next();
+  }
+
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader(
@@ -871,8 +876,8 @@ async function loadPublishedHtml(project) {
 
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
-app.use(securityHeaders);
 app.use(previewHostOnly);
+app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.options(/^\/builds\/.+$/, authorizeBuildAccess, applyBuildArtifactCors, (req, res) => {
   res.sendStatus(204);

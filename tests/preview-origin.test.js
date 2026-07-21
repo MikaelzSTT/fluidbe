@@ -102,6 +102,36 @@ function stubPublishedBuild() {
   };
 }
 
+function stubPublishedProjectPage() {
+  const originalProjectFindOne = Project.findOne;
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+
+  Project.findOne = async () => ({
+    _id: projectId,
+    slug: 'clean-app',
+    isPublished: true,
+    appName: 'Clean App',
+    seo: {
+      title: 'Clean App',
+      description: 'Published preview page',
+    },
+  });
+
+  ProjectBuild.findOne = () => ({
+    sort: async () => ({
+      _id: buildId,
+      projectId,
+      status: 'done',
+      fullHtml: '<!doctype html><html><head><title>Old</title></head><body><main>published ok</main></body></html>',
+    }),
+  });
+
+  return () => {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalProjectBuildFindOne;
+  };
+}
+
 test('preview and published URLs use the dedicated preview origin', () => {
   assert.equal(
     buildPreviewUrl(projectId, buildId),
@@ -143,12 +173,37 @@ test('preview URL parsing rejects host injection and unsafe build paths', () => 
   );
 });
 
+test('preview host only exposes builds and published pages', async () => {
+  const server = await listen();
+
+  try {
+    const root = await request(server, { path: '/' });
+    assert.equal(root.statusCode, 404);
+    assert.doesNotMatch(root.body, /FLUIDBE backend rodando/);
+    assert.doesNotMatch(root.body, /database/);
+    assert.match(root.headers['content-security-policy'], /default-src 'none'/);
+    assert.equal(root.headers['referrer-policy'], 'no-referrer');
+
+    const api = await request(server, { path: '/api/auth/me' });
+    assert.equal(api.statusCode, 404);
+    assert.doesNotMatch(api.body, /Token/);
+
+    const admin = await request(server, { path: '/admin.html' });
+    assert.equal(admin.statusCode, 404);
+
+    const login = await request(server, { path: '/login.html' });
+    assert.equal(login.statusCode, 404);
+  } finally {
+    await close(server);
+  }
+});
+
 test('preview host refuses API routes and credentialed CORS', async () => {
   const server = await listen();
 
   try {
     const api = await request(server, {
-      path: '/api/auth/login',
+      path: '/api/auth/me',
       headers: {
         Origin: 'https://preview.askfluid.now',
         Cookie: 'fluid_session=test',
@@ -169,6 +224,35 @@ test('preview host refuses API routes and credentialed CORS', async () => {
     assert.equal(preflight.statusCode, 204);
     assert.equal(preflight.headers['access-control-allow-origin'], 'https://preview.askfluid.now');
     assert.equal(preflight.headers['access-control-allow-credentials'], undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+test('normal host keeps health root and API routes available', async () => {
+  const server = await listen();
+
+  try {
+    const root = await request(server, {
+      path: '/',
+      headers: {
+        Host: 'api.askfluid.now',
+      },
+    });
+    assert.equal(root.statusCode, 200);
+    assert.deepEqual(JSON.parse(root.body), {
+      message: 'FLUIDBE backend rodando',
+      database: 'conectada',
+    });
+
+    const api = await request(server, {
+      path: '/api/auth/me',
+      headers: {
+        Host: 'api.askfluid.now',
+      },
+    });
+    assert.equal(api.statusCode, 401);
+    assert.match(api.body, /Token não enviado/);
   } finally {
     await close(server);
   }
@@ -201,6 +285,24 @@ test('preview host serves static build files without setting cookies', async () 
     restore();
     await close(server);
     await fs.rm(path.join(__dirname, '..', 'public', 'builds', projectId), { recursive: true, force: true });
+  }
+});
+
+test('preview host serves published project pages', async () => {
+  const restore = stubPublishedProjectPage();
+  const server = await listen();
+
+  try {
+    const published = await request(server, { path: '/p/clean-app' });
+
+    assert.equal(published.statusCode, 200);
+    assert.match(published.body, /published ok/);
+    assert.match(published.headers['content-security-policy'], /default-src 'none'/);
+    assert.equal(published.headers['referrer-policy'], 'no-referrer');
+    assert.equal(published.headers['access-control-allow-credentials'], undefined);
+  } finally {
+    restore();
+    await close(server);
   }
 });
 

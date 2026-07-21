@@ -50,10 +50,30 @@ function getLegacyPreviewRemovalDate() {
   return String(process.env.LEGACY_PREVIEW_REMOVAL_DATE || DEFAULT_LEGACY_PREVIEW_REMOVAL_DATE).trim();
 }
 
-function getRequestHost(req) {
-  return String(req.hostname || req.headers?.host || '')
-    .split(':')[0]
+function normalizeRequestHost(value) {
+  const host = String(value || '')
+    .split(',')[0]
+    .trim()
     .toLowerCase();
+
+  if (!host) {
+    return '';
+  }
+
+  if (host.startsWith('[')) {
+    const closingBracketIndex = host.indexOf(']');
+    return closingBracketIndex > 0 ? host.slice(1, closingBracketIndex) : host;
+  }
+
+  return host.split(':')[0];
+}
+
+function getRequestHost(req) {
+  return normalizeRequestHost(
+    req.headers?.['x-forwarded-host'] ||
+    req.hostname ||
+    req.headers?.host
+  );
 }
 
 function isPreviewHost(req) {
