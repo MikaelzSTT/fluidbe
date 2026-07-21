@@ -686,7 +686,11 @@ function serializeAccountPreferences(preferences) {
 function hasActivePaidSubscription(user) {
   const plan = String(user?.plan || '').toLowerCase();
   const subscriptionStatus = String(user?.subscriptionStatus || '').toLowerCase();
-  const hasSubscriptionId = typeof user?.stripeSubscriptionId === 'string' && user.stripeSubscriptionId.trim();
+  const hasSubscriptionId = [
+    user?.stripeSubscriptionId,
+    user?.stripeTestSubscriptionId,
+    user?.stripeLiveSubscriptionId,
+  ].some((subscriptionId) => typeof subscriptionId === 'string' && subscriptionId.trim());
 
   return Boolean(
     hasSubscriptionId &&
@@ -1496,9 +1500,17 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
       compactMode: false,
     };
     user.stripeCustomerId = undefined;
+    user.stripeTestCustomerId = undefined;
+    user.stripeLiveCustomerId = undefined;
     user.stripeSubscriptionId = undefined;
+    user.stripeTestSubscriptionId = undefined;
+    user.stripeLiveSubscriptionId = undefined;
     user.subscriptionStatus = undefined;
+    user.stripeTestSubscriptionStatus = undefined;
+    user.stripeLiveSubscriptionStatus = undefined;
     user.subscriptionCurrentPeriodEnd = undefined;
+    user.stripeTestSubscriptionCurrentPeriodEnd = undefined;
+    user.stripeLiveSubscriptionCurrentPeriodEnd = undefined;
     user.billingUpdatedAt = now;
     clearTwoFactor(user);
 

@@ -66,6 +66,20 @@ const PLAN_PRICE_ENV_NAMES = Object.freeze({
   pro: 'STRIPE_PRO_PRICE_ID',
   business: 'STRIPE_BUSINESS_PRICE_ID',
 });
+const STRIPE_MODE_FIELDS = Object.freeze({
+  sk_test: Object.freeze({
+    customerId: 'stripeTestCustomerId',
+    subscriptionId: 'stripeTestSubscriptionId',
+    subscriptionStatus: 'stripeTestSubscriptionStatus',
+    currentPeriodEnd: 'stripeTestSubscriptionCurrentPeriodEnd',
+  }),
+  sk_live: Object.freeze({
+    customerId: 'stripeLiveCustomerId',
+    subscriptionId: 'stripeLiveSubscriptionId',
+    subscriptionStatus: 'stripeLiveSubscriptionStatus',
+    currentPeriodEnd: 'stripeLiveSubscriptionCurrentPeriodEnd',
+  }),
+});
 const loggedMissingBillingConfig = new Set();
 
 function logBillingError(context, error) {
@@ -96,8 +110,29 @@ function getStripeMode() {
   return envMode(process.env.STRIPE_SECRET_KEY, 'sk_test', 'sk_live');
 }
 
+function getStripeModeFields(stripeMode = getStripeMode()) {
+  return STRIPE_MODE_FIELDS[stripeMode] || null;
+}
+
+function getStripeEventMode(eventOrObject) {
+  return eventOrObject?.livemode ? 'sk_live' : 'sk_test';
+}
+
 function getPublishableMode() {
   return envMode(process.env.STRIPE_PUBLISHABLE_KEY, 'pk_test', 'pk_live');
+}
+
+function getStripeIdPrefix(stripeId) {
+  if (!stripeId) {
+    return null;
+  }
+
+  const match = String(stripeId).match(/^[A-Za-z]+_/);
+  return match ? match[0] : 'invalid';
+}
+
+function getStripeIdLast4(stripeId) {
+  return stripeId ? String(stripeId).slice(-4) : null;
 }
 
 function getPriceIdPrefix(priceId) {
@@ -164,7 +199,8 @@ async function retrieveStripeAccountId(stripe, selectedPlan, priceId) {
   try {
     const account = await stripe.accounts.retrieve();
     logCheckoutDiagnostics('Stripe checkout account resolved.', selectedPlan, priceId, {
-      stripeAccountId: account?.id || null,
+      stripeAccountIdPrefix: getStripeIdPrefix(account?.id),
+      stripeAccountIdLast4: getStripeIdLast4(account?.id),
     });
     return account?.id || null;
   } catch (error) {
@@ -489,7 +525,201 @@ async function findCurrentUser(req, res) {
   return user;
 }
 
-async function updateUserFromSubscription(subscription) {
+function getModeSpecificValue(user, stripeMode, fieldName) {
+  const fields = getStripeModeFields(stripeMode);
+  return fields ? user?.[fields[fieldName]] : null;
+}
+
+function setModeSpecificValue(target, stripeMode, fieldName, value) {
+  const fields = getStripeModeFields(stripeMode);
+
+  if (fields?.[fieldName] && value !== undefined) {
+    target[fields[fieldName]] = value;
+  }
+}
+
+function unsetModeSpecificValue(target, stripeMode, fieldName) {
+  const fields = getStripeModeFields(stripeMode);
+
+  if (fields?.[fieldName]) {
+    target[fields[fieldName]] = '';
+  }
+}
+
+function buildStripeUserLookup({ stripeCustomerId, stripeSubscriptionId, userId, stripeMode }) {
+  const modeFields = getStripeModeFields(stripeMode);
+
+  return [
+    ...(stripeCustomerId && modeFields ? [{ [modeFields.customerId]: stripeCustomerId }] : []),
+    ...(stripeSubscriptionId && modeFields ? [{ [modeFields.subscriptionId]: stripeSubscriptionId }] : []),
+    ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
+    ...(stripeSubscriptionId ? [{ stripeSubscriptionId }] : []),
+    ...(userId ? [{ _id: userId }] : []),
+  ];
+}
+
+function getStoredStripeCustomerIdForMode(user, stripeMode) {
+  const modeCustomerId = getModeSpecificValue(user, stripeMode, 'customerId');
+
+  if (modeCustomerId) {
+    return {
+      customerId: modeCustomerId,
+      source: getStripeModeFields(stripeMode)?.customerId || 'modeSpecific',
+      isLegacyFallback: false,
+    };
+  }
+
+  if (user?.stripeCustomerId) {
+    return {
+      customerId: user.stripeCustomerId,
+      source: 'stripeCustomerId',
+      isLegacyFallback: true,
+    };
+  }
+
+  return {
+    customerId: null,
+    source: null,
+    isLegacyFallback: false,
+  };
+}
+
+function getResourceHint(error) {
+  const param = String(error?.param || error?.raw?.param || '').toLowerCase();
+
+  if (param.includes('customer')) {
+    return 'customer';
+  }
+
+  if (param.includes('subscription')) {
+    return 'subscription';
+  }
+
+  const message = String(error?.message || error?.raw?.message || '').toLowerCase();
+
+  if (message.includes('customer')) {
+    return 'customer';
+  }
+
+  if (message.includes('subscription')) {
+    return 'subscription';
+  }
+
+  return 'unknown';
+}
+
+function buildStripeResourceNotFoundResponse(error, selectedPlan) {
+  return {
+    error: 'STRIPE_RESOURCE_NOT_FOUND',
+    resourceHint: getResourceHint(error),
+    selectedPlan,
+    stripeMode: getStripeMode(),
+  };
+}
+
+async function createStripeCustomerForUser(stripe, user, stripeMode) {
+  const customer = await stripe.customers.create({
+    email: user.email,
+    name: user.name,
+    metadata: {
+      userId: String(user._id),
+    },
+  });
+
+  setModeSpecificValue(user, stripeMode, 'customerId', customer.id);
+
+  if (stripeMode === 'sk_live') {
+    user.stripeCustomerId = customer.id;
+  }
+
+  user.billingUpdatedAt = new Date();
+  await user.save();
+
+  return customer.id;
+}
+
+async function resolveCheckoutCustomerId(stripe, user, selectedPlan, priceId, stripeMode) {
+  const storedCustomer = getStoredStripeCustomerIdForMode(user, stripeMode);
+
+  logCheckoutDiagnostics('Stripe checkout customer diagnostics.', selectedPlan, priceId, {
+    storedCustomerIdExists: Boolean(storedCustomer.customerId),
+    storedCustomerIdPrefix: getStripeIdPrefix(storedCustomer.customerId),
+    storedCustomerIdLast4: getStripeIdLast4(storedCustomer.customerId),
+    storedCustomerIdSource: storedCustomer.source,
+  });
+
+  if (storedCustomer.customerId) {
+    try {
+      const customer = await stripe.customers.retrieve(storedCustomer.customerId);
+
+      if (customer?.deleted) {
+        throw Object.assign(new Error('Stored Stripe customer was deleted.'), {
+          code: 'resource_missing',
+          param: 'customer',
+        });
+      }
+
+      if (storedCustomer.isLegacyFallback) {
+        setModeSpecificValue(user, stripeMode, 'customerId', storedCustomer.customerId);
+        user.billingUpdatedAt = new Date();
+        await user.save();
+      }
+
+      return storedCustomer.customerId;
+    } catch (error) {
+      if (error?.code !== 'resource_missing') {
+        throw error;
+      }
+
+      logCheckoutDiagnostics('Stored Stripe customer missing in current mode; creating a replacement.', selectedPlan, priceId, {
+        storedCustomerIdPrefix: getStripeIdPrefix(storedCustomer.customerId),
+        storedCustomerIdLast4: getStripeIdLast4(storedCustomer.customerId),
+        storedCustomerIdSource: storedCustomer.source,
+      });
+    }
+  }
+
+  return createStripeCustomerForUser(stripe, user, stripeMode);
+}
+
+async function resolvePortalCustomerId(stripe, user, stripeMode) {
+  const storedCustomer = getStoredStripeCustomerIdForMode(user, stripeMode);
+
+  if (!storedCustomer.customerId) {
+    return null;
+  }
+
+  try {
+    const customer = await stripe.customers.retrieve(storedCustomer.customerId);
+
+    if (customer?.deleted) {
+      return null;
+    }
+
+    if (storedCustomer.isLegacyFallback) {
+      setModeSpecificValue(user, stripeMode, 'customerId', storedCustomer.customerId);
+      user.billingUpdatedAt = new Date();
+      await user.save();
+    }
+
+    return storedCustomer.customerId;
+  } catch (error) {
+    if (error?.code === 'resource_missing') {
+      console.info('Stripe portal customer missing in current mode.', {
+        stripeMode,
+        storedCustomerIdExists: true,
+        storedCustomerIdPrefix: getStripeIdPrefix(storedCustomer.customerId),
+        storedCustomerIdLast4: getStripeIdLast4(storedCustomer.customerId),
+        storedCustomerIdSource: storedCustomer.source,
+      });
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+async function updateUserFromSubscription(subscription, stripeMode = getStripeMode()) {
   const stripeCustomerId =
     typeof subscription.customer === 'string'
       ? subscription.customer
@@ -512,35 +742,58 @@ async function updateUserFromSubscription(subscription) {
     subscriptionStatus: subscription.status,
     billingUpdatedAt: new Date(),
   };
+  setModeSpecificValue(update, stripeMode, 'subscriptionStatus', subscription.status);
+
   const periodEnd = subscriptionPeriodEnd(subscription);
   const unset = {};
   const isCanceled = subscription.status === 'canceled' || subscription.status === 'incomplete_expired';
 
   if (stripeCustomerId) {
-    update.stripeCustomerId = stripeCustomerId;
+    setModeSpecificValue(update, stripeMode, 'customerId', stripeCustomerId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeCustomerId = stripeCustomerId;
+    }
   }
 
   if (!isCanceled && stripeSubscriptionId) {
-    update.stripeSubscriptionId = stripeSubscriptionId;
+    setModeSpecificValue(update, stripeMode, 'subscriptionId', stripeSubscriptionId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeSubscriptionId = stripeSubscriptionId;
+    }
   }
 
   if (!isCanceled && periodEnd) {
     update.subscriptionCurrentPeriodEnd = periodEnd;
+    setModeSpecificValue(update, stripeMode, 'currentPeriodEnd', periodEnd);
   } else if (nextPlan === 'free') {
     unset.subscriptionCurrentPeriodEnd = '';
+    unsetModeSpecificValue(unset, stripeMode, 'currentPeriodEnd');
   }
 
   if (isCanceled) {
-    unset.stripeSubscriptionId = '';
+    unsetModeSpecificValue(unset, stripeMode, 'subscriptionId');
+
+    if (stripeMode === 'sk_live') {
+      unset.stripeSubscriptionId = '';
+    }
+  }
+
+  const lookup = buildStripeUserLookup({
+    stripeCustomerId,
+    stripeSubscriptionId,
+    userId,
+    stripeMode,
+  });
+
+  if (!lookup.length) {
+    return null;
   }
 
   const user = await User.findOneAndUpdate(
     {
-      $or: [
-        ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
-        ...(stripeSubscriptionId ? [{ stripeSubscriptionId }] : []),
-        ...(userId ? [{ _id: userId }] : []),
-      ],
+      $or: lookup,
     },
     {
       $set: update,
@@ -554,7 +807,7 @@ async function updateUserFromSubscription(subscription) {
   return user;
 }
 
-async function updateUserFromCheckoutSession(session, stripe) {
+async function updateUserFromCheckoutSession(session, stripe, stripeMode = getStripeMode()) {
   const stripeCustomerId =
     typeof session.customer === 'string' ? session.customer : session.customer?.id;
   const stripeSubscriptionId =
@@ -569,22 +822,46 @@ async function updateUserFromCheckoutSession(session, stripe) {
 
   if (stripeSubscriptionId && stripe) {
     const subscription = await stripe.subscriptions.retrieve(stripeSubscriptionId);
-    return updateUserFromSubscription(subscription);
+    return updateUserFromSubscription(subscription, stripeMode);
+  }
+
+  const update = {
+    billingUpdatedAt: new Date(),
+  };
+
+  if (stripeCustomerId) {
+    setModeSpecificValue(update, stripeMode, 'customerId', stripeCustomerId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeCustomerId = stripeCustomerId;
+    }
+  }
+
+  if (stripeSubscriptionId) {
+    setModeSpecificValue(update, stripeMode, 'subscriptionId', stripeSubscriptionId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeSubscriptionId = stripeSubscriptionId;
+    }
+  }
+
+  const lookup = buildStripeUserLookup({
+    stripeCustomerId,
+    stripeSubscriptionId,
+    userId,
+    stripeMode,
+  });
+
+  if (!lookup.length) {
+    return null;
   }
 
   const user = await User.findOneAndUpdate(
     {
-      $or: [
-        ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
-        ...(userId ? [{ _id: userId }] : []),
-      ],
+      $or: lookup,
     },
     {
-      $set: {
-        ...(stripeCustomerId ? { stripeCustomerId } : {}),
-        ...(stripeSubscriptionId ? { stripeSubscriptionId } : {}),
-        billingUpdatedAt: new Date(),
-      },
+      $set: update,
     },
     { new: true }
   );
@@ -594,7 +871,7 @@ async function updateUserFromCheckoutSession(session, stripe) {
   return user;
 }
 
-async function updateUserFromInvoice(invoice, status) {
+async function updateUserFromInvoice(invoice, status, stripeMode = getStripeEventMode(invoice)) {
   const stripeCustomerId =
     typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
   const stripeSubscriptionId =
@@ -614,28 +891,53 @@ async function updateUserFromInvoice(invoice, status) {
   }
 
   const update = {
-    ...(stripeCustomerId ? { stripeCustomerId } : {}),
-    ...(stripeSubscriptionId ? { stripeSubscriptionId } : {}),
     subscriptionStatus: status,
     plan: nextPlan,
     billingUpdatedAt: new Date(),
   };
+  setModeSpecificValue(update, stripeMode, 'subscriptionStatus', status);
+
+  if (stripeCustomerId) {
+    setModeSpecificValue(update, stripeMode, 'customerId', stripeCustomerId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeCustomerId = stripeCustomerId;
+    }
+  }
+
+  if (stripeSubscriptionId) {
+    setModeSpecificValue(update, stripeMode, 'subscriptionId', stripeSubscriptionId);
+
+    if (stripeMode === 'sk_live') {
+      update.stripeSubscriptionId = stripeSubscriptionId;
+    }
+  }
+
   const unset = {};
   const periodEnd = invoicePeriodEnd(invoice);
 
   if (nextPlan === 'free') {
     unset.subscriptionCurrentPeriodEnd = '';
+    unsetModeSpecificValue(unset, stripeMode, 'currentPeriodEnd');
   } else if (periodEnd) {
     update.subscriptionCurrentPeriodEnd = periodEnd;
+    setModeSpecificValue(update, stripeMode, 'currentPeriodEnd', periodEnd);
+  }
+
+  const lookup = buildStripeUserLookup({
+    stripeCustomerId,
+    stripeSubscriptionId,
+    userId,
+    stripeMode,
+  });
+
+  if (!lookup.length) {
+    return null;
   }
 
   const user = await User.findOneAndUpdate(
     {
-      $or: [
-        ...(stripeCustomerId ? [{ stripeCustomerId }] : []),
-        ...(stripeSubscriptionId ? [{ stripeSubscriptionId }] : []),
-        ...(userId ? [{ _id: userId }] : []),
-      ],
+      $or: lookup,
     },
     {
       $set: update,
@@ -682,18 +984,18 @@ router.post('/webhook', stripeWebhookRateLimit, express.raw({ type: 'application
 
     switch (event.type) {
       case 'checkout.session.completed':
-        await updateUserFromCheckoutSession(event.data.object, stripe);
+        await updateUserFromCheckoutSession(event.data.object, stripe, getStripeEventMode(event));
         break;
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted':
-        await updateUserFromSubscription(event.data.object);
+        await updateUserFromSubscription(event.data.object, getStripeEventMode(event));
         break;
       case 'invoice.paid':
-        await updateUserFromInvoice(event.data.object, 'active');
+        await updateUserFromInvoice(event.data.object, 'active', getStripeEventMode(event));
         break;
       case 'invoice.payment_failed':
-        await updateUserFromInvoice(event.data.object, 'past_due');
+        await updateUserFromInvoice(event.data.object, 'past_due', getStripeEventMode(event));
         break;
       default:
         break;
@@ -761,11 +1063,14 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
   }
 
   try {
+    const stripeMode = getStripeMode();
     logCheckoutDiagnostics('Stripe checkout diagnostics.', requestedPlan, priceId);
     await retrieveStripeAccountId(stripe, requestedPlan, priceId);
 
+    let configuredPrice;
+
     try {
-      await retrieveConfiguredPrice(stripe, requestedPlan, priceId);
+      configuredPrice = await retrieveConfiguredPrice(stripe, requestedPlan, priceId);
     } catch (error) {
       if (error?.code === 'resource_missing') {
         return res.status(400).json(buildStripePriceNotFoundResponse(requestedPlan));
@@ -780,22 +1085,25 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
       return null;
     }
 
-    let stripeCustomerId = user.stripeCustomerId;
+    const stripeCustomerId = await resolveCheckoutCustomerId(
+      stripe,
+      user,
+      requestedPlan,
+      priceId,
+      stripeMode
+    );
 
-    if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
-        email: user.email,
-        name: user.name,
-        metadata: {
-          userId: String(user._id),
-        },
-      });
-
-      stripeCustomerId = customer.id;
-      user.stripeCustomerId = stripeCustomerId;
-      user.billingUpdatedAt = new Date();
-      await user.save();
-    }
+    logCheckoutDiagnostics('Stripe checkout create input diagnostics.', requestedPlan, priceId, {
+      priceRetrieveSucceeded: Boolean(configuredPrice?.id),
+      priceActive: Boolean(configuredPrice?.active),
+      priceCurrency: configuredPrice?.currency || null,
+      priceRecurringInterval: configuredPrice?.recurring?.interval || null,
+      customerIdPrefix: getStripeIdPrefix(stripeCustomerId),
+      customerIdLast4: getStripeIdLast4(stripeCustomerId),
+      lineItemCount: 1,
+      customerEmailProvided: false,
+      subscriptionProvided: false,
+    });
 
     const frontendUrl = getFrontendUrl();
     const session = await stripe.checkout.sessions.create({
@@ -824,6 +1132,11 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
     return res.json({ url: session.url });
   } catch (error) {
     logBillingError('Stripe checkout session creation failed.', error);
+
+    if (error?.code === 'resource_missing') {
+      return res.status(400).json(buildStripeResourceNotFoundResponse(error, requestedPlan));
+    }
+
     return res.status(500).json({
       message: 'Unable to create checkout session.',
       selectedPlan: requestedPlan,
@@ -852,18 +1165,30 @@ router.post('/portal', authMiddleware, billingMutationRateLimit, async (req, res
       return null;
     }
 
-    if (!user.stripeCustomerId) {
+    const stripeMode = getStripeMode();
+    const stripeCustomerId = await resolvePortalCustomerId(stripe, user, stripeMode);
+
+    if (!stripeCustomerId) {
       return res.status(400).json({ message: 'No Stripe customer is linked to this user.' });
     }
 
     const session = await stripe.billingPortal.sessions.create({
-      customer: user.stripeCustomerId,
+      customer: stripeCustomerId,
       return_url: `${getFrontendUrl()}/projects.html`,
     });
 
     return res.json({ url: session.url });
   } catch (error) {
     logBillingError('Stripe portal session creation failed.', error);
+
+    if (error?.code === 'resource_missing') {
+      return res.status(400).json({
+        error: 'STRIPE_RESOURCE_NOT_FOUND',
+        resourceHint: getResourceHint(error),
+        stripeMode: getStripeMode(),
+      });
+    }
+
     return res.status(500).json({ message: 'Unable to create billing portal session.' });
   }
 });

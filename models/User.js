@@ -118,7 +118,31 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
 
+    stripeTestCustomerId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
+    stripeLiveCustomerId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
     stripeSubscriptionId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
+    stripeTestSubscriptionId: {
+      type: String,
+      trim: true,
+      index: true,
+    },
+
+    stripeLiveSubscriptionId: {
       type: String,
       trim: true,
       index: true,
@@ -129,7 +153,25 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
 
+    stripeTestSubscriptionStatus: {
+      type: String,
+      trim: true,
+    },
+
+    stripeLiveSubscriptionStatus: {
+      type: String,
+      trim: true,
+    },
+
     subscriptionCurrentPeriodEnd: {
+      type: Date,
+    },
+
+    stripeTestSubscriptionCurrentPeriodEnd: {
+      type: Date,
+    },
+
+    stripeLiveSubscriptionCurrentPeriodEnd: {
       type: Date,
     },
 
