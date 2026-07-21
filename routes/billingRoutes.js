@@ -56,11 +56,16 @@ const PLAN_DETAILS = Object.freeze({
 
 const BILLING_ENV_NAMES = Object.freeze([
   'STRIPE_SECRET_KEY',
+  'STRIPE_PUBLISHABLE_KEY',
   'STRIPE_PRO_PRICE_ID',
   'STRIPE_BUSINESS_PRICE_ID',
   'STRIPE_WEBHOOK_SECRET',
   'FRONTEND_URL',
 ]);
+const PLAN_PRICE_ENV_NAMES = Object.freeze({
+  pro: 'STRIPE_PRO_PRICE_ID',
+  business: 'STRIPE_BUSINESS_PRICE_ID',
+});
 const loggedMissingBillingConfig = new Set();
 
 function logBillingError(context, error) {
@@ -69,6 +74,125 @@ function logBillingError(context, error) {
     code: error?.code || null,
     status: error?.statusCode || error?.status || null,
   });
+}
+
+function envMode(value, testPrefix, livePrefix) {
+  if (!value) {
+    return 'missing';
+  }
+
+  if (String(value).startsWith(`${testPrefix}_`)) {
+    return testPrefix;
+  }
+
+  if (String(value).startsWith(`${livePrefix}_`)) {
+    return livePrefix;
+  }
+
+  return 'invalid';
+}
+
+function getStripeMode() {
+  return envMode(process.env.STRIPE_SECRET_KEY, 'sk_test', 'sk_live');
+}
+
+function getPublishableMode() {
+  return envMode(process.env.STRIPE_PUBLISHABLE_KEY, 'pk_test', 'pk_live');
+}
+
+function getPriceIdPrefix(priceId) {
+  if (!priceId) {
+    return 'missing';
+  }
+
+  return String(priceId).startsWith('price_') ? 'price_' : 'invalid';
+}
+
+function getPriceIdLast4(priceId) {
+  return priceId ? String(priceId).slice(-4) : null;
+}
+
+function buildSafeBillingConfigDiagnostics() {
+  return {
+    stripeMode: getStripeMode(),
+    publishableMode: getPublishableMode(),
+    webhookSecretPresent: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
+    prices: {
+      pro: {
+        envVar: PLAN_PRICE_ENV_NAMES.pro,
+        priceIdPrefix: getPriceIdPrefix(process.env.STRIPE_PRO_PRICE_ID),
+        priceIdLast4: getPriceIdLast4(process.env.STRIPE_PRO_PRICE_ID),
+      },
+      business: {
+        envVar: PLAN_PRICE_ENV_NAMES.business,
+        priceIdPrefix: getPriceIdPrefix(process.env.STRIPE_BUSINESS_PRICE_ID),
+        priceIdLast4: getPriceIdLast4(process.env.STRIPE_BUSINESS_PRICE_ID),
+      },
+    },
+  };
+}
+
+function buildSafeCheckoutDiagnostics(selectedPlan, priceId) {
+  return {
+    stripeMode: getStripeMode(),
+    publishableMode: getPublishableMode(),
+    webhookSecretPresent: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
+    selectedPlan,
+    envVar: PLAN_PRICE_ENV_NAMES[selectedPlan] || null,
+    priceIdPrefix: getPriceIdPrefix(priceId),
+    priceIdLast4: getPriceIdLast4(priceId),
+  };
+}
+
+function logCheckoutDiagnostics(message, selectedPlan, priceId, extra = {}) {
+  console.info(message, {
+    ...buildSafeCheckoutDiagnostics(selectedPlan, priceId),
+    ...extra,
+  });
+}
+
+function buildStripePriceNotFoundResponse(selectedPlan) {
+  return {
+    error: 'STRIPE_PRICE_NOT_FOUND',
+    reason: 'The configured price ID does not exist in the Stripe account/mode used by STRIPE_SECRET_KEY.',
+    selectedPlan,
+    envVar: PLAN_PRICE_ENV_NAMES[selectedPlan],
+  };
+}
+
+async function retrieveStripeAccountId(stripe, selectedPlan, priceId) {
+  try {
+    const account = await stripe.accounts.retrieve();
+    logCheckoutDiagnostics('Stripe checkout account resolved.', selectedPlan, priceId, {
+      stripeAccountId: account?.id || null,
+    });
+    return account?.id || null;
+  } catch (error) {
+    logCheckoutDiagnostics('Stripe checkout account lookup failed.', selectedPlan, priceId, {
+      errorCode: error?.code || null,
+      status: error?.statusCode || error?.status || null,
+    });
+    throw error;
+  }
+}
+
+async function retrieveConfiguredPrice(stripe, selectedPlan, priceId) {
+  try {
+    const price = await stripe.prices.retrieve(priceId);
+    logCheckoutDiagnostics('Stripe checkout price resolved.', selectedPlan, priceId, {
+      priceActive: Boolean(price?.active),
+      currency: price?.currency || null,
+      recurringInterval: price?.recurring?.interval || null,
+      lookupKey: price?.lookup_key || null,
+    });
+    return price;
+  } catch (error) {
+    logCheckoutDiagnostics('Stripe checkout price lookup failed.', selectedPlan, priceId, {
+      errorCode: error?.code || null,
+      status: error?.statusCode || error?.status || null,
+    });
+    throw error;
+  }
 }
 
 function getFrontendUrl() {
@@ -588,6 +712,13 @@ router.post('/webhook', stripeWebhookRateLimit, express.raw({ type: 'application
 
 router.use(express.json());
 
+router.get('/config', authMiddleware, async (req, res) => {
+  return res.json({
+    ok: true,
+    ...buildSafeBillingConfigDiagnostics(),
+  });
+});
+
 router.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await findCurrentUser(req, res);
@@ -623,12 +754,26 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
 
   const { stripe, priceIds } = getBillingConfig();
   const priceId = priceIds[requestedPlan];
+  const priceEnvVar = PLAN_PRICE_ENV_NAMES[requestedPlan];
 
   if (!stripe || !priceId) {
     return res.status(503).json({ message: 'Stripe checkout is not configured.' });
   }
 
   try {
+    logCheckoutDiagnostics('Stripe checkout diagnostics.', requestedPlan, priceId);
+    await retrieveStripeAccountId(stripe, requestedPlan, priceId);
+
+    try {
+      await retrieveConfiguredPrice(stripe, requestedPlan, priceId);
+    } catch (error) {
+      if (error?.code === 'resource_missing') {
+        return res.status(400).json(buildStripePriceNotFoundResponse(requestedPlan));
+      }
+
+      throw error;
+    }
+
     const user = await findCurrentUser(req, res);
 
     if (!user) {
@@ -679,7 +824,11 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
     return res.json({ url: session.url });
   } catch (error) {
     logBillingError('Stripe checkout session creation failed.', error);
-    return res.status(500).json({ message: 'Unable to create checkout session.' });
+    return res.status(500).json({
+      message: 'Unable to create checkout session.',
+      selectedPlan: requestedPlan,
+      envVar: priceEnvVar,
+    });
   }
 });
 
