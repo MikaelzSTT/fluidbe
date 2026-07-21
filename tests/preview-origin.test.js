@@ -10,7 +10,7 @@ process.env.BUILD_PREVIEW_SECRET = 'preview-origin-test-secret';
 
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
-const { app } = require('../server');
+const { app, previewIsolationHelpers } = require('../server');
 const {
   buildPreviewUrl,
   buildPublishedProjectUrl,
@@ -23,6 +23,7 @@ const projectId = '64f000000000000000000101';
 const buildId = '64f000000000000000000102';
 const buildPath = `/builds/${projectId}/${buildId}/index.html`;
 const publicBuildRoot = path.join(__dirname, '..', 'public', 'builds', projectId, buildId);
+const { buildPreviewContentSecurityPolicy } = previewIsolationHelpers;
 
 function listen() {
   return new Promise((resolve) => {
@@ -64,6 +65,40 @@ function request(server, options) {
     req.on('error', reject);
     req.end();
   });
+}
+
+function parseCspDirectives(csp) {
+  const directives = new Map();
+
+  for (const directive of String(csp || '').split(';')) {
+    const parts = directive.trim().split(/\s+/).filter(Boolean);
+
+    if (parts.length > 0) {
+      directives.set(parts[0], parts.slice(1));
+    }
+  }
+
+  return directives;
+}
+
+function withPreviewImgSrcAllowlist(value, fn) {
+  const previousValue = process.env.PREVIEW_IMG_SRC_ALLOWLIST;
+
+  if (value === undefined) {
+    delete process.env.PREVIEW_IMG_SRC_ALLOWLIST;
+  } else {
+    process.env.PREVIEW_IMG_SRC_ALLOWLIST = value;
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (previousValue === undefined) {
+      delete process.env.PREVIEW_IMG_SRC_ALLOWLIST;
+    } else {
+      process.env.PREVIEW_IMG_SRC_ALLOWLIST = previousValue;
+    }
+  }
 }
 
 function stubPublishedBuild() {
@@ -171,6 +206,68 @@ test('preview URL parsing rejects host injection and unsafe build paths', () => 
     toDedicatedPreviewUrl(`https://apps.askfluid.now.evil.example${buildPath}`),
     `https://preview.askfluid.now${buildPath}`
   );
+});
+
+test('preview CSP allows safe image sources and keeps script/connect restricted', () => {
+  withPreviewImgSrcAllowlist('https://images.unsplash.com,https://plus.unsplash.com', () => {
+    const directives = parseCspDirectives(buildPreviewContentSecurityPolicy());
+
+    assert.deepEqual(directives.get('default-src'), ["'none'"]);
+    assert.deepEqual(directives.get('script-src'), ["'self'"]);
+    assert.deepEqual(directives.get('connect-src'), ["'self'"]);
+    assert.deepEqual(directives.get('frame-ancestors'), ['https://askfluid.now']);
+
+    const imgSrc = directives.get('img-src');
+    assert.ok(imgSrc.includes("'self'"));
+    assert.ok(imgSrc.includes('data:'));
+    assert.ok(imgSrc.includes('blob:'));
+    assert.ok(imgSrc.includes('https://images.unsplash.com'));
+    assert.ok(imgSrc.includes('https://plus.unsplash.com'));
+    assert.equal(imgSrc.includes('https://cdn.example.com'), false);
+  });
+});
+
+test('preview CSP keeps image allowlist empty by default', () => {
+  withPreviewImgSrcAllowlist(undefined, () => {
+    const directives = parseCspDirectives(buildPreviewContentSecurityPolicy());
+
+    assert.deepEqual(directives.get('img-src'), ["'self'", 'data:', 'blob:']);
+  });
+});
+
+test('preview CSP rejects unsafe image allowlist entries with safe logs', () => {
+  const previousWarn = console.warn;
+  const warnings = [];
+
+  console.warn = (...args) => {
+    warnings.push(args);
+  };
+
+  try {
+    withPreviewImgSrcAllowlist(
+      'http://images.unsplash.com,https://*.example.com,javascript:alert(1),https://images.unsplash.com/path,https://plus.unsplash.com',
+      () => {
+        const directives = parseCspDirectives(buildPreviewContentSecurityPolicy());
+        const imgSrc = directives.get('img-src');
+
+        assert.ok(imgSrc.includes('https://plus.unsplash.com'));
+        assert.equal(imgSrc.includes('http://images.unsplash.com'), false);
+        assert.equal(imgSrc.includes('https://*.example.com'), false);
+        assert.equal(imgSrc.includes('javascript:alert(1)'), false);
+        assert.equal(imgSrc.includes('https://images.unsplash.com/path'), false);
+      }
+    );
+  } finally {
+    console.warn = previousWarn;
+  }
+
+  assert.equal(warnings.length, 4);
+  assert.ok(warnings.every((warning) => warning[0] === 'Invalid PREVIEW_IMG_SRC_ALLOWLIST entry ignored'));
+
+  const renderedWarnings = warnings.map((warning) => JSON.stringify(warning)).join('\n');
+  assert.doesNotMatch(renderedWarnings, /https:\/\/images\.unsplash\.com\/path/);
+  assert.doesNotMatch(renderedWarnings, /javascript:alert\(1\)/);
+  assert.doesNotMatch(renderedWarnings, /http:\/\/images\.unsplash\.com/);
 });
 
 test('preview host only exposes builds and published pages', async () => {

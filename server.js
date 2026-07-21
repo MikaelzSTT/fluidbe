@@ -247,8 +247,105 @@ function publicAppsOnly(req, res, next) {
   return res.sendStatus(404);
 }
 
+let previewImgSrcAllowlistCache = {
+  rawValue: null,
+  sources: [],
+};
+
+function logInvalidPreviewImgSrcAllowlistEntry(rawEntry, reason) {
+  let scheme = 'invalid';
+
+  try {
+    const url = new URL(rawEntry);
+    scheme = url.protocol ? url.protocol.replace(/:$/, '') : 'invalid';
+  } catch (error) {
+    scheme = 'invalid';
+  }
+
+  console.warn('Invalid PREVIEW_IMG_SRC_ALLOWLIST entry ignored', {
+    reason,
+    scheme,
+    inputLength: String(rawEntry || '').length,
+  });
+}
+
+function normalizePreviewImgSrcAllowlistEntry(rawEntry) {
+  const value = String(rawEntry || '').trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (value.includes('*')) {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'wildcards are not allowed');
+    return null;
+  }
+
+  let url;
+
+  try {
+    url = new URL(value);
+  } catch (error) {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'invalid URL');
+    return null;
+  }
+
+  if (url.protocol !== 'https:') {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'protocol must be https');
+    return null;
+  }
+
+  if (url.username || url.password) {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'credentials are not allowed');
+    return null;
+  }
+
+  if ((url.pathname && url.pathname !== '/') || url.search || url.hash) {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'only origins are allowed');
+    return null;
+  }
+
+  if (!url.hostname) {
+    logInvalidPreviewImgSrcAllowlistEntry(value, 'hostname is required');
+    return null;
+  }
+
+  return url.origin;
+}
+
+function getPreviewImgSrcAllowlistSources() {
+  const rawValue = String(process.env.PREVIEW_IMG_SRC_ALLOWLIST || '');
+
+  if (previewImgSrcAllowlistCache.rawValue === rawValue) {
+    return previewImgSrcAllowlistCache.sources;
+  }
+
+  const sources = [];
+  const seenSources = new Set();
+
+  for (const rawEntry of rawValue.split(',')) {
+    const source = normalizePreviewImgSrcAllowlistEntry(rawEntry);
+
+    if (!source || seenSources.has(source)) {
+      continue;
+    }
+
+    seenSources.add(source);
+    sources.push(source);
+  }
+
+  previewImgSrcAllowlistCache = {
+    rawValue,
+    sources,
+  };
+
+  return sources;
+}
+
 function buildPreviewContentSecurityPolicy() {
   const frameAncestors = getPreviewFrameAncestors();
+  const imgSrc = ["'self'", 'data:', 'blob:', ...getPreviewImgSrcAllowlistSources()].join(' ');
+
   return [
     "default-src 'none'",
     "base-uri 'none'",
@@ -257,7 +354,7 @@ function buildPreviewContentSecurityPolicy() {
     `frame-ancestors ${frameAncestors}`,
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob:",
+    `img-src ${imgSrc}`,
     "font-src 'self' data:",
     "media-src 'self' data: blob:",
     "worker-src 'self' blob:",
