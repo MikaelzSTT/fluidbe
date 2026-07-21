@@ -81,12 +81,29 @@ const STRIPE_MODE_FIELDS = Object.freeze({
   }),
 });
 const loggedMissingBillingConfig = new Set();
+const OPTIONAL_CHECKOUT_RESOURCE_TYPES = Object.freeze(new Set([
+  'coupon',
+  'promotion_code',
+  'tax_rate',
+  'shipping_rate',
+  'payment_method_configuration',
+]));
+const CHECKOUT_RESOURCE_TYPE_BY_PREFIX = Object.freeze({
+  acct: 'connected_account',
+  coupon: 'coupon',
+  cus: 'customer',
+  pmc: 'payment_method_configuration',
+  price: 'price',
+  promo: 'promotion_code',
+  shr: 'shipping_rate',
+  sub: 'subscription',
+  txr: 'tax_rate',
+});
 
 function logBillingError(context, error) {
   console.error(context, {
     name: error?.name || 'Error',
-    code: error?.code || null,
-    status: error?.statusCode || error?.status || null,
+    ...buildSafeStripeErrorDiagnostics(error),
   });
 }
 
@@ -133,6 +150,27 @@ function getStripeIdPrefix(stripeId) {
 
 function getStripeIdLast4(stripeId) {
   return stripeId ? String(stripeId).slice(-4) : null;
+}
+
+function redactStripeIds(value) {
+  if (!value) {
+    return null;
+  }
+
+  return String(value).replace(/\b([A-Za-z]+_)[A-Za-z0-9_]+/g, (match, prefix) => (
+    `${prefix}...${match.slice(-4)}`
+  ));
+}
+
+function buildSafeStripeErrorDiagnostics(error) {
+  return {
+    code: error?.code || error?.raw?.code || null,
+    type: error?.type || error?.raw?.type || null,
+    param: error?.param || error?.raw?.param || null,
+    message: redactStripeIds(error?.message || error?.raw?.message),
+    statusCode: error?.statusCode || error?.status || error?.raw?.statusCode || null,
+    requestId: error?.requestId || error?.raw?.requestId || error?.raw?.request_id || null,
+  };
 }
 
 function getPriceIdPrefix(priceId) {
@@ -186,6 +224,154 @@ function logCheckoutDiagnostics(message, selectedPlan, priceId, extra = {}) {
   });
 }
 
+function getCheckoutPath(parentPath, key) {
+  if (!parentPath) {
+    return String(key);
+  }
+
+  return typeof key === 'number' ? `${parentPath}[${key}]` : `${parentPath}.${key}`;
+}
+
+function getCheckoutResourceType(stripeId) {
+  const prefix = getStripeIdPrefix(stripeId);
+
+  if (!prefix || prefix === 'invalid') {
+    return null;
+  }
+
+  return CHECKOUT_RESOURCE_TYPE_BY_PREFIX[prefix.slice(0, -1)] || 'stripe_id';
+}
+
+function getCheckoutResourceTypeByPath(pathName) {
+  if (/(^|\.)customer$/.test(pathName)) {
+    return 'customer';
+  }
+
+  if (/(^|\.)price$/.test(pathName)) {
+    return 'price';
+  }
+
+  if (/(^|\.)coupon$/.test(pathName)) {
+    return 'coupon';
+  }
+
+  if (/(^|\.)promotion_code$/.test(pathName)) {
+    return 'promotion_code';
+  }
+
+  if (/(^|\.)payment_method_configuration$/.test(pathName)) {
+    return 'payment_method_configuration';
+  }
+
+  if (/(^|\.)shipping_rate$/.test(pathName)) {
+    return 'shipping_rate';
+  }
+
+  if (/(^|\.)subscription$/.test(pathName)) {
+    return 'subscription';
+  }
+
+  if (/(^|\.)transfer_data\.destination$/.test(pathName)) {
+    return 'connected_account';
+  }
+
+  if (/(^|\.)(tax_rates|default_tax_rates)\[\d+\]$/.test(pathName)) {
+    return 'tax_rate';
+  }
+
+  return null;
+}
+
+function collectCheckoutStripeResourceIds(value, parentPath = '') {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => collectCheckoutStripeResourceIds(
+      item,
+      getCheckoutPath(parentPath, index)
+    ));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.entries(value).flatMap(([key, item]) => collectCheckoutStripeResourceIds(
+      item,
+      getCheckoutPath(parentPath, key)
+    ));
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  const resourceType = /^[A-Za-z]+_[A-Za-z0-9_]+$/.test(value)
+    ? getCheckoutResourceType(value) || getCheckoutResourceTypeByPath(parentPath)
+    : getCheckoutResourceTypeByPath(parentPath);
+
+  if (!resourceType) {
+    return [];
+  }
+
+  return [{
+    path: parentPath,
+    resourceType,
+    idPrefix: getStripeIdPrefix(value),
+    idLast4: getStripeIdLast4(value),
+    optional: OPTIONAL_CHECKOUT_RESOURCE_TYPES.has(resourceType),
+  }];
+}
+
+function hasCheckoutResourceType(resources, resourceType) {
+  return resources.some((resource) => resource.resourceType === resourceType);
+}
+
+function hasCheckoutKey(value, targetKey) {
+  if (Array.isArray(value)) {
+    return value.some((item) => hasCheckoutKey(item, targetKey));
+  }
+
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  return Object.entries(value).some(([key, item]) => key === targetKey || hasCheckoutKey(item, targetKey));
+}
+
+function buildCheckoutPayloadDiagnostics(checkoutParams, selectedPlan, priceId, configuredPrice) {
+  const resources = collectCheckoutStripeResourceIds(checkoutParams);
+  const customerPresent = Boolean(checkoutParams.customer);
+
+  return {
+    selectedPlan,
+    stripeMode: getStripeMode(),
+    envVar: PLAN_PRICE_ENV_NAMES[selectedPlan] || null,
+    priceResolved: Boolean(configuredPrice?.id),
+    customerPresent,
+    ...(customerPresent ? {
+      customerIdPrefix: getStripeIdPrefix(checkoutParams.customer),
+      customerIdLast4: getStripeIdLast4(checkoutParams.customer),
+    } : {}),
+    stripeResourcePresence: {
+      customer: customerPresent,
+      price: hasCheckoutResourceType(resources, 'price'),
+      coupon: hasCheckoutResourceType(resources, 'coupon') || hasCheckoutKey(checkoutParams, 'coupon'),
+      promotion_code: hasCheckoutResourceType(resources, 'promotion_code') || hasCheckoutKey(checkoutParams, 'promotion_code'),
+      tax_rate: hasCheckoutResourceType(resources, 'tax_rate') || hasCheckoutKey(checkoutParams, 'tax_rates') || hasCheckoutKey(checkoutParams, 'default_tax_rates'),
+      shipping_rate: hasCheckoutResourceType(resources, 'shipping_rate') || hasCheckoutKey(checkoutParams, 'shipping_rate'),
+      payment_method_configuration: hasCheckoutResourceType(resources, 'payment_method_configuration') || hasCheckoutKey(checkoutParams, 'payment_method_configuration'),
+      subscription: hasCheckoutResourceType(resources, 'subscription') || hasCheckoutKey(checkoutParams, 'subscription'),
+      connected_account: hasCheckoutResourceType(resources, 'connected_account'),
+      transfer_data: hasCheckoutKey(checkoutParams, 'transfer_data'),
+      application_fee: hasCheckoutKey(checkoutParams, 'application_fee_amount') || hasCheckoutKey(checkoutParams, 'application_fee_percent'),
+    },
+    optionalStripeResourcesPresent: {
+      coupon: hasCheckoutResourceType(resources, 'coupon') || hasCheckoutKey(checkoutParams, 'coupon'),
+      promotion_code: hasCheckoutResourceType(resources, 'promotion_code') || hasCheckoutKey(checkoutParams, 'promotion_code'),
+      tax_rate: hasCheckoutResourceType(resources, 'tax_rate') || hasCheckoutKey(checkoutParams, 'tax_rates') || hasCheckoutKey(checkoutParams, 'default_tax_rates'),
+      shipping_rate: hasCheckoutResourceType(resources, 'shipping_rate') || hasCheckoutKey(checkoutParams, 'shipping_rate'),
+      payment_method_configuration: hasCheckoutResourceType(resources, 'payment_method_configuration') || hasCheckoutKey(checkoutParams, 'payment_method_configuration'),
+    },
+    stripeResourceFields: resources,
+  };
+}
+
 function buildStripePriceNotFoundResponse(selectedPlan) {
   return {
     error: 'STRIPE_PRICE_NOT_FOUND',
@@ -205,8 +391,7 @@ async function retrieveStripeAccountId(stripe, selectedPlan, priceId) {
     return account?.id || null;
   } catch (error) {
     logCheckoutDiagnostics('Stripe checkout account lookup failed.', selectedPlan, priceId, {
-      errorCode: error?.code || null,
-      status: error?.statusCode || error?.status || null,
+      error: buildSafeStripeErrorDiagnostics(error),
     });
     throw error;
   }
@@ -224,8 +409,7 @@ async function retrieveConfiguredPrice(stripe, selectedPlan, priceId) {
     return price;
   } catch (error) {
     logCheckoutDiagnostics('Stripe checkout price lookup failed.', selectedPlan, priceId, {
-      errorCode: error?.code || null,
-      status: error?.statusCode || error?.status || null,
+      error: buildSafeStripeErrorDiagnostics(error),
     });
     throw error;
   }
@@ -586,32 +770,56 @@ function getStoredStripeCustomerIdForMode(user, stripeMode) {
 
 function getResourceHint(error) {
   const param = String(error?.param || error?.raw?.param || '').toLowerCase();
-
-  if (param.includes('customer')) {
-    return 'customer';
-  }
-
-  if (param.includes('subscription')) {
-    return 'subscription';
-  }
-
   const message = String(error?.message || error?.raw?.message || '').toLowerCase();
+  const haystack = `${param} ${message}`;
 
-  if (message.includes('customer')) {
+  if (haystack.includes('customer')) {
     return 'customer';
   }
 
-  if (message.includes('subscription')) {
+  if (haystack.includes('promotion_code') || haystack.includes('promotion code')) {
+    return 'promotion_code';
+  }
+
+  if (haystack.includes('coupon')) {
+    return 'coupon';
+  }
+
+  if (haystack.includes('tax_rate') || haystack.includes('tax rate')) {
+    return 'tax_rate';
+  }
+
+  if (haystack.includes('shipping_rate') || haystack.includes('shipping rate')) {
+    return 'shipping_rate';
+  }
+
+  if (haystack.includes('payment_method_configuration') || haystack.includes('payment method configuration')) {
+    return 'payment_method_configuration';
+  }
+
+  if (haystack.includes('subscription')) {
     return 'subscription';
+  }
+
+  if (haystack.includes('transfer_data') || haystack.includes('destination') || haystack.includes('account')) {
+    return 'connected_account';
+  }
+
+  if (haystack.includes('application_fee') || haystack.includes('application fee')) {
+    return 'application_fee';
   }
 
   return 'unknown';
 }
 
 function buildStripeResourceNotFoundResponse(error, selectedPlan) {
+  const diagnostics = buildSafeStripeErrorDiagnostics(error);
+
   return {
     error: 'STRIPE_RESOURCE_NOT_FOUND',
-    resourceHint: getResourceHint(error),
+    code: 'resource_missing',
+    param: diagnostics.param || null,
+    message: diagnostics.message || 'Stripe resource missing',
     selectedPlan,
     stripeMode: getStripeMode(),
   };
@@ -636,6 +844,153 @@ async function createStripeCustomerForUser(stripe, user, stripeMode) {
   await user.save();
 
   return customer.id;
+}
+
+function buildCheckoutSessionParams({ stripeCustomerId, priceId, frontendUrl, user, requestedPlan }) {
+  return {
+    mode: 'subscription',
+    customer: stripeCustomerId,
+    line_items: [
+      {
+        price: priceId,
+        quantity: 1,
+      },
+    ],
+    success_url: `${frontendUrl}/projects.html?billing=success`,
+    cancel_url: `${frontendUrl}/pricing?billing=cancelled`,
+    metadata: {
+      userId: String(user._id),
+      plan: requestedPlan,
+    },
+    subscription_data: {
+      metadata: {
+        userId: String(user._id),
+        plan: requestedPlan,
+      },
+    },
+  };
+}
+
+function removeCheckoutOptionalResource(checkoutParams, resourceHint) {
+  switch (resourceHint) {
+    case 'coupon':
+    case 'promotion_code':
+      if (checkoutParams.discounts) {
+        delete checkoutParams.discounts;
+        return true;
+      }
+      if (checkoutParams.subscription_data?.discounts) {
+        delete checkoutParams.subscription_data.discounts;
+        return true;
+      }
+      return false;
+    case 'tax_rate': {
+      let removed = false;
+
+      checkoutParams.line_items?.forEach((lineItem) => {
+        if (lineItem.tax_rates) {
+          delete lineItem.tax_rates;
+          removed = true;
+        }
+      });
+
+      if (checkoutParams.subscription_data?.default_tax_rates) {
+        delete checkoutParams.subscription_data.default_tax_rates;
+        removed = true;
+      }
+
+      return removed;
+    }
+    case 'shipping_rate':
+      if (checkoutParams.shipping_options) {
+        delete checkoutParams.shipping_options;
+        return true;
+      }
+      return false;
+    case 'payment_method_configuration':
+      if (checkoutParams.payment_method_configuration) {
+        delete checkoutParams.payment_method_configuration;
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+function logCheckoutCreateError(message, error, selectedPlan, priceId) {
+  logCheckoutDiagnostics(message, selectedPlan, priceId, {
+    error: buildSafeStripeErrorDiagnostics(error),
+    resourceHint: getResourceHint(error),
+  });
+}
+
+async function createCheckoutSessionWithRecovery({
+  stripe,
+  checkoutParams,
+  user,
+  stripeMode,
+  selectedPlan,
+  priceId,
+  configuredPrice,
+}) {
+  logCheckoutDiagnostics(
+    'Stripe checkout create input diagnostics.',
+    selectedPlan,
+    priceId,
+    buildCheckoutPayloadDiagnostics(checkoutParams, selectedPlan, priceId, configuredPrice)
+  );
+
+  try {
+    return await stripe.checkout.sessions.create(checkoutParams);
+  } catch (error) {
+    logCheckoutCreateError('Stripe checkout session creation failed.', error, selectedPlan, priceId);
+
+    if (error?.code !== 'resource_missing') {
+      throw error;
+    }
+
+    const resourceHint = getResourceHint(error);
+
+    if (resourceHint === 'customer') {
+      const replacementCustomerId = await createStripeCustomerForUser(stripe, user, stripeMode);
+      checkoutParams.customer = replacementCustomerId;
+
+      logCheckoutDiagnostics('Retrying Stripe checkout with replacement customer.', selectedPlan, priceId, {
+        priceResolved: Boolean(configuredPrice?.id),
+        customerPresent: true,
+        customerIdPrefix: getStripeIdPrefix(replacementCustomerId),
+        customerIdLast4: getStripeIdLast4(replacementCustomerId),
+      });
+
+      try {
+        return await stripe.checkout.sessions.create(checkoutParams);
+      } catch (retryError) {
+        logCheckoutCreateError('Stripe checkout retry after customer replacement failed.', retryError, selectedPlan, priceId);
+        throw retryError;
+      }
+    }
+
+    if (stripeMode === 'sk_test' && OPTIONAL_CHECKOUT_RESOURCE_TYPES.has(resourceHint)) {
+      const removed = removeCheckoutOptionalResource(checkoutParams, resourceHint);
+
+      if (removed) {
+        logCheckoutDiagnostics('Retrying Stripe checkout without optional resource.', selectedPlan, priceId, {
+          removedOptionalResource: resourceHint,
+          ...buildCheckoutPayloadDiagnostics(checkoutParams, selectedPlan, priceId, configuredPrice),
+        });
+
+        try {
+          return await stripe.checkout.sessions.create(checkoutParams);
+        } catch (retryError) {
+          logCheckoutCreateError('Stripe checkout retry without optional resource failed.', retryError, selectedPlan, priceId);
+          throw retryError;
+        }
+      }
+    }
+
+    throw error;
+  }
 }
 
 async function resolveCheckoutCustomerId(stripe, user, selectedPlan, priceId, stripeMode) {
@@ -1093,40 +1448,22 @@ router.post('/checkout', authMiddleware, billingMutationRateLimit, async (req, r
       stripeMode
     );
 
-    logCheckoutDiagnostics('Stripe checkout create input diagnostics.', requestedPlan, priceId, {
-      priceRetrieveSucceeded: Boolean(configuredPrice?.id),
-      priceActive: Boolean(configuredPrice?.active),
-      priceCurrency: configuredPrice?.currency || null,
-      priceRecurringInterval: configuredPrice?.recurring?.interval || null,
-      customerIdPrefix: getStripeIdPrefix(stripeCustomerId),
-      customerIdLast4: getStripeIdLast4(stripeCustomerId),
-      lineItemCount: 1,
-      customerEmailProvided: false,
-      subscriptionProvided: false,
-    });
-
     const frontendUrl = getFrontendUrl();
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer: stripeCustomerId,
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      success_url: `${frontendUrl}/projects.html?billing=success`,
-      cancel_url: `${frontendUrl}/pricing?billing=cancelled`,
-      metadata: {
-        userId: String(user._id),
-        plan: requestedPlan,
-      },
-      subscription_data: {
-        metadata: {
-          userId: String(user._id),
-          plan: requestedPlan,
-        },
-      },
+    const checkoutParams = buildCheckoutSessionParams({
+      stripeCustomerId,
+      priceId,
+      frontendUrl,
+      user,
+      requestedPlan,
+    });
+    const session = await createCheckoutSessionWithRecovery({
+      stripe,
+      checkoutParams,
+      user,
+      stripeMode,
+      selectedPlan: requestedPlan,
+      priceId,
+      configuredPrice,
     });
 
     return res.json({ url: session.url });
