@@ -2,8 +2,8 @@ const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const mongoose = require('mongoose');
 const multer = require('multer');
+const ChatMessage = require('../models/ChatMessage');
 const Project = require('../models/Project');
-const ProjectBuild = require('../models/ProjectBuild');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const authMiddleware = require('../middleware/authMiddleware');
@@ -17,6 +17,10 @@ const {
   refundAiQuotaContext,
   sendAiQuotaError,
 } = require('../utils/aiQuota');
+const {
+  createCurrentProjectSnapshot,
+  looksSensitiveForSnapshot,
+} = require('../utils/projectSnapshot');
 const { createSourceContext } = require('../utils/sourceContext');
 
 const router = express.Router();
@@ -39,6 +43,7 @@ const MAX_CODE_CONTEXT_FILES = 8;
 const MAX_CODE_CONTEXT_EXCERPTS = 3;
 const MAX_CODE_CONTEXT_EXCERPT_CHARS = 900;
 const MAX_CODE_CONTEXT_CHARS = 5000;
+const MAX_RECENT_CHAT_HISTORY_MESSAGES = 12;
 const CODE_CONTEXT_KEYWORDS = new Set([
   'button', 'review', 'header', 'navbar', 'card', 'footer',
 ]);
@@ -415,6 +420,63 @@ function normalizeHistoryItem(item) {
   return { role, content };
 }
 
+async function loadProjectMessageHistory(projectId) {
+  const messages = await ProjectMessage.find({
+    projectId,
+    role: { $in: ['user', 'assistant'] },
+  })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(MAX_RECENT_CHAT_HISTORY_MESSAGES)
+    .select('role content createdAt')
+    .lean();
+
+  return messages
+    .reverse()
+    .map(normalizeHistoryItem)
+    .filter(Boolean);
+}
+
+function getSessionConversationId(req) {
+  return String(req.session?._id || req.session?.id || req.session?.jti || req.userId || '').trim();
+}
+
+async function loadSessionMessageHistory(req) {
+  const sessionId = getSessionConversationId(req);
+
+  if (!sessionId) {
+    return [];
+  }
+
+  const messages = await ChatMessage.find({
+    userId: req.userId,
+    sessionId,
+    role: { $in: ['user', 'assistant'] },
+  })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(MAX_RECENT_CHAT_HISTORY_MESSAGES)
+    .select('role content createdAt')
+    .lean();
+
+  return messages
+    .reverse()
+    .map(normalizeHistoryItem)
+    .filter(Boolean);
+}
+
+async function createSessionChatMessage(req, payload) {
+  const sessionId = getSessionConversationId(req);
+
+  if (!sessionId) {
+    return null;
+  }
+
+  return ChatMessage.create({
+    userId: req.userId,
+    sessionId,
+    ...payload,
+  });
+}
+
 function buildProjectContext(project) {
   if (!project) {
     return '';
@@ -478,12 +540,23 @@ function buildProjectCodeContext(build, message) {
 
   let contextBuild = build;
   const hasSummary = Boolean(String(build.sourceSummary || '').trim());
-  const hasIndexedFiles = Array.isArray(build.indexedFiles) && build.indexedFiles.length > 0;
+  const safeIndexedFiles = (Array.isArray(build.indexedFiles) ? build.indexedFiles : [])
+    .filter((file) => file && typeof file.path === 'string')
+    .filter((file) => !isUnsafeCodeContextFile(file.path, file.excerpt));
+  const hasIndexedFiles = safeIndexedFiles.length > 0;
 
   if (!hasSummary && !hasIndexedFiles && Array.isArray(build.sourceFiles) && build.sourceFiles.length > 0) {
     contextBuild = {
       ...build,
-      ...createSourceContext(build.sourceFiles),
+      ...createSourceContext(build.sourceFiles.filter((file) => {
+        const relativePath = file?.relativePath || file?.path || '';
+        return !isUnsafeCodeContextFile(relativePath, decodeSourceFileForSafety(file));
+      })),
+    };
+  } else if (Array.isArray(build.indexedFiles)) {
+    contextBuild = {
+      ...build,
+      indexedFiles: safeIndexedFiles,
     };
   }
 
@@ -518,6 +591,33 @@ function buildProjectCodeContext(build, message) {
     `Arquivos relacionados: ${listedFiles.length ? listedFiles.join(', ') : 'nenhum arquivo indexado.'}`,
     excerpts.length ? `Trechos relevantes:\n${excerpts.join('\n\n')}` : '',
   ].filter(Boolean).join('\n\n').slice(0, MAX_CODE_CONTEXT_CHARS);
+}
+
+function decodeSourceFileForSafety(file) {
+  if (!file || file.encoding !== 'base64' || typeof file.content !== 'string') {
+    return '';
+  }
+
+  try {
+    return Buffer.from(file.content, 'base64').toString('utf8');
+  } catch (error) {
+    return '';
+  }
+}
+
+function isUnsafeCodeContextFile(relativePath, content) {
+  const normalizedPath = String(relativePath || '').replace(/\\/g, '/').toLowerCase();
+  const basename = normalizedPath.split('/').pop() || '';
+
+  return (
+    !normalizedPath ||
+    normalizedPath.endsWith('.map') ||
+    basename === '.env' ||
+    basename.startsWith('.env.') ||
+    normalizedPath.includes('/secrets/') ||
+    normalizedPath.includes('/keys/') ||
+    looksSensitiveForSnapshot(normalizedPath, content)
+  );
 }
 
 function reserveProjectVisualContext(build) {
@@ -750,6 +850,8 @@ Use action "wizard" somente quando houver intencao clara de criar, gerar, montar
 ${hasProjectContext ? 'Como ha um projeto atual, tambem use action "wizard" quando o usuario pedir para editar, alterar, adicionar, remover, ajustar, trocar, melhorar ou modificar qualquer parte do projeto existente.' : ''}
 
 Use action "chat" para conversa normal, duvidas, mensagens aleatorias, testes, cumprimentos, risadas, reacoes curtas ou texto sem intencao clara de criacao.
+Use action "chat" para follow-ups curtos que dependem do turno anterior, como "pq", "por que", "como assim", "isso", "dele", "dela", "do superman ue". Resolva a referencia pelo historico recente.
+Nunca use action "wizard" ou "clarify" apenas porque a mensagem contem um substantivo, personagem, marca, nicho ou tema. E preciso haver pedido explicito de criar/gerar/montar/construir um projeto, ou editar/alterar/adicionar/remover algo quando houver projeto atual.
 
 Use action "clarify" quando houver intencao clara de criar um projeto, mas o pedido ainda estiver vago ou incompleto para uma boa primeira geracao.
 ${hasUploadedImageContext ? 'Excecao importante: quando houver imagem anexada e o texto for vago, nao use uma resposta generica. Use action "chat" para fazer uma pergunta util baseada no que voce entendeu da imagem e inclua options curtas. A pergunta deve demonstrar que voce analisou a imagem.' : ''}
@@ -773,6 +875,7 @@ Exemplos de pedidos com intencao de criar, mas vagos, que devem ser "clarify":
 Se o historico ou a mensagem atual contiver respostas estruturadas de briefing, com escolhas ou definicoes sobre objetivo, publico, funcionalidades, fluxo, conteudo, login, pagamento, checkout, vendedores, plataforma, CTA ou visual, entao use action "wizard".
 
 Se o usuario ja informar no pedido inicial o que deve ser criado e trouxer detalhes suficientes para uma primeira versao boa, use action "wizard".
+Antes de classificar a mensagem atual, considere a mensagem anterior do usuario e a resposta anterior da IA. Se a mensagem atual for uma continuacao, responda diretamente a continuacao e nao mostre sugestoes genericas de criacao.
 
 Quando action for "wizard", reply deve ser uma frase natural, curta e sem pergunta, dizendo que voce vai iniciar a criacao. Nao use texto fixo.
 
@@ -787,6 +890,7 @@ As options devem ser geradas por voce para a conversa atual, nunca copiadas de u
 
 Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos. Nao salve dados. Nao mencione detalhes internos como polling, ProjectBuild, MongoDB ou JWT a menos que o usuario pergunte.
 Nunca peca API key, token, senha ou secret no chat.
+Quando houver um bloco CURRENT PROJECT SNAPSHOT, trate-o como a fonte autoritativa do projeto aberto. Se o usuario perguntar o que existe/esta escrito na home ou preview, descreva apenas textos, botoes, navegacao e estrutura presentes nesse snapshot. Se o snapshot disser que nao ha conteudo visivel acessivel, responda que nao conseguiu inspecionar o projeto em vez de inventar.
 
 Contexto do projeto atual:
 ${projectContext || 'Nenhum projeto informado.'}
@@ -802,7 +906,7 @@ Retorne somente JSON valido, sem markdown, sem texto antes ou depois, no formato
 `.trim();
 }
 
-function buildClarifySystemPrompt() {
+function buildClarifySystemPrompt(projectContext = '', projectCodeContext = '') {
   return `
 Voce e a IA de briefing da Fluid, em portugues do Brasil.
 
@@ -819,6 +923,7 @@ Regras obrigatorias:
 - Nao salve dados e nao mencione banco, ProjectBuild, MongoDB, JWT ou detalhes internos.
 - Nunca peca API key, token, senha ou secret no chat.
 - Sempre inclua uma pergunta de estilo visual quando fizer sentido.
+${projectContext ? '- Existe um projeto atual aberto; use o contexto dele apenas para evitar perguntas que contradigam o build atual.' : ''}
 
 Direcionamento por tipo de projeto:
 - Se for marketplace, pode perguntar sobre pagamentos, login, vendedores, checkout e visual.
@@ -841,6 +946,11 @@ Formato exato:
     }
   ]
 }
+
+Contexto do projeto atual:
+${projectContext || 'Nenhum projeto informado.'}
+
+${projectCodeContext || ''}
 `.trim();
 }
 
@@ -852,6 +962,7 @@ Voce e a IA de chat da Fluid, em portugues do Brasil.
 
 Responda de forma natural, breve e util. Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos.
 Nunca peca API key, token, senha ou secret no chat.
+Quando houver um bloco CURRENT PROJECT SNAPSHOT, trate-o como a fonte autoritativa do projeto aberto. Se o usuario perguntar o que existe/esta escrito na home ou preview, descreva apenas textos, botoes, navegacao e estrutura presentes nesse snapshot. Se o snapshot disser que nao ha conteudo visivel acessivel, responda que nao conseguiu inspecionar o projeto em vez de inventar.
 
 Se o usuario pedir algo vago sobre criar site, app, landing page, SaaS, dashboard, ecommerce, interface ou projeto, faca no maximo uma pergunta curta sobre tema, negocio, produto ou objetivo principal.
 
@@ -980,6 +1091,82 @@ function normalizeBuildIntentText(value) {
     .trim();
 }
 
+function isProjectInspectionQuestion(message) {
+  const normalized = normalizeBuildIntentText(message);
+
+  return /\b(o que|oque|quais?|fale|diga|me diga|descreva|liste|mostre)\b/.test(normalized)
+    && /\b(home|preview|tela|pagina|conteudo|texto|textos|escrito|ve|vendo|aparece|aparecendo)\b/.test(normalized);
+}
+
+function hasExplicitBuildOrEditIntent(message, hasProject = false) {
+  const normalized = normalizeBuildIntentText(message);
+
+  if (!normalized) {
+    return false;
+  }
+
+  const creationIntent = /\b(crie|criar|cria|gere|gerar|gera|monte|monta|construa|construir|build|create|make|desenvolva|faca|faz)\b/.test(normalized)
+    && /\b(app|aplicativo|site|website|landing page|marketplace|saas|dashboard|ecommerce|e commerce|loja|projeto|sistema|pagina|interface|plataforma)\b/.test(normalized);
+  const directCreationNoun = /\b(quero|preciso)\b.*\b(app|aplicativo|site|website|landing page|marketplace|saas|dashboard|ecommerce|e commerce|loja|projeto|sistema|pagina|interface|plataforma)\b/.test(normalized);
+  const editIntent = hasProject && /\b(edite|editar|altere|alterar|mude|mudar|troque|trocar|adicione|adicionar|remova|remover|ajuste|ajustar|aumente|aumentar|diminua|diminuir|deixa|deixe|maior|menor)\b/.test(normalized);
+
+  return creationIntent || directCreationNoun || editIntent;
+}
+
+function getLastHistoryItem(history, role = null) {
+  const items = Array.isArray(history) ? history.map(normalizeHistoryItem).filter(Boolean) : [];
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (!role || items[index].role === role) {
+      return items[index];
+    }
+  }
+
+  return null;
+}
+
+function isLikelyConversationalFollowUp(message, history) {
+  const normalized = normalizeBuildIntentText(message);
+  const previousAssistant = getLastHistoryItem(history, 'assistant');
+
+  if (!normalized || !previousAssistant) {
+    return false;
+  }
+
+  if ([
+    'pq',
+    'porque',
+    'por que',
+    'por quê',
+    'como assim',
+    'isso',
+    'isto',
+    'essa',
+    'esse',
+    'ele',
+    'ela',
+    'dele',
+    'dela',
+    'disso',
+    'dessa',
+    'desse',
+  ].includes(normalized)) {
+    return true;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+
+  if (words.length <= 5 && /^(?:do|da|dos|das|de|sobre|e|mas)\b/.test(normalized)) {
+    return true;
+  }
+
+  if (words.length <= 4 && /\b(ue|ué|hein|entao|então)\b/.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
 function getPriorHistoryItems(history, currentMessage = '') {
   if (!Array.isArray(history)) {
     return [];
@@ -1051,6 +1238,10 @@ function isCompleteFirstBuildPrompt(message, history, project) {
   const normalizedText = normalizeBuildIntentText(message);
 
   if (!normalizedText || isVagueCreationPrompt(normalizedText)) {
+    return false;
+  }
+
+  if (!hasExplicitBuildOrEditIntent(message, false)) {
     return false;
   }
 
@@ -1323,7 +1514,7 @@ async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700, ai
   return content;
 }
 
-async function getClarificationQuestions({ message, history, aiQuotaContext }) {
+async function getClarificationQuestions({ message, history, projectContext = '', projectCodeContext = '', aiQuotaContext }) {
   const previousMessages = Array.isArray(history)
     ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
     : [];
@@ -1332,7 +1523,7 @@ async function getClarificationQuestions({ message, history, aiQuotaContext }) {
     aiQuotaContext,
     maxTokens: 1400,
     messages: [
-      { role: 'system', content: buildClarifySystemPrompt() },
+      { role: 'system', content: buildClarifySystemPrompt(projectContext, projectCodeContext) },
       ...previousMessages,
       { role: 'user', content: message },
     ],
@@ -1378,12 +1569,17 @@ async function getAiReply({
 }) {
   const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
-  const firstPromptBuildNow = !imageAttachment && isCompleteFirstBuildPrompt(message, history, project);
+  const conversationalFollowUp = isLikelyConversationalFollowUp(message, previousMessages);
+  const explicitBuildOrEditIntent = hasExplicitBuildOrEditIntent(message, Boolean(project));
+  const firstPromptBuildNow = !imageAttachment
+    && !conversationalFollowUp
+    && isCompleteFirstBuildPrompt(message, history, project);
 
   console.info('[chat] detectedBuildNow', {
     detectedBuildNow: firstPromptBuildNow,
     hasProject: Boolean(project),
     hasPriorHistory: hasFirstPromptHistory(history, message),
+    conversationalFollowUp,
   });
 
   if (firstPromptBuildNow) {
@@ -1428,6 +1624,16 @@ async function getAiReply({
       throw new Error('Decisao invalida da IA.');
     }
 
+    if (conversationalFollowUp && !explicitBuildOrEditIntent && action !== 'chat') {
+      action = 'chat';
+      reply = 'Entendi. Você está continuando a conversa anterior; vou responder com base nela.';
+    }
+
+    if (!project && !explicitBuildOrEditIntent && action === 'wizard') {
+      action = 'chat';
+      reply = 'Você quer falar sobre isso ou quer criar algum projeto com esse tema?';
+    }
+
     const firstPromptNoContext = !project && !hasFirstPromptHistory(history, message);
     const normalizedBuildText = firstPromptNoContext ? normalizeBuildIntentText(message) : '';
 
@@ -1455,7 +1661,7 @@ async function getAiReply({
       ];
     }
 
-    const shouldIncludeOptions = action === 'chat' && isQuestion(reply);
+    const shouldIncludeOptions = action === 'chat' && isQuestion(reply) && !conversationalFollowUp && explicitBuildOrEditIntent;
     const options = normalizeOptions(
       forcedImageClarifyOptions || parsed.options,
       shouldIncludeOptions
@@ -1513,7 +1719,7 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
   const aiQuotaContext = createAiQuotaContext(req, { route: 'chat-clarify' });
 
   try {
-    const { message, history, messages } = req.body;
+    const { message, history, messages, projectId } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
@@ -1523,9 +1729,39 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
       return res.status(413).json({ code: 'CHAT_MESSAGE_TOO_LARGE', message: 'Mensagem muito longa.' });
     }
 
+    let project = null;
+    let projectContext = '';
+    let projectCodeContext = '';
+    let effectiveHistory = history || messages;
+
+    if (projectId) {
+      if (!mongoose.Types.ObjectId.isValid(projectId)) {
+        return res.status(400).json({ message: 'ID de projeto inválido.' });
+      }
+
+      project = await Project.findOne({
+        _id: projectId,
+        userId: req.userId,
+      });
+
+      if (!project) {
+        return res.status(404).json({ message: 'Projeto não encontrado.' });
+      }
+
+      const currentSnapshot = await createCurrentProjectSnapshot(project);
+      projectContext = buildProjectContext(project);
+      projectCodeContext = currentSnapshot.promptBlock;
+      effectiveHistory = await loadProjectMessageHistory(project._id);
+    } else {
+      const sessionHistory = await loadSessionMessageHistory(req);
+      effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
+    }
+
     const questions = await getClarificationQuestions({
       message: message.trim(),
-      history: history || messages,
+      history: effectiveHistory,
+      projectContext,
+      projectCodeContext,
       aiQuotaContext,
     });
     aiQuotaContext.providerUsefulResponse = true;
@@ -1558,7 +1794,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     const { projectId } = req.body;
     const history = parseOptionalJson(req.body.history, req.body.history);
     const messages = parseOptionalJson(req.body.messages, req.body.messages);
-    const effectiveHistory = history || messages;
+    let effectiveHistory = history || messages;
     const imageAttachment = buildImageAttachment(getUploadedImage(req));
     const rawMessage = typeof req.body.message === 'string' ? req.body.message : '';
     const safeImageMetadata = buildImageMetadata(imageAttachment);
@@ -1572,6 +1808,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     let projectCodeContext = '';
     let projectVisualContext = '';
     let userMessage = null;
+    let sessionUserMessage = null;
     let changeRequest = null;
     const trimmedMessage = rawMessage.trim() || getDefaultImagePrompt(req);
 
@@ -1597,18 +1834,59 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         return res.status(404).json({ message: 'Projeto não encontrado.' });
       }
 
-      const latestBuild = await ProjectBuild.findOne({
-        projectId: project._id,
-        status: { $in: ['draft', 'done'] },
-      })
-        .sort({ createdAt: -1, _id: -1 })
-        .select(VISUAL_CONTEXT_ENABLED ? 'sourceSummary indexedFiles sourceFiles previewUrl' : 'sourceSummary indexedFiles sourceFiles')
-        .lean();
-      projectCodeContext = buildProjectCodeContext(latestBuild, trimmedMessage);
+      const currentSnapshot = await createCurrentProjectSnapshot(project);
+      const snapshotContext = currentSnapshot.promptBlock;
+      const codeContext = buildProjectCodeContext(currentSnapshot.build, trimmedMessage);
+      projectCodeContext = [snapshotContext, codeContext].filter(Boolean).join('\n\n');
       projectVisualContext = [
-        reserveProjectVisualContext(latestBuild),
+        reserveProjectVisualContext(currentSnapshot.build),
         imageVisualContext,
       ].filter(Boolean).join('\n\n');
+      effectiveHistory = await loadProjectMessageHistory(project._id);
+
+      if (!currentSnapshot.available && isProjectInspectionQuestion(trimmedMessage)) {
+        const reply = 'Não consegui inspecionar o snapshot atual do projeto, então não vou inventar o que aparece na home.';
+        userMessage = await ProjectMessage.create({
+          projectId: project._id,
+          role: 'user',
+          content: trimmedMessage,
+          metadata: {
+            source: 'api_chat',
+            userId: req.userId,
+            ...(safeImageMetadata || {}),
+          },
+        });
+        await ProjectMessage.create({
+          projectId: project._id,
+          role: 'assistant',
+          content: reply,
+          metadata: {
+            source: 'api_chat',
+            userId: req.userId,
+            readyForWizard: false,
+            needsClarification: false,
+            mode: CHAT_MODE,
+            status: null,
+            options: [],
+            requiredConnectors: [],
+            ...(safeImageMetadata || {}),
+          },
+        });
+
+        return res.json({
+          success: true,
+          reply,
+          mode: CHAT_MODE,
+          readyForWizard: false,
+          needsClarification: false,
+          status: null,
+          generationStatus: null,
+          generation_status: null,
+          options: [],
+          requiredConnectors: [],
+          changeRequest: null,
+        });
+      }
 
       const willCallAiProvider = imageAttachment
         || !isCompleteFirstBuildPrompt(trimmedMessage, effectiveHistory, project);
@@ -1641,6 +1919,17 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       });
     } else {
       projectVisualContext = imageVisualContext;
+      const sessionHistory = await loadSessionMessageHistory(req);
+      effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
+      sessionUserMessage = await createSessionChatMessage(req, {
+        role: 'user',
+        content: trimmedMessage,
+        metadata: {
+          source: 'api_chat',
+          userId: req.userId,
+          ...(safeImageMetadata || {}),
+        },
+      });
     }
 
     const aiReply = await getAiReply({
@@ -1693,6 +1982,23 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         };
         await changeRequest.save();
       }
+    } else {
+      await createSessionChatMessage(req, {
+        role: 'assistant',
+        content: aiReply.reply,
+        metadata: {
+          source: 'api_chat',
+          userId: req.userId,
+          userMessageId: sessionUserMessage?._id || null,
+          readyForWizard: Boolean(aiReply.readyForWizard),
+          needsClarification: Boolean(aiReply.needsClarification),
+          mode: aiReply.mode || CHAT_MODE,
+          status: aiReply.status || null,
+          options: aiReply.options || [],
+          requiredConnectors,
+          ...(safeImageMetadata || {}),
+        },
+      });
     }
 
     const responsePayload = {

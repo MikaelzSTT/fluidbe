@@ -5,8 +5,13 @@ const jwt = require('jsonwebtoken');
 const Module = require('module');
 const test = require('node:test');
 
+const ChatMessage = require('../models/ChatMessage');
 const Session = require('../models/Session');
 const User = require('../models/User');
+const Project = require('../models/Project');
+const ProjectBuild = require('../models/ProjectBuild');
+const ProjectChangeRequest = require('../models/ProjectChangeRequest');
+const ProjectMessage = require('../models/ProjectMessage');
 const rateLimit = require('../middleware/rateLimit');
 
 const ORIGINAL_MODULE_LOAD = Module._load;
@@ -126,21 +131,29 @@ function clearRouteModules() {
 function createAnthropicMock(providerState) {
   return function AnthropicMock() {
     this.messages = {
-      create: async () => {
+      create: async (request) => {
         providerState.calls += 1;
+        providerState.requests = providerState.requests || [];
+        providerState.requests.push(request);
 
         if (providerState.error) {
           throw providerState.error;
         }
 
+        const result = providerState.resultFromRequest
+          ? providerState.resultFromRequest(request)
+          : {
+              action: 'chat',
+              reply: providerState.replyFromRequest
+                ? providerState.replyFromRequest(request)
+                : 'Resposta mockada do provider.',
+            };
+
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                action: 'chat',
-                reply: 'Resposta mockada do provider.',
-              }),
+              text: JSON.stringify(result),
             },
           ],
         };
@@ -190,7 +203,38 @@ function createRequest(app, token, body, headers = {}) {
   });
 }
 
-async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, fn) {
+function createFindManyChain(docs) {
+  const chain = {
+    docs: [...docs],
+    sort(sortSpec) {
+      const fields = Object.entries(sortSpec || {});
+      this.docs = [...this.docs].sort((left, right) => {
+        for (const [field, order] of fields) {
+          const leftValue = field === '_id' ? String(left._id || '') : new Date(left[field] || 0).getTime();
+          const rightValue = field === '_id' ? String(right._id || '') : new Date(right[field] || 0).getTime();
+          if (leftValue === rightValue) continue;
+          return order < 0 ? (rightValue > leftValue ? 1 : -1) : (leftValue > rightValue ? 1 : -1);
+        }
+        return 0;
+      });
+      return this;
+    },
+    limit(count) {
+      this.docs = this.docs.slice(0, count);
+      return this;
+    },
+    select() {
+      return this;
+    },
+    lean() {
+      return Promise.resolve(this.docs);
+    },
+  };
+
+  return chain;
+}
+
+async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', sessionMessages = null }, fn) {
   const previousEnv = {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     JWT_SECRET: process.env.JWT_SECRET,
@@ -198,6 +242,8 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
     PUBLIC_BEARER_AUTH_LEGACY_ENABLED: process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED,
   };
   const previousLoad = Module._load;
+  const previousChatFind = ChatMessage.find;
+  const previousChatCreate = ChatMessage.create;
   const previousFindOne = Session.findOne;
   const previousFindById = User.findById;
   const previousRedisProvider = rateLimit.getConnectedRedisClient;
@@ -205,6 +251,7 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
   const previousConsoleWarn = console.warn;
   const previousConsoleError = console.error;
   const errorLogs = [];
+  const storedSessionMessages = Array.isArray(sessionMessages) ? sessionMessages : [];
 
   process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
   process.env.JWT_SECRET = 'test-jwt-secret';
@@ -215,6 +262,21 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
   User.findById = () => ({
     select: async (fields) => (String(fields).includes('plan') ? { plan: userPlan } : { deletedAt: null }),
   });
+  ChatMessage.find = (query = {}) => createFindManyChain(storedSessionMessages.filter((message) => {
+    if (query.userId && String(message.userId) !== String(query.userId)) return false;
+    if (query.sessionId && String(message.sessionId) !== String(query.sessionId)) return false;
+    if (query.role?.$in && !query.role.$in.includes(message.role)) return false;
+    return true;
+  }));
+  ChatMessage.create = async (payload) => {
+    const message = {
+      _id: `chat-message-${storedSessionMessages.length + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 22, 12, storedSessionMessages.length)),
+      ...payload,
+    };
+    storedSessionMessages.push(message);
+    return message;
+  };
   rateLimit.getConnectedRedisClient = async () => redis;
   console.info = () => {};
   console.warn = () => {};
@@ -237,7 +299,7 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
     app.use('/api/chat', chatRoutes);
     const token = jwt.sign({ id: '64b7f0f0f0f0f0f0f0f0f0f0', jti: 'session-jti' }, process.env.JWT_SECRET, { algorithm: 'HS256' });
 
-    await fn({ app, token, errorLogs });
+    await fn({ app, token, errorLogs, sessionMessages: storedSessionMessages });
   } finally {
     process.env.ANTHROPIC_API_KEY = previousEnv.ANTHROPIC_API_KEY;
     process.env.JWT_SECRET = previousEnv.JWT_SECRET;
@@ -245,6 +307,8 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
     else process.env.NODE_ENV = previousEnv.NODE_ENV;
     if (previousEnv.PUBLIC_BEARER_AUTH_LEGACY_ENABLED === undefined) delete process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED;
     else process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED = previousEnv.PUBLIC_BEARER_AUTH_LEGACY_ENABLED;
+    ChatMessage.find = previousChatFind;
+    ChatMessage.create = previousChatCreate;
     Session.findOne = previousFindOne;
     User.findById = previousFindById;
     rateLimit.getConnectedRedisClient = previousRedisProvider;
@@ -322,4 +386,398 @@ test('POST /api/chat: Redis indisponível segue fallback e não retorna 500 no c
     assert.equal(response.body.success, true);
     assert.equal(providerState.calls, 1);
   });
+});
+
+function mockFindOne(docs) {
+  return (query = {}) => {
+    const matches = docs.filter((doc) => {
+      if (query._id && String(doc._id) !== String(query._id)) return false;
+      if (query.projectId && String(doc.projectId) !== String(query.projectId)) return false;
+      if (query.userId && String(doc.userId) !== String(query.userId)) return false;
+      if (query.status) {
+        if (query.status.$in && !query.status.$in.includes(doc.status)) return false;
+        else if (!query.status.$in && doc.status !== query.status) return false;
+      }
+      return true;
+    });
+    const chain = {
+      docs: matches,
+      sort(sortSpec) {
+        const [[field, order]] = Object.entries(sortSpec || { createdAt: -1 });
+        this.docs = [...this.docs].sort((left, right) => {
+          const leftValue = new Date(left[field] || 0).getTime();
+          const rightValue = new Date(right[field] || 0).getTime();
+          return order < 0 ? rightValue - leftValue : leftValue - rightValue;
+        });
+        return this;
+      },
+      select() {
+        return this;
+      },
+      lean() {
+        return Promise.resolve(this.docs[0] || null);
+      },
+      then(resolve, reject) {
+        return Promise.resolve(this.docs[0] || null).then(resolve, reject);
+      },
+    };
+    return chain;
+  };
+}
+
+test('POST /api/chat: usa snapshot do projeto atual e ignora histórico de outro projeto com cookie auth', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const projectAId = '64f0000000000000000000a1';
+  const projectBId = '64f0000000000000000000b2';
+  const buildAId = '64f0000000000000000000c3';
+  const providerState = {
+    calls: 0,
+    replyFromRequest(request) {
+      assert.match(request.system, /CURRENT PROJECT SNAPSHOT/);
+      assert.match(request.system, /TasteFlow/);
+      assert.match(request.system, /Fresh bowls/);
+      assert.doesNotMatch(request.system, /MealHub/);
+      assert.doesNotMatch(request.system, /OPENAI_API_KEY|sk-proj/);
+      assert.equal(JSON.stringify(request.messages).includes('MealHub'), false);
+      return 'Na home vejo TasteFlow, Fresh bowls e o botão Start order.';
+    },
+  };
+  const previousProjectFindOne = Project.findOne;
+  const previousBuildFindOne = ProjectBuild.findOne;
+  const previousMessageFind = ProjectMessage.find;
+  const previousMessageCreate = ProjectMessage.create;
+  const previousChangeCreate = ProjectChangeRequest.create;
+  const previousCookieEnabled = process.env.PUBLIC_COOKIE_AUTH_ENABLED;
+  const previousCookieName = process.env.PUBLIC_COOKIE_NAME;
+  const createdMessages = [];
+
+  Project.findOne = mockFindOne([
+    { _id: projectAId, userId, name: 'TasteFlow', appName: 'TasteFlow', latestPublishedBuildId: buildAId },
+    { _id: projectBId, userId, name: 'MealHub', appName: 'MealHub' },
+  ]);
+  ProjectBuild.findOne = mockFindOne([
+    {
+      _id: buildAId,
+      projectId: projectAId,
+      type: 'react_vite',
+      status: 'done',
+      fullHtml: '<!doctype html><html><head><title>TasteFlow</title></head><body><nav>Menu Pricing</nav><main><h1>TasteFlow</h1><p>Fresh bowls for busy teams.</p><button>Start order</button></main></body></html>',
+      artifactFiles: [],
+      indexedFiles: [
+        {
+          path: 'src/App.jsx',
+          kind: 'source',
+          size: 80,
+          excerpt: 'const OPENAI_API_KEY="sk-proj-secretvalue123456789";',
+        },
+      ],
+      createdAt: new Date('2026-07-20T10:00:00Z'),
+      updatedAt: new Date('2026-07-20T10:00:00Z'),
+    },
+  ]);
+  ProjectMessage.find = () => ({
+    sort() { return this; },
+    limit() { return this; },
+    select() { return this; },
+    lean: async () => [
+      { role: 'user', content: 'Historico real do TasteFlow', createdAt: new Date('2026-07-20T11:00:00Z') },
+    ],
+  });
+  ProjectMessage.create = async (payload) => {
+    createdMessages.push(payload);
+    return { _id: `message-${createdMessages.length}`, ...payload };
+  };
+  ProjectChangeRequest.create = async (payload) => ({
+    _id: 'change-request-id',
+    ...payload,
+    save: async function save() { return this; },
+  });
+  process.env.PUBLIC_COOKIE_AUTH_ENABLED = 'true';
+  process.env.PUBLIC_COOKIE_NAME = '__Host-fluid_session';
+
+  try {
+    await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+      const response = await createRequest(app, token, {
+        projectId: projectAId,
+        message: 'fale tudo que está escrito na home',
+        history: [
+          { role: 'user', content: 'No projeto MealHub tinha uma home antiga.' },
+        ],
+      }, {
+        Cookie: `__Host-fluid_session=${token}`,
+        'Idempotency-Key': 'project-snapshot-cookie',
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(response.body.reply, 'Na home vejo TasteFlow, Fresh bowls e o botão Start order.');
+      assert.equal(providerState.calls, 1);
+      assert.equal(redis.reserveCalls, 1);
+      assert.equal(redis.commitCalls, 1);
+      assert.equal(createdMessages.length, 2);
+      assert.equal(createdMessages.every((message) => String(message.projectId) === projectAId), true);
+    });
+  } finally {
+    Project.findOne = previousProjectFindOne;
+    ProjectBuild.findOne = previousBuildFindOne;
+    ProjectMessage.find = previousMessageFind;
+    ProjectMessage.create = previousMessageCreate;
+    ProjectChangeRequest.create = previousChangeCreate;
+    if (previousCookieEnabled === undefined) delete process.env.PUBLIC_COOKIE_AUTH_ENABLED;
+    else process.env.PUBLIC_COOKIE_AUTH_ENABLED = previousCookieEnabled;
+    if (previousCookieName === undefined) delete process.env.PUBLIC_COOKIE_NAME;
+    else process.env.PUBLIC_COOKIE_NAME = previousCookieName;
+  }
+});
+
+test('POST /api/chat: "Superman" seguido de "pq" mantém contexto da mesma sessão e conta uma chamada real por turno', async () => {
+  const redis = new SmokeRedis();
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      if (providerState.calls === 1) {
+        assert.deepEqual(request.messages.map((message) => message.content), [
+          'fala só em uma palavra qm ganha batman ou superman',
+        ]);
+        return { action: 'chat', reply: 'Superman.' };
+      }
+
+      assert.deepEqual(request.messages.map((message) => message.role), ['user', 'assistant', 'user']);
+      assert.deepEqual(request.messages.map((message) => message.content), [
+        'fala só em uma palavra qm ganha batman ou superman',
+        'Superman.',
+        'pq',
+      ]);
+      assert.match(request.system, /follow-ups curtos/i);
+      return { action: 'chat', reply: 'Porque, em geral, ele tem força, velocidade e resistência muito acima do Batman.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages: [] }, async ({ app, token, sessionMessages }) => {
+    const first = await createRequest(app, token, {
+      message: 'fala só em uma palavra qm ganha batman ou superman',
+    }, {
+      'Idempotency-Key': 'superman-first',
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(first.body.reply, 'Superman.');
+
+    const second = await createRequest(app, token, {
+      message: 'pq',
+    }, {
+      'Idempotency-Key': 'superman-why',
+    });
+
+    assert.equal(second.status, 200);
+    assert.equal(second.body.mode, 'chat');
+    assert.equal(second.body.readyForWizard, false);
+    assert.equal(second.body.options.length, 0);
+    assert.match(second.body.reply, /Porque/);
+    assert.equal(providerState.calls, 2);
+    assert.equal(redis.reserveCalls, 2);
+    assert.equal(redis.commitCalls, 2);
+    assert.equal(sessionMessages.length, 4);
+  });
+});
+
+test('POST /api/chat: "do superman ué" referencia o turno anterior e não vira intenção de criação', async () => {
+  const redis = new SmokeRedis();
+  const sessionMessages = [
+    { _id: 'm1', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'user', content: 'fala só em uma palavra qm ganha batman ou superman', createdAt: new Date('2026-07-22T12:00:00Z') },
+    { _id: 'm2', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'assistant', content: 'Superman.', createdAt: new Date('2026-07-22T12:01:00Z') },
+    { _id: 'm3', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'user', content: 'pq', createdAt: new Date('2026-07-22T12:02:00Z') },
+    { _id: 'm4', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'assistant', content: 'Desculpe, não entendi.', createdAt: new Date('2026-07-22T12:03:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.equal(request.messages.at(-1).content, 'do superman ué');
+      assert.equal(request.messages.some((message) => message.content === 'Superman.'), true);
+      assert.equal(request.messages.some((message) => message.content === 'Desculpe, não entendi.'), true);
+      return { action: 'chat', reply: 'Entendi: você perguntou por que eu escolhi o Superman. É pela diferença de poderes físicos.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'do superman ué',
+    }, {
+      'Idempotency-Key': 'superman-reference',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.mode, 'chat');
+    assert.equal(response.body.readyForWizard, false);
+    assert.equal(response.body.needsClarification, false);
+    assert.equal(response.body.options.length, 0);
+    assert.match(response.body.reply, /Superman|poderes/);
+  });
+});
+
+test('POST /api/chat: substantivo curto isolado não dispara build intent mesmo se o classificador sugerir wizard', async () => {
+  const redis = new SmokeRedis();
+  const providerState = {
+    calls: 0,
+    resultFromRequest() {
+      return { action: 'wizard', reply: 'Vou começar a criar um projeto sobre Superman.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages: [] }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Superman',
+    }, {
+      'Idempotency-Key': 'short-noun-no-build',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.mode, 'chat');
+    assert.equal(response.body.readyForWizard, false);
+    assert.equal(response.body.status, null);
+    assert.equal(redis.reserveCalls, 1);
+    assert.equal(redis.commitCalls, 1);
+  });
+});
+
+test('POST /api/chat: histórico truncado preserva os turnos mais recentes em ordem', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const sessionMessages = Array.from({ length: 16 }, (_, index) => ({
+    _id: `history-${index}`,
+    userId,
+    sessionId: 'session-id',
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    content: `turno-${index}`,
+    createdAt: new Date(Date.UTC(2026, 6, 22, 13, index)),
+  }));
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      const contents = request.messages.map((message) => message.content);
+      assert.equal(contents.includes('turno-0'), false);
+      assert.equal(contents[0], 'turno-4');
+      assert.equal(contents.slice(-2)[0], 'turno-15');
+      assert.equal(contents.at(-1), 'pq');
+      return { action: 'chat', reply: 'Respondendo pelo contexto mais recente.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'pq',
+    }, {
+      'Idempotency-Key': 'truncated-history',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.mode, 'chat');
+    assert.equal(response.body.readyForWizard, false);
+  });
+});
+
+test('POST /api/chat: "isso" e "deixa maior" usam o histórico recente do mesmo projeto', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const projectId = '64f0000000000000000000d1';
+  const buildId = '64f0000000000000000000d2';
+  const projectMessages = [
+    { _id: 'pm1', projectId, role: 'user', content: 'qual texto principal da home?', createdAt: new Date('2026-07-22T14:00:00Z') },
+    { _id: 'pm2', projectId, role: 'assistant', content: 'O texto principal é TasteFlow.', createdAt: new Date('2026-07-22T14:01:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      const contents = request.messages.map((message) => message.content);
+
+      if (providerState.calls === 1) {
+        assert.deepEqual(contents, [
+          'qual texto principal da home?',
+          'O texto principal é TasteFlow.',
+          'isso',
+        ]);
+        return { action: 'chat', reply: 'Sim, estou falando do texto TasteFlow.' };
+      }
+
+      assert.equal(contents.includes('isso'), true);
+      assert.equal(contents.includes('Sim, estou falando do texto TasteFlow.'), true);
+      assert.equal(contents.at(-1), 'deixa maior');
+      return { action: 'wizard', reply: 'Vou aumentar o texto TasteFlow.' };
+    },
+  };
+  const previousProjectFindOne = Project.findOne;
+  const previousBuildFindOne = ProjectBuild.findOne;
+  const previousMessageFind = ProjectMessage.find;
+  const previousMessageCreate = ProjectMessage.create;
+  const previousChangeCreate = ProjectChangeRequest.create;
+
+  Project.findOne = mockFindOne([
+    { _id: projectId, userId, name: 'TasteFlow', appName: 'TasteFlow', latestPublishedBuildId: buildId },
+  ]);
+  ProjectBuild.findOne = mockFindOne([
+    {
+      _id: buildId,
+      projectId,
+      type: 'html',
+      status: 'done',
+      fullHtml: '<main><h1>TasteFlow</h1><p>Fresh bowls.</p></main>',
+      artifactFiles: [],
+      indexedFiles: [],
+      createdAt: new Date('2026-07-22T13:00:00Z'),
+      updatedAt: new Date('2026-07-22T13:00:00Z'),
+    },
+  ]);
+  ProjectMessage.find = (query = {}) => createFindManyChain(projectMessages.filter((message) => (
+    String(message.projectId) === String(query.projectId) &&
+    (!query.role?.$in || query.role.$in.includes(message.role))
+  )));
+  ProjectMessage.create = async (payload) => {
+    const message = {
+      _id: `pm-created-${projectMessages.length + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 22, 14, projectMessages.length + 1)),
+      ...payload,
+    };
+    projectMessages.push(message);
+    return message;
+  };
+  ProjectChangeRequest.create = async (payload) => ({
+    _id: `cr-${providerState.calls}`,
+    ...payload,
+    save: async function save() { return this; },
+  });
+
+  try {
+    await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+      const first = await createRequest(app, token, {
+        projectId,
+        message: 'isso',
+      }, {
+        'Idempotency-Key': 'project-isso',
+      });
+
+      assert.equal(first.status, 200);
+      assert.equal(first.body.mode, 'chat');
+      assert.equal(first.body.readyForWizard, false);
+      assert.equal(first.body.options.length, 0);
+
+      const second = await createRequest(app, token, {
+        projectId,
+        message: 'deixa maior',
+      }, {
+        'Idempotency-Key': 'project-deixa-maior',
+      });
+
+      assert.equal(second.status, 200);
+      assert.equal(second.body.mode, 'wizard');
+      assert.equal(second.body.readyForWizard, true);
+      assert.equal(second.body.options.length, 0);
+      assert.match(second.body.reply, /TasteFlow/);
+    });
+  } finally {
+    Project.findOne = previousProjectFindOne;
+    ProjectBuild.findOne = previousBuildFindOne;
+    ProjectMessage.find = previousMessageFind;
+    ProjectMessage.create = previousMessageCreate;
+    ProjectChangeRequest.create = previousChangeCreate;
+  }
 });

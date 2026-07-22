@@ -34,6 +34,7 @@ const {
   scanBuildSecurity: scanBuildSecurityShared,
   withAbsoluteBuildUrls: withAbsoluteBuildUrlsShared,
 } = require('../utils/projectPublication');
+const { invalidateProjectSnapshotCache } = require('../utils/projectSnapshot');
 const {
   buildPreviewUrl,
   isBuildUrlLike,
@@ -3210,6 +3211,7 @@ router.post(
       });
       build.buildJobId = job._id;
       await build.save();
+      invalidateProjectSnapshotCache(project._id);
 
       await Project.findByIdAndUpdate(
         project._id,
@@ -3321,6 +3323,7 @@ router.post(
       await publishValidatedDist(extractedDistDir, publicBuildDir);
       await build.save();
       buildSaved = true;
+      invalidateProjectSnapshotCache(project._id);
 
       await Project.findByIdAndUpdate(
         project._id,
@@ -3395,6 +3398,7 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
       projectId: project._id,
       ...pickBuildPayload(req.body),
     });
+    invalidateProjectSnapshotCache(project._id);
 
     return res.status(201).json({
       success: true,

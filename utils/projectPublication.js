@@ -16,6 +16,7 @@ const {
   parseBuildPathFromUrl,
   toDedicatedPreviewUrl,
 } = require('./previewOrigin');
+const { invalidateProjectSnapshotCache } = require('./projectSnapshot');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
@@ -607,6 +608,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
       req,
       projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.deployUrl || projectBuild.distUrl || ''
     );
+    invalidateProjectSnapshotCache(project._id);
 
     return {
       alreadyPublished: true,
@@ -705,6 +707,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
     runValidators: true,
   });
   const publicUrl = publishedProject.publicUrl || (publishedProject.deploy && publishedProject.deploy.url) || '';
+  invalidateProjectSnapshotCache(project._id);
 
   return {
     alreadyPublished: false,

@@ -15,6 +15,7 @@ const {
 } = require('../utils/connectorInjection');
 const { createSourceContext } = require('../utils/sourceContext');
 const { generateFallbackAppName } = require('../utils/projectNaming');
+const { invalidateProjectSnapshotCache } = require('../utils/projectSnapshot');
 const { buildPreviewUrl } = require('../utils/previewOrigin');
 const { reactViteBuildHelpers } = require('../routes/adminRoutes');
 
@@ -241,6 +242,7 @@ async function runBuildPipeline(job, workspace) {
     } else if (build.status !== 'done') {
       throw new Error(`ProjectBuild está em estado inesperado: ${build.status}.`);
     }
+    invalidateProjectSnapshotCache(job.projectId);
 
     await bucket.delete(job.sourceGridFsFileId);
     sourceZipDeleted = true;

@@ -620,6 +620,7 @@ module.exports = {
   buildProjectFileTree,
   getProjectFileMetadata,
   isLikelyTextBuffer,
+  isProjectFileSensitive,
   parsePublicBuildUrl,
   resolveProjectArtifactFile,
   resolveProjectFilePath,
