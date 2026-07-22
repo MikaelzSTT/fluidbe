@@ -6,6 +6,7 @@ const ChatMessage = require('../models/ChatMessage');
 const Project = require('../models/Project');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
+const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
 const { createRateLimit, getClientIp } = require('../middleware/rateLimit');
 const {
@@ -40,6 +41,11 @@ const {
   persistBriefingSession,
   sendBriefingSessionExpired,
 } = require('../utils/briefingSessions');
+const {
+  getResponseLanguageName,
+  normalizeLanguageCode,
+  resolveResponseLanguage,
+} = require('../utils/responseLanguage');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
@@ -69,7 +75,41 @@ const BUILD_NOW_MODE = 'build_now';
 const WIZARD_MODE = 'wizard';
 const CLARIFY_MODE = 'clarify';
 const CHAT_MODE = 'chat';
-const BUILD_NOW_REPLY = 'Perfeito - vou começar a construir agora.';
+const CHAT_COPY = Object.freeze({
+  en: {
+    buildNowReply: "Perfect - I'll start building now.",
+    clarifyReply: "I'll ask a few quick questions to better understand the project.",
+    minimumBriefingCompleteReply: "The minimum briefing is complete. I'll start creating it.",
+    continuationReply: "Got it. You're continuing the previous conversation, so I'll answer based on that.",
+    themeOrProjectQuestion: 'Do you want to talk about this, or create a project with this theme?',
+    imageClarifyReply: 'I will use the image as a reference. Do you want me to follow the visual identity, recreate the screen layout, or turn the idea into a complete app?',
+    imageClarifyOptions: ['Follow the visual identity', 'Recreate the layout', 'Create a complete app'],
+    snapshotUnavailableReply: "I couldn't inspect the current project snapshot, so I won't invent what appears on the home page.",
+    incompleteBriefingMessage: 'Complete the minimum briefing before building the project.',
+  },
+  pt: {
+    buildNowReply: 'Perfeito - vou começar a construir agora.',
+    clarifyReply: 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.',
+    minimumBriefingCompleteReply: 'O briefing mínimo está completo. Vou iniciar a criação.',
+    continuationReply: 'Entendi. Você está continuando a conversa anterior; vou responder com base nela.',
+    themeOrProjectQuestion: 'Você quer falar sobre isso ou quer criar algum projeto com esse tema?',
+    imageClarifyReply: 'Vou usar a imagem como referência. Você quer que eu siga mais a identidade visual, o layout da tela ou transforme a ideia em um app completo?',
+    imageClarifyOptions: ['Seguir a identidade visual', 'Recriar o layout', 'Criar um app completo'],
+    snapshotUnavailableReply: 'Não consegui inspecionar o snapshot atual do projeto, então não vou inventar o que aparece na home.',
+    incompleteBriefingMessage: 'Complete o briefing mínimo antes de construir o projeto.',
+  },
+  es: {
+    buildNowReply: 'Perfecto - empezaré a construir ahora.',
+    clarifyReply: 'Haré algunas preguntas rápidas para entender mejor el proyecto.',
+    minimumBriefingCompleteReply: 'El briefing mínimo está completo. Empezaré la creación.',
+    continuationReply: 'Entendido. Estás continuando la conversación anterior, así que responderé con base en ella.',
+    themeOrProjectQuestion: '¿Quieres hablar sobre esto o crear un proyecto con este tema?',
+    imageClarifyReply: 'Usaré la imagen como referencia. ¿Quieres que siga la identidad visual, recree el layout de la pantalla o convierta la idea en una app completa?',
+    imageClarifyOptions: ['Seguir la identidad visual', 'Recrear el layout', 'Crear una app completa'],
+    snapshotUnavailableReply: 'No pude inspeccionar el snapshot actual del proyecto, así que no inventaré lo que aparece en la home.',
+    incompleteBriefingMessage: 'Completa el briefing mínimo antes de construir el proyecto.',
+  },
+});
 const SAFE_CHAT_ERROR_STAGES = new Set([
   'quota_reserve',
   'provider_call',
@@ -253,14 +293,7 @@ function parseOptionalJson(value, fallback) {
 }
 
 function normalizeRequestLanguage(value) {
-  const normalized = String(value || '')
-    .trim()
-    .toLowerCase()
-    .slice(0, 8);
-
-  if (normalized.startsWith('pt')) return 'pt';
-  if (normalized.startsWith('es')) return 'es';
-  return 'en';
+  return normalizeLanguageCode(value) || 'en';
 }
 
 function getRequestLanguage(req) {
@@ -275,6 +308,47 @@ function getRequestLanguage(req) {
 function getDefaultImagePrompt(req) {
   const language = getRequestLanguage(req);
   return IMAGE_ONLY_DEFAULT_PROMPTS[language] || IMAGE_ONLY_DEFAULT_PROMPTS.en;
+}
+
+function getChatCopy(language) {
+  return CHAT_COPY[normalizeLanguageCode(language)] || CHAT_COPY.en;
+}
+
+async function getAccountLanguagePreference(req) {
+  if (!req.userId) {
+    return '';
+  }
+
+  try {
+    const userQuery = User.findById(req.userId);
+    const user = typeof userQuery?.select === 'function'
+      ? await userQuery.select('preferences.language')
+      : await userQuery;
+
+    return user?.preferences?.language || '';
+  } catch (error) {
+    return '';
+  }
+}
+
+async function resolveChatResponseLanguage(req, { message, history, project } = {}) {
+  const accountLanguage = await getAccountLanguagePreference(req);
+
+  return resolveResponseLanguage({
+    message,
+    history,
+    accountLanguage,
+    projectLanguage: project?.settings?.language,
+  });
+}
+
+function buildResponseLanguageInstruction(responseLanguage) {
+  return [
+    `RESPONSE LANGUAGE: ${getResponseLanguageName(responseLanguage)}`,
+    'All user-facing reply and options text must use RESPONSE LANGUAGE, unless the latest user message explicitly requested another language; that request is already reflected in RESPONSE LANGUAGE.',
+    'Do not choose the response language from the project name, interface locale, old saved prompts, user metadata, or project metadata.',
+    'Do not translate proper names, brands, or project content automatically.',
+  ].join('\n');
 }
 
 function getUploadedImage(req) {
@@ -855,12 +929,15 @@ function filterNewRequiredConnectors(project, detectedConnectors) {
   return newConnectors;
 }
 
-function buildDecisionSystemPrompt(projectContext, hasProjectContext = false, projectCodeContext = '', projectVisualContext = '') {
+function buildDecisionSystemPrompt(projectContext, hasProjectContext = false, projectCodeContext = '', projectVisualContext = '', responseLanguage = 'en') {
   const buildContext = [projectCodeContext, projectVisualContext].filter(Boolean).join('\n\n');
   const hasUploadedImageContext = projectVisualContext.includes('Imagem anexada pelo usuario:');
+  const copy = getChatCopy(responseLanguage);
 
   return `
-Voce e a IA de chat da Fluid, em portugues do Brasil.
+Voce e a IA de chat da Fluid.
+
+${buildResponseLanguageInstruction(responseLanguage)}
 
 Sua tarefa e orquestrar uma conversa e decidir se o sistema deve iniciar o wizard de criacao ou pedir clarificacao.
 
@@ -901,9 +978,9 @@ Antes de classificar a mensagem atual, considere a mensagem anterior do usuario 
 
 Quando action for "wizard", reply deve ser uma frase natural, curta e sem pergunta, dizendo que voce vai iniciar a criacao. Nao use texto fixo.
 
-Quando action for "clarify", reply deve ser exatamente: "Vou fazer algumas perguntas rápidas para entender melhor o projeto."
+Quando action for "clarify", reply deve ser exatamente: "${copy.clarifyReply}"
 
-Quando action for "chat", reply deve ser natural, util e breve. Nao use respostas fixas de "nao entendi".
+Quando action for "chat", reply deve ser natural, util e breve em RESPONSE LANGUAGE. Nao use respostas fixas de "nao entendi".
 
 Quando action for "chat" e reply for uma pergunta, gere tambem options com 2 a 4 respostas curtas que o usuario poderia escolher.
 Quando action for "chat" e reply nao for uma pergunta, options deve ser [].
@@ -928,13 +1005,15 @@ Retorne somente JSON valido, sem markdown, sem texto antes ou depois, no formato
 `.trim();
 }
 
-function buildFallbackSystemPrompt(projectContext, projectCodeContext = '', projectVisualContext = '') {
+function buildFallbackSystemPrompt(projectContext, projectCodeContext = '', projectVisualContext = '', responseLanguage = 'en') {
   const buildContext = [projectCodeContext, projectVisualContext].filter(Boolean).join('\n\n');
 
   return `
-Voce e a IA de chat da Fluid, em portugues do Brasil.
+Voce e a IA de chat da Fluid.
 
-Responda de forma natural, breve e util. Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos.
+${buildResponseLanguageInstruction(responseLanguage)}
+
+Responda de forma natural, breve e util em RESPONSE LANGUAGE. Nao gere codigo, HTML, CSS ou JS. Nao crie arquivos.
 Nunca peca API key, token, senha ou secret no chat.
 Quando houver um bloco CURRENT PROJECT SNAPSHOT, trate-o como a fonte autoritativa do projeto aberto. Se o usuario perguntar o que existe/esta escrito na home ou preview, descreva apenas textos, botoes, navegacao e estrutura presentes nesse snapshot. Se o snapshot disser que nao ha conteudo visivel acessivel, responda que nao conseguiu inspecionar o projeto em vez de inventar.
 
@@ -1025,7 +1104,7 @@ function isQuestion(text) {
     return true;
   }
 
-  return /^(qual|quais|quem|quando|onde|como|por que|porque|o que|que|voce quer|você quer|pode me dizer|me diga|me conta)\b/i.test(
+  return /^(qual|quais|quem|quando|onde|como|por que|porque|o que|que|voce quer|você quer|pode me dizer|me diga|me conta|what|which|who|when|where|how|why|do you want|can you tell me|tell me|que|cual|cuál|quien|quién|cuando|cuándo|donde|dónde|como|cómo|por que|por qué)\b/i.test(
     normalized
   );
 }
@@ -1400,9 +1479,10 @@ async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700, ai
 
 async function getFallbackChatReply({
   message, previousMessages, projectContext, projectCodeContext, projectVisualContext, imageAttachment, aiQuotaContext,
+  responseLanguage = 'en',
 }) {
   const messages = [
-    { role: 'system', content: buildFallbackSystemPrompt(projectContext, projectCodeContext, projectVisualContext) },
+    { role: 'system', content: buildFallbackSystemPrompt(projectContext, projectCodeContext, projectVisualContext, responseLanguage) },
     ...previousMessages,
     { role: 'user', content: message },
   ];
@@ -1431,10 +1511,11 @@ async function getFallbackChatReply({
 
 async function getAiReply({
   message, history, project, projectCodeContext = '', projectVisualContext = '', imageAttachment, aiQuotaContext,
-  briefingInput = {},
+  briefingInput = {}, responseLanguage = 'en',
 }) {
   const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
+  const copy = getChatCopy(responseLanguage);
   const conversationalFollowUp = isLikelyConversationalFollowUp(message, previousMessages);
   const explicitBuildOrEditIntent = hasExplicitBuildOrEditIntent(message, Boolean(project));
   const briefingEvaluation = project
@@ -1466,7 +1547,7 @@ async function getAiReply({
     });
 
     return {
-      reply: BUILD_NOW_REPLY,
+      reply: copy.buildNowReply,
       readyForWizard: true,
       needsClarification: false,
       options: [],
@@ -1487,7 +1568,7 @@ async function getAiReply({
   const decisionMessages = [
     {
       role: 'system',
-      content: buildDecisionSystemPrompt(projectContext, Boolean(project), projectCodeContext, projectVisualContext),
+      content: buildDecisionSystemPrompt(projectContext, Boolean(project), projectCodeContext, projectVisualContext, responseLanguage),
     },
     ...previousMessages,
     { role: 'user', content: message },
@@ -1507,12 +1588,12 @@ async function getAiReply({
 
     if (conversationalFollowUp && !explicitBuildOrEditIntent && action !== 'chat') {
       action = 'chat';
-      reply = 'Entendi. Você está continuando a conversa anterior; vou responder com base nela.';
+      reply = copy.continuationReply;
     }
 
     if (!project && !explicitBuildOrEditIntent && action === 'wizard') {
       action = 'chat';
-      reply = 'Você quer falar sobre isso ou quer criar algum projeto com esse tema?';
+      reply = copy.themeOrProjectQuestion;
     }
 
     if (!project && explicitBuildOrEditIntent) {
@@ -1520,10 +1601,10 @@ async function getAiReply({
         action = 'wizard';
         reply = reply && action === String(parsed.action || '').trim().toLowerCase()
           ? reply
-          : 'O briefing mínimo está completo. Vou iniciar a criação.';
+          : copy.minimumBriefingCompleteReply;
       } else {
         action = 'clarify';
-        reply = 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.';
+        reply = copy.clarifyReply;
       }
     }
 
@@ -1533,7 +1614,7 @@ async function getAiReply({
     if (firstPromptNoContext && action === 'wizard' && isVagueCreationPrompt(normalizedBuildText)) {
       action = isGreetingPrompt(normalizedBuildText) ? 'chat' : 'clarify';
       reply = action === 'clarify'
-        ? 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
+        ? copy.clarifyReply
         : reply;
     }
 
@@ -1543,20 +1624,16 @@ async function getAiReply({
       action = 'chat';
       if (
         !reply ||
-        reply === 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
+        reply === copy.clarifyReply
       ) {
-        reply = 'Vou usar a imagem como referência. Você quer que eu siga mais a identidade visual, o layout da tela ou transforme a ideia em um app completo?';
+        reply = copy.imageClarifyReply;
       }
-      forcedImageClarifyOptions = [
-        'Seguir a identidade visual',
-        'Recriar o layout',
-        'Criar um app completo',
-      ];
+      forcedImageClarifyOptions = copy.imageClarifyOptions;
     }
 
     if (!project && briefingEvaluation.active && !briefingEvaluation.complete) {
       action = 'clarify';
-      reply = 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.';
+      reply = copy.clarifyReply;
       forcedImageClarifyOptions = null;
     }
 
@@ -1583,7 +1660,7 @@ async function getAiReply({
     return {
       reply:
         action === 'clarify'
-          ? 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.'
+          ? copy.clarifyReply
           : reply,
       readyForWizard,
       needsClarification: action === 'clarify',
@@ -1608,8 +1685,8 @@ async function getAiReply({
       if (!project && explicitBuildOrEditIntent) {
         return {
           reply: briefingEvaluation.complete
-            ? 'O briefing mínimo está completo. Vou iniciar a criação.'
-            : 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.',
+            ? copy.minimumBriefingCompleteReply
+            : copy.clarifyReply,
           readyForWizard: briefingEvaluation.complete,
           needsClarification: !briefingEvaluation.complete,
           options: [],
@@ -1635,6 +1712,7 @@ async function getAiReply({
         projectVisualContext,
         imageAttachment,
         aiQuotaContext,
+        responseLanguage,
       });
     }
 
@@ -1707,6 +1785,11 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
       }
     }
 
+    const responseLanguage = await resolveChatResponseLanguage(req, {
+      message: message.trim(),
+      history: effectiveHistory,
+      project,
+    });
     const briefingEvaluation = evaluateProjectBriefing({
       ...req.body,
       briefing: {
@@ -1719,7 +1802,7 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
     const briefingSummary = buildBriefingSummary(briefingEvaluation.briefing);
     const questions = briefingEvaluation.complete
       ? []
-      : buildBriefingQuestions(briefingEvaluation);
+      : buildBriefingQuestions(briefingEvaluation, 4, responseLanguage);
     const persistedBriefingSession = newProjectFlow
       ? await persistBriefingSession(req, {
           ...briefingEvaluation,
@@ -1775,6 +1858,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     let changeRequest = null;
     let savedBriefingSession = null;
     let persistedBriefingSession = null;
+    let responseLanguage = null;
     const trimmedMessage = rawMessage.trim() || getDefaultImagePrompt(req);
     const buildProjectAction = isBuildProjectAction(req.body, trimmedMessage);
     const newProjectFlow = isNewProjectFlow(req.body)
@@ -1811,9 +1895,14 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         imageVisualContext,
       ].filter(Boolean).join('\n\n');
       effectiveHistory = await loadProjectMessageHistory(project._id);
+      responseLanguage = await resolveChatResponseLanguage(req, {
+        message: trimmedMessage,
+        history: effectiveHistory,
+        project,
+      });
 
       if (!currentSnapshot.available && isProjectInspectionQuestion(trimmedMessage)) {
-        const reply = 'Não consegui inspecionar o snapshot atual do projeto, então não vou inventar o que aparece na home.';
+        const reply = getChatCopy(responseLanguage).snapshotUnavailableReply;
         userMessage = await ProjectMessage.create({
           projectId: project._id,
           role: 'user',
@@ -1889,6 +1978,11 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       projectVisualContext = imageVisualContext;
       const sessionHistory = await loadSessionMessageHistory(req);
       effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
+      responseLanguage = await resolveChatResponseLanguage(req, {
+        message: trimmedMessage,
+        history: effectiveHistory,
+        project: null,
+      });
 
       if (buildProjectAction) {
         savedBriefingSession = await findBriefingSession(req, { includeCompleted: true });
@@ -1911,14 +2005,14 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         if (!briefingEvaluation.complete) {
           return res.status(422).json({
             code: 'BRIEFING_INCOMPLETE',
-            message: 'Complete o briefing mínimo antes de construir o projeto.',
+            message: getChatCopy(responseLanguage).incompleteBriefingMessage,
             briefing: briefingEvaluation.briefing,
             briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
             briefingComplete: false,
             canBuild: false,
             missingBriefingFields: briefingEvaluation.missingFields,
             invalidBriefingFields: briefingEvaluation.invalidFields,
-            questions: buildBriefingQuestions(briefingEvaluation),
+            questions: buildBriefingQuestions(briefingEvaluation, 4, responseLanguage),
             briefingSessionId: String(savedBriefingSession._id),
           });
         }
@@ -1935,9 +2029,18 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       });
     }
 
+    if (!responseLanguage) {
+      responseLanguage = await resolveChatResponseLanguage(req, {
+        message: trimmedMessage,
+        history: effectiveHistory,
+        project,
+      });
+    }
+
+    const responseCopy = getChatCopy(responseLanguage);
     const aiReply = savedBriefingSession && buildProjectAction
       ? {
-          reply: BUILD_NOW_REPLY,
+          reply: responseCopy.buildNowReply,
           readyForWizard: true,
           needsClarification: false,
           options: [],
@@ -1970,6 +2073,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
           imageAttachment,
           aiQuotaContext,
           briefingInput: req.body,
+          responseLanguage,
         });
     aiQuotaContext.providerUsefulResponse = true;
     setAiQuotaStage(aiQuotaContext, 'quota_commit');

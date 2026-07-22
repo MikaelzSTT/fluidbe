@@ -7,6 +7,126 @@ const FIELD_LABELS = Object.freeze({
   cta: 'CTA',
 });
 
+const BRIEFING_COPY = Object.freeze({
+  pt: {
+    moreDetail: 'Preciso de um pouco mais de detalhe.',
+    typeQuestion: 'Qual tipo de projeto você quer criar?',
+    typeOptions: [
+      ['landing-page', 'Landing page', 'Uma página focada em uma oferta e ação principal.'],
+      ['web-app', 'App web', 'Uma aplicação que resolve um problema ou fluxo.'],
+      ['marketplace', 'Marketplace', 'Uma plataforma que conecta compradores e vendedores.'],
+      ['portfolio', 'Portfólio', 'Uma apresentação de trabalhos e experiência.'],
+    ],
+    objectiveQuestion: 'Qual é o objetivo principal do projeto?',
+    objectiveOptions: [
+      ['vender', 'Vender', 'Gerar compras ou contratações.'],
+      ['captar_leads', 'Captar leads', 'Receber contatos ou pedidos de orçamento.'],
+      ['apresentar', 'Apresentar', 'Divulgar um negócio, trabalho ou iniciativa.'],
+      ['resolver_problema', 'Resolver um problema', 'Entregar uma ferramenta ou fluxo útil.'],
+    ],
+    mainContext: {
+      marketplace: ['O que será negociado no marketplace?', 'Ex.: equipamentos usados para restaurantes'],
+      webApp: ['Qual problema o app web deve resolver?', 'Ex.: organizar escalas de equipes de enfermagem'],
+      landingPage: ['O que você quer vender ou apresentar?', 'Ex.: cursos de inglês online para adultos'],
+      portfolio: ['De quem é o portfólio e de qual área?', 'Ex.: portfólio de Ana, fotógrafa de gastronomia'],
+      default: ['Descreva em uma frase o produto, serviço, negócio ou tema.', 'Ex.: consultoria financeira para pequenas empresas'],
+    },
+    audience: {
+      marketplace: 'Quem negocia nesse marketplace?',
+      webApp: 'Para quem o app resolve esse problema?',
+      default: 'Qual é o público-alvo ou cliente ideal?',
+      placeholder: 'Ex.: brasileiros adultos que estudam para trabalhar no exterior',
+    },
+    styleQuestion: 'Qual estilo visual deve orientar o projeto?',
+    styleOptions: [
+      ['moderno', 'Moderno', 'Visual atual, claro e objetivo.'],
+      ['minimalista', 'Minimalista', 'Poucos elementos e bastante foco no conteúdo.'],
+      ['premium', 'Premium', 'Acabamento sofisticado e alta percepção de valor.'],
+      ['divertido', 'Divertido', 'Mais cor, energia e informalidade.'],
+    ],
+    ctaQuestion: 'Qual ação principal o visitante deve realizar?',
+    ctaPlaceholder: 'Ex.: Comprar agora, Solicitar orçamento ou Agendar demonstração',
+  },
+  en: {
+    moreDetail: 'I need a little more detail.',
+    typeQuestion: 'What type of project do you want to create?',
+    typeOptions: [
+      ['landing-page', 'Landing page', 'A page focused on one offer and primary action.'],
+      ['web-app', 'Web app', 'An application that solves a problem or workflow.'],
+      ['marketplace', 'Marketplace', 'A platform that connects buyers and sellers.'],
+      ['portfolio', 'Portfolio', 'A presentation of work and experience.'],
+    ],
+    objectiveQuestion: 'What is the main goal of the project?',
+    objectiveOptions: [
+      ['vender', 'Sell', 'Generate purchases or hires.'],
+      ['captar_leads', 'Capture leads', 'Receive contacts or quote requests.'],
+      ['apresentar', 'Present', 'Promote a business, work, or initiative.'],
+      ['resolver_problema', 'Solve a problem', 'Deliver a useful tool or workflow.'],
+    ],
+    mainContext: {
+      marketplace: ['What will be traded in the marketplace?', 'Example: used equipment for restaurants'],
+      webApp: ['What problem should the web app solve?', 'Example: organizing nursing team schedules'],
+      landingPage: ['What do you want to sell or present?', 'Example: online English courses for adults'],
+      portfolio: ['Whose portfolio is it, and for what field?', 'Example: Ana, a food photographer'],
+      default: ['Describe the product, service, business, or topic in one sentence.', 'Example: financial consulting for small businesses'],
+    },
+    audience: {
+      marketplace: 'Who trades in this marketplace?',
+      webApp: 'Who does the app solve this problem for?',
+      default: 'Who is the target audience or ideal customer?',
+      placeholder: 'Example: adults studying English for work abroad',
+    },
+    styleQuestion: 'What visual style should guide the project?',
+    styleOptions: [
+      ['moderno', 'Modern', 'Current, clear, and direct visual style.'],
+      ['minimalista', 'Minimalist', 'Few elements with strong focus on the content.'],
+      ['premium', 'Premium', 'Polished execution with high perceived value.'],
+      ['divertido', 'Playful', 'More color, energy, and informality.'],
+    ],
+    ctaQuestion: 'What primary action should visitors take?',
+    ctaPlaceholder: 'Example: Buy now, Request a quote, or Schedule a demo',
+  },
+  es: {
+    moreDetail: 'Necesito un poco más de detalle.',
+    typeQuestion: '¿Qué tipo de proyecto quieres crear?',
+    typeOptions: [
+      ['landing-page', 'Landing page', 'Una página centrada en una oferta y una acción principal.'],
+      ['web-app', 'App web', 'Una aplicación que resuelve un problema o flujo.'],
+      ['marketplace', 'Marketplace', 'Una plataforma que conecta compradores y vendedores.'],
+      ['portfolio', 'Portafolio', 'Una presentación de trabajos y experiencia.'],
+    ],
+    objectiveQuestion: '¿Cuál es el objetivo principal del proyecto?',
+    objectiveOptions: [
+      ['vender', 'Vender', 'Generar compras o contrataciones.'],
+      ['captar_leads', 'Captar leads', 'Recibir contactos o solicitudes de presupuesto.'],
+      ['apresentar', 'Presentar', 'Promover un negocio, trabajo o iniciativa.'],
+      ['resolver_problema', 'Resolver un problema', 'Entregar una herramienta o flujo útil.'],
+    ],
+    mainContext: {
+      marketplace: ['¿Qué se negociará en el marketplace?', 'Ej.: equipos usados para restaurantes'],
+      webApp: ['¿Qué problema debe resolver la app web?', 'Ej.: organizar turnos de equipos de enfermería'],
+      landingPage: ['¿Qué quieres vender o presentar?', 'Ej.: cursos de inglés online para adultos'],
+      portfolio: ['¿De quién es el portafolio y de qué área?', 'Ej.: portafolio de Ana, fotógrafa gastronómica'],
+      default: ['Describe en una frase el producto, servicio, negocio o tema.', 'Ej.: consultoría financiera para pequeñas empresas'],
+    },
+    audience: {
+      marketplace: '¿Quién negocia en este marketplace?',
+      webApp: '¿Para quién resuelve este problema la app?',
+      default: '¿Cuál es el público objetivo o cliente ideal?',
+      placeholder: 'Ej.: adultos que estudian inglés para trabajar en el exterior',
+    },
+    styleQuestion: '¿Qué estilo visual debe orientar el proyecto?',
+    styleOptions: [
+      ['moderno', 'Moderno', 'Visual actual, claro y objetivo.'],
+      ['minimalista', 'Minimalista', 'Pocos elementos y mucho foco en el contenido.'],
+      ['premium', 'Premium', 'Acabado sofisticado y alta percepción de valor.'],
+      ['divertido', 'Divertido', 'Más color, energía e informalidad.'],
+    ],
+    ctaQuestion: '¿Qué acción principal debe realizar el visitante?',
+    ctaPlaceholder: 'Ej.: Comprar ahora, Solicitar presupuesto o Agendar demo',
+  },
+});
+
 const FIELD_ALIASES = Object.freeze({
   type: ['type', 'projectType', 'project_type', 'tipo', 'tipo_projeto'],
   objective: ['objective', 'goal', 'purpose', 'objetivo', 'finalidade'],
@@ -368,11 +488,15 @@ function createChoiceQuestion(field, question, options) {
   };
 }
 
-function createTextQuestion(field, question, placeholder, invalid) {
+function getBriefingCopy(language) {
+  return BRIEFING_COPY[language] || BRIEFING_COPY.pt;
+}
+
+function createTextQuestion(field, question, placeholder, invalid, copy = BRIEFING_COPY.pt) {
   return {
     id: field,
     field,
-    question: invalid ? `Preciso de um pouco mais de detalhe. ${question}` : question,
+    question: invalid ? `${copy.moreDetail} ${question}` : question,
     inputType: 'text',
     required: true,
     placeholder,
@@ -380,61 +504,54 @@ function createTextQuestion(field, question, placeholder, invalid) {
   };
 }
 
-function getMainContextQuestion(type, invalid) {
+function getMainContextQuestion(type, invalid, copy = BRIEFING_COPY.pt) {
+  const source = copy.mainContext;
+
   if (type === 'marketplace') {
-    return createTextQuestion('mainContext', 'O que será negociado no marketplace?', 'Ex.: equipamentos usados para restaurantes', invalid);
+    return createTextQuestion('mainContext', source.marketplace[0], source.marketplace[1], invalid, copy);
   }
   if (type === 'web-app') {
-    return createTextQuestion('mainContext', 'Qual problema o app web deve resolver?', 'Ex.: organizar escalas de equipes de enfermagem', invalid);
+    return createTextQuestion('mainContext', source.webApp[0], source.webApp[1], invalid, copy);
   }
   if (type === 'landing-page') {
-    return createTextQuestion('mainContext', 'O que você quer vender ou apresentar?', 'Ex.: cursos de inglês online para adultos', invalid);
+    return createTextQuestion('mainContext', source.landingPage[0], source.landingPage[1], invalid, copy);
   }
   if (type === 'portfolio') {
-    return createTextQuestion('mainContext', 'De quem é o portfólio e de qual área?', 'Ex.: portfólio de Ana, fotógrafa de gastronomia', invalid);
+    return createTextQuestion('mainContext', source.portfolio[0], source.portfolio[1], invalid, copy);
   }
-  return createTextQuestion('mainContext', 'Descreva em uma frase o produto, serviço, negócio ou tema.', 'Ex.: consultoria financeira para pequenas empresas', invalid);
+  return createTextQuestion('mainContext', source.default[0], source.default[1], invalid, copy);
 }
 
-function buildBriefingQuestions(evaluation, limit = 4) {
+function buildBriefingQuestions(evaluation, limit = 4, language = 'pt') {
+  if (typeof limit === 'string') {
+    language = limit;
+    limit = 4;
+  }
+
   const { briefing, missingFields, invalidFields } = evaluation;
   const type = normalizeProjectType(briefing.type);
+  const copy = getBriefingCopy(language);
   const questions = [];
 
   for (const field of missingFields) {
     const invalid = invalidFields.includes(field);
     if (field === 'type') {
-      questions.push(createChoiceQuestion('type', 'Qual tipo de projeto você quer criar?', [
-        ['landing-page', 'Landing page', 'Uma página focada em uma oferta e ação principal.'],
-        ['web-app', 'App web', 'Uma aplicação que resolve um problema ou fluxo.'],
-        ['marketplace', 'Marketplace', 'Uma plataforma que conecta compradores e vendedores.'],
-        ['portfolio', 'Portfólio', 'Uma apresentação de trabalhos e experiência.'],
-      ]));
+      questions.push(createChoiceQuestion('type', copy.typeQuestion, copy.typeOptions));
     } else if (field === 'objective') {
-      questions.push(createChoiceQuestion('objective', 'Qual é o objetivo principal do projeto?', [
-        ['vender', 'Vender', 'Gerar compras ou contratações.'],
-        ['captar_leads', 'Captar leads', 'Receber contatos ou pedidos de orçamento.'],
-        ['apresentar', 'Apresentar', 'Divulgar um negócio, trabalho ou iniciativa.'],
-        ['resolver_problema', 'Resolver um problema', 'Entregar uma ferramenta ou fluxo útil.'],
-      ]));
+      questions.push(createChoiceQuestion('objective', copy.objectiveQuestion, copy.objectiveOptions));
     } else if (field === 'mainContext') {
-      questions.push(getMainContextQuestion(type, invalid));
+      questions.push(getMainContextQuestion(type, invalid, copy));
     } else if (field === 'audience') {
       const question = type === 'marketplace'
-        ? 'Quem negocia nesse marketplace?'
+        ? copy.audience.marketplace
         : type === 'web-app'
-          ? 'Para quem o app resolve esse problema?'
-          : 'Qual é o público-alvo ou cliente ideal?';
-      questions.push(createTextQuestion('audience', question, 'Ex.: brasileiros adultos que estudam para trabalhar no exterior', invalid));
+          ? copy.audience.webApp
+          : copy.audience.default;
+      questions.push(createTextQuestion('audience', question, copy.audience.placeholder, invalid, copy));
     } else if (field === 'style') {
-      questions.push(createChoiceQuestion('style', 'Qual estilo visual deve orientar o projeto?', [
-        ['moderno', 'Moderno', 'Visual atual, claro e objetivo.'],
-        ['minimalista', 'Minimalista', 'Poucos elementos e bastante foco no conteúdo.'],
-        ['premium', 'Premium', 'Acabamento sofisticado e alta percepção de valor.'],
-        ['divertido', 'Divertido', 'Mais cor, energia e informalidade.'],
-      ]));
+      questions.push(createChoiceQuestion('style', copy.styleQuestion, copy.styleOptions));
     } else if (field === 'cta') {
-      questions.push(createTextQuestion('cta', 'Qual ação principal o visitante deve realizar?', 'Ex.: Comprar agora, Solicitar orçamento ou Agendar demonstração', invalid));
+      questions.push(createTextQuestion('cta', copy.ctaQuestion, copy.ctaPlaceholder, invalid, copy));
     }
   }
 

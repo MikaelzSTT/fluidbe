@@ -239,6 +239,7 @@ async function withChatRouteSmoke({
   redis,
   providerState,
   userPlan = 'free',
+  userPreferences = {},
   sessionMessages = null,
   briefingSessions = null,
 }, fn) {
@@ -271,7 +272,19 @@ async function withChatRouteSmoke({
 
   Session.findOne = async () => ({ _id: 'session-id', lastSeenAt: new Date(), save: async () => {} });
   User.findById = () => ({
-    select: async (fields) => (String(fields).includes('plan') ? { plan: userPlan } : { deletedAt: null }),
+    select: async (fields) => {
+      const selectedFields = String(fields);
+
+      if (selectedFields.includes('plan')) {
+        return { plan: userPlan };
+      }
+
+      if (selectedFields.includes('preferences.language')) {
+        return { preferences: userPreferences };
+      }
+
+      return { deletedAt: null };
+    },
   });
   ChatMessage.find = (query = {}) => createFindManyChain(storedSessionMessages.filter((message) => {
     if (query.userId && String(message.userId) !== String(query.userId)) return false;
@@ -397,6 +410,143 @@ test('POST /api/chat: usuário free passa, reserva quota, chama provider uma vez
     assert.equal(redis.reserveCalls, 1);
     assert.equal(redis.commitCalls, 1);
     assert.equal(redis.refundCalls, 0);
+  });
+});
+
+test('POST /api/chat: mensagem em inglês recebe resposta em inglês e conta uma chamada', async () => {
+  const redis = new SmokeRedis();
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: English/);
+      return { action: 'chat', reply: 'I can help you plan the next step.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Can you help me improve my project?',
+      language: 'pt-BR',
+      history: [],
+    }, {
+      'Accept-Language': 'pt-BR',
+      'Idempotency-Key': 'language-english-current',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.reply, 'I can help you plan the next step.');
+    assert.equal(providerState.calls, 1);
+    assert.equal(redis.reserveCalls, 1);
+    assert.equal(redis.commitCalls, 1);
+    assert.equal(redis.refundCalls, 0);
+  });
+});
+
+test('POST /api/chat: mensagem em português recebe resposta em português', async () => {
+  const redis = new SmokeRedis();
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: Portuguese/);
+      return { action: 'chat', reply: 'Posso ajudar a definir o próximo passo.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Você pode me ajudar com meu projeto?',
+      language: 'en',
+      history: [],
+    }, {
+      'Idempotency-Key': 'language-portuguese-current',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.reply, 'Posso ajudar a definir o próximo passo.');
+    assert.equal(providerState.calls, 1);
+  });
+});
+
+test('POST /api/chat: "why?" mantém inglês pelo contexto recente', async () => {
+  const redis = new SmokeRedis();
+  const sessionMessages = [
+    { _id: 'en1', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'user', content: 'Can you explain the pricing section?', createdAt: new Date('2026-07-22T12:00:00Z') },
+    { _id: 'en2', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'assistant', content: 'It needs clearer tiers.', createdAt: new Date('2026-07-22T12:01:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: English/);
+      assert.equal(request.messages.at(-1).content, 'why?');
+      return { action: 'chat', reply: 'Because users need to compare plans quickly.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'why?',
+      language: 'pt-BR',
+    }, {
+      'Idempotency-Key': 'language-why-context',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.reply, 'Because users need to compare plans quickly.');
+  });
+});
+
+test('POST /api/chat: "pq?" mantém português pelo contexto recente', async () => {
+  const redis = new SmokeRedis();
+  const sessionMessages = [
+    { _id: 'pt1', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'user', content: 'Você pode explicar a seção de preços?', createdAt: new Date('2026-07-22T12:00:00Z') },
+    { _id: 'pt2', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'assistant', content: 'Ela precisa de planos mais claros.', createdAt: new Date('2026-07-22T12:01:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: Portuguese/);
+      assert.equal(request.messages.at(-1).content, 'pq?');
+      return { action: 'chat', reply: 'Porque o usuário precisa comparar os planos rapidamente.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'pq?',
+      language: 'en',
+    }, {
+      'Idempotency-Key': 'language-pq-context',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.reply, 'Porque o usuário precisa comparar os planos rapidamente.');
+  });
+});
+
+test('POST /api/chat: pedido explícito em inglês vence preferência pt-BR', async () => {
+  const redis = new SmokeRedis();
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: English/);
+      return { action: 'chat', reply: 'The next step is to define the target audience.' };
+    },
+  };
+
+  await withChatRouteSmoke({
+    redis,
+    providerState,
+    userPreferences: { language: 'portuguese' },
+  }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'responda em inglês: qual é o próximo passo?',
+      history: [],
+    }, {
+      'Idempotency-Key': 'language-explicit-over-preference',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.reply, 'The next step is to define the target audience.');
   });
 });
 
@@ -585,6 +735,170 @@ test('POST /api/chat: usa snapshot do projeto atual e ignora histórico de outro
     else process.env.PUBLIC_COOKIE_AUTH_ENABLED = previousCookieEnabled;
     if (previousCookieName === undefined) delete process.env.PUBLIC_COOKIE_NAME;
     else process.env.PUBLIC_COOKIE_NAME = previousCookieName;
+  }
+});
+
+test('POST /api/chat: projeto configurado em português não força português numa conversa em inglês', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const projectId = '64f0000000000000000000f1';
+  const buildId = '64f0000000000000000000f2';
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: English/);
+      return { action: 'chat', reply: 'I would simplify the header copy first.' };
+    },
+  };
+  const previousProjectFindOne = Project.findOne;
+  const previousBuildFindOne = ProjectBuild.findOne;
+  const previousMessageFind = ProjectMessage.find;
+  const previousMessageCreate = ProjectMessage.create;
+  const previousChangeCreate = ProjectChangeRequest.create;
+  const projectMessages = [];
+
+  Project.findOne = mockFindOne([{
+    _id: projectId,
+    userId,
+    name: 'Projeto em Português',
+    appName: 'Projeto em Português',
+    settings: { language: 'pt-BR' },
+    latestPublishedBuildId: buildId,
+  }]);
+  ProjectBuild.findOne = mockFindOne([{
+    _id: buildId,
+    projectId,
+    type: 'html',
+    status: 'done',
+    fullHtml: '<main><h1>Projeto em Português</h1><p>Welcome visitors.</p></main>',
+    artifactFiles: [],
+    indexedFiles: [],
+    createdAt: new Date('2026-07-22T13:00:00Z'),
+    updatedAt: new Date('2026-07-22T13:00:00Z'),
+  }]);
+  ProjectMessage.find = (query = {}) => createFindManyChain(projectMessages.filter((message) => (
+    String(message.projectId) === String(query.projectId) &&
+    (!query.role?.$in || query.role.$in.includes(message.role))
+  )));
+  ProjectMessage.create = async (payload) => {
+    projectMessages.push(payload);
+    return { _id: `project-language-${projectMessages.length}`, ...payload };
+  };
+  ProjectChangeRequest.create = async (payload) => ({
+    _id: 'project-language-change',
+    ...payload,
+    save: async function save() { return this; },
+  });
+
+  try {
+    await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+      const response = await createRequest(app, token, {
+        projectId,
+        projectFlow: 'existing_project',
+        message: 'Can you review the home header?',
+        language: 'pt-BR',
+      }, {
+        'Idempotency-Key': 'project-pt-setting-english-chat',
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(response.body.reply, 'I would simplify the header copy first.');
+      assert.equal(providerState.calls, 1);
+      assert.equal(redis.reserveCalls, 1);
+      assert.equal(redis.commitCalls, 1);
+    });
+  } finally {
+    Project.findOne = previousProjectFindOne;
+    ProjectBuild.findOne = previousBuildFindOne;
+    ProjectMessage.find = previousMessageFind;
+    ProjectMessage.create = previousMessageCreate;
+    ProjectChangeRequest.create = previousChangeCreate;
+  }
+});
+
+test('POST /api/chat: projeto A não influencia idioma do projeto B', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const projectAId = '64f0000000000000000000a1';
+  const projectBId = '64f0000000000000000000b1';
+  const buildBId = '64f0000000000000000000b2';
+  const projectMessages = [
+    { _id: 'pa1', projectId: projectAId, role: 'user', content: 'Você pode revisar a home?', createdAt: new Date('2026-07-22T11:00:00Z') },
+    { _id: 'pa2', projectId: projectAId, role: 'assistant', content: 'Claro, posso revisar em português.', createdAt: new Date('2026-07-22T11:01:00Z') },
+    { _id: 'pb1', projectId: projectBId, role: 'user', content: 'Can you review the pricing section?', createdAt: new Date('2026-07-22T12:00:00Z') },
+    { _id: 'pb2', projectId: projectBId, role: 'assistant', content: 'The pricing tiers need clearer labels.', createdAt: new Date('2026-07-22T12:01:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest(request) {
+      assert.match(request.system, /RESPONSE LANGUAGE: English/);
+      assert.equal(JSON.stringify(request.messages).includes('Claro, posso revisar em português.'), false);
+      return { action: 'chat', reply: 'Because the current pricing labels are too similar.' };
+    },
+  };
+  const previousProjectFindOne = Project.findOne;
+  const previousBuildFindOne = ProjectBuild.findOne;
+  const previousMessageFind = ProjectMessage.find;
+  const previousMessageCreate = ProjectMessage.create;
+  const previousChangeCreate = ProjectChangeRequest.create;
+
+  Project.findOne = mockFindOne([{
+    _id: projectBId,
+    userId,
+    name: 'PricingHub',
+    appName: 'PricingHub',
+    settings: { language: 'pt-BR' },
+    latestPublishedBuildId: buildBId,
+  }]);
+  ProjectBuild.findOne = mockFindOne([{
+    _id: buildBId,
+    projectId: projectBId,
+    type: 'html',
+    status: 'done',
+    fullHtml: '<main><h1>PricingHub</h1><p>Compare plans.</p></main>',
+    artifactFiles: [],
+    indexedFiles: [],
+    createdAt: new Date('2026-07-22T13:00:00Z'),
+    updatedAt: new Date('2026-07-22T13:00:00Z'),
+  }]);
+  ProjectMessage.find = (query = {}) => createFindManyChain(projectMessages.filter((message) => (
+    String(message.projectId) === String(query.projectId) &&
+    (!query.role?.$in || query.role.$in.includes(message.role))
+  )));
+  ProjectMessage.create = async (payload) => {
+    projectMessages.push(payload);
+    return { _id: `project-b-language-${projectMessages.length}`, ...payload };
+  };
+  ProjectChangeRequest.create = async (payload) => ({
+    _id: 'project-b-change',
+    ...payload,
+    save: async function save() { return this; },
+  });
+
+  try {
+    await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+      const response = await createRequest(app, token, {
+        projectId: projectBId,
+        projectFlow: 'existing_project',
+        message: 'why?',
+        history: [
+          { role: 'user', content: 'Você pode revisar a home?' },
+          { role: 'assistant', content: 'Claro, posso revisar em português.' },
+        ],
+      }, {
+        'Idempotency-Key': 'project-b-language-isolated',
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(response.body.reply, 'Because the current pricing labels are too similar.');
+      assert.equal(providerState.calls, 1);
+    });
+  } finally {
+    Project.findOne = previousProjectFindOne;
+    ProjectBuild.findOne = previousBuildFindOne;
+    ProjectMessage.find = previousMessageFind;
+    ProjectMessage.create = previousMessageCreate;
+    ProjectChangeRequest.create = previousChangeCreate;
   }
 });
 
@@ -799,6 +1113,28 @@ test('POST /api/chat/clarify gera perguntas sem duplicar quota de IA', async () 
     assert.equal(response.body.briefing.mainContext, 'marmitas fitness');
     assert.equal(response.body.questions.some((question) => question.field === 'mainContext'), false);
     assert.equal(response.body.questions.some((question) => question.field === 'audience'), true);
+    assert.equal(providerState.calls, 0);
+    assert.equal(redis.reserveCalls, 0);
+    assert.equal(redis.commitCalls, 0);
+  });
+});
+
+test('POST /api/chat/clarify: briefing em inglês faz perguntas em inglês', async () => {
+  const redis = new SmokeRedis();
+  const providerState = { calls: 0 };
+
+  await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Build a landing page for yoga mats',
+      language: 'pt-BR',
+    }, {
+      'Idempotency-Key': 'english-briefing-questions',
+    }, '/api/chat/clarify');
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.questions.length > 0, true);
+    assert.match(response.body.questions[0].question, /what/i);
+    assert.equal(JSON.stringify(response.body.questions).includes('Qual é'), false);
     assert.equal(providerState.calls, 0);
     assert.equal(redis.reserveCalls, 0);
     assert.equal(redis.commitCalls, 0);
