@@ -1,6 +1,12 @@
 const jwt = require('jsonwebtoken');
 const Session = require('../models/Session');
 const User = require('../models/User');
+const {
+  getPublicAuthMigrationDeadline,
+  getPublicSessionCookieValue,
+  isPublicBearerAuthLegacyEnabled,
+  isPublicCookieAuthEnabled,
+} = require('../utils/publicAuthCookies');
 
 const LAST_SEEN_UPDATE_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -8,28 +14,82 @@ function isLegacyTokenAllowed(req) {
   return req.method === 'GET' && req.originalUrl.split('?')[0] === '/api/auth/me';
 }
 
-async function authMiddleware(req, res, next) {
+function getBearerToken(req) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
-    return res.status(401).json({ message: 'Token não enviado.' });
+    return '';
   }
 
   const [scheme, token] = authHeader.split(/\s+/);
 
   if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ message: 'Token inválido.' });
+    return '';
+  }
+
+  return token;
+}
+
+function getRequestToken(req) {
+  const cookieToken = isPublicCookieAuthEnabled() ? getPublicSessionCookieValue(req) : '';
+
+  if (cookieToken) {
+    return {
+      token: cookieToken,
+      source: 'cookie',
+    };
+  }
+
+  const bearerToken = getBearerToken(req);
+
+  if (bearerToken && isPublicBearerAuthLegacyEnabled()) {
+    return {
+      token: bearerToken,
+      source: 'bearer',
+    };
+  }
+
+  if (bearerToken) {
+    return {
+      token: '',
+      source: 'disabled_bearer',
+    };
+  }
+
+  return {
+    token: '',
+    source: 'missing',
+  };
+}
+
+async function authMiddleware(req, res, next) {
+  const parsedToken = getRequestToken(req);
+
+  if (!parsedToken.token) {
+    if (parsedToken.source === 'disabled_bearer') {
+      return res.status(401).json({
+        code: 'PUBLIC_BEARER_AUTH_DISABLED',
+        message: 'Bearer público legado desativado.',
+      });
+    }
+
+    return res.status(401).json({ message: 'Token não enviado.' });
+  }
+
+  if (parsedToken.source === 'bearer') {
+    res.setHeader('X-Public-Bearer-Auth-Legacy', 'true');
+    res.setHeader('X-Public-Auth-Migration-Deadline', getPublicAuthMigrationDeadline());
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    const decoded = jwt.verify(parsedToken.token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     if (!decoded.id || decoded.runtimeUserId) {
-      return res.status(401).json({ message: 'Token inválido ou expirado.' });
+      return res.status(401).json({ message: 'Token inválido.' });
     }
 
     if (!decoded.jti) {
-      if (isLegacyTokenAllowed(req)) {
+      if (parsedToken.source === 'bearer' && isLegacyTokenAllowed(req)) {
         const legacyUser = await User.findById(decoded.id).select('deletedAt');
 
         if (legacyUser?.deletedAt) {
@@ -41,6 +101,7 @@ async function authMiddleware(req, res, next) {
 
         req.userId = decoded.id;
         req.authLegacyToken = true;
+        req.authSource = parsedToken.source;
         return next();
       }
 
@@ -76,6 +137,7 @@ async function authMiddleware(req, res, next) {
 
     req.userId = decoded.id;
     req.session = session;
+    req.authSource = parsedToken.source;
 
     if (!session.lastSeenAt || now - session.lastSeenAt >= LAST_SEEN_UPDATE_INTERVAL_MS) {
       session.lastSeenAt = now;

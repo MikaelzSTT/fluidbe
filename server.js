@@ -43,6 +43,13 @@ const {
   parseBuildPathFromUrl,
   toDedicatedPreviewUrl,
 } = require('./utils/previewOrigin');
+const {
+  getPublicAppOrigin,
+  getPublicSessionCookieValue,
+  hasValidCsrfToken,
+  isPublicBearerAuthLegacyEnabled,
+  isPublicCookieAuthEnabled,
+} = require('./utils/publicAuthCookies');
 
 
 dotenv.config();
@@ -86,7 +93,7 @@ const allowedOrigins = [
 ];
 const baseCorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-key', 'Idempotency-Key', 'X-Idempotency-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-admin-token', 'x-admin-key', 'Idempotency-Key', 'X-Idempotency-Key'],
   optionsSuccessStatus: 204
 };
 function corsOptions(req, callback) {
@@ -97,6 +104,18 @@ function corsOptions(req, callback) {
       ...baseCorsOptions,
       origin: origin === getPreviewAllowedOrigin() ? origin : false,
       credentials: false,
+    });
+    return;
+  }
+
+  if (isPublicFrontendApiRoute(req.path || '')) {
+    const publicAppOrigin = getPublicAppOrigin();
+    const isAllowedPublicOrigin = origin === publicAppOrigin;
+
+    callback(null, {
+      ...baseCorsOptions,
+      origin: isAllowedPublicOrigin ? origin : false,
+      credentials: isAllowedPublicOrigin,
     });
     return;
   }
@@ -151,6 +170,93 @@ function apiRateLimitUnlessStripeWebhook(req, res, next) {
   }
 
   return apiRateLimit(req, res, next);
+}
+
+function isMutableMethod(method) {
+  return !['GET', 'HEAD', 'OPTIONS'].includes(String(method || '').toUpperCase());
+}
+
+function isPublicCookieAuthApiRoute(pathname) {
+  return (
+    isPublicAuthApiRoute(pathname)
+    || pathname === '/api/projects'
+    || pathname.startsWith('/api/projects/')
+    || pathname === '/api/chat'
+    || pathname.startsWith('/api/chat/')
+    || pathname === '/api/billing'
+    || pathname.startsWith('/api/billing/')
+    || pathname === '/api/connectors'
+    || pathname.startsWith('/api/connectors/')
+  );
+}
+
+function isOAuthCallbackRequest(req) {
+  const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+
+  return req.method === 'GET' && (
+    requestPath === '/api/auth/google/callback'
+    || requestPath === '/api/auth/github/callback'
+  );
+}
+
+function isCsrfTokenExemptRequest(req) {
+  const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+
+  return (
+    requestPath === '/api/auth/login'
+    || requestPath === '/api/auth/register'
+    || requestPath === '/api/auth/2fa/verify-login'
+    || requestPath === '/api/auth/session/migrate'
+  );
+}
+
+function requestHasAllowedPublicOrigin(req) {
+  const publicAppOrigin = getPublicAppOrigin();
+  const origin = req.header('Origin');
+
+  if (origin) {
+    return origin === publicAppOrigin;
+  }
+
+  const referer = req.header('Referer');
+
+  if (!referer) {
+    return false;
+  }
+
+  try {
+    return new URL(referer).origin === publicAppOrigin;
+  } catch (error) {
+    return false;
+  }
+}
+
+function publicCsrfProtection(req, res, next) {
+  if (
+    !isPublicCookieAuthEnabled()
+    || !isMutableMethod(req.method)
+    || isStripeWebhookRequest(req)
+    || isOAuthCallbackRequest(req)
+    || !isPublicCookieAuthApiRoute(req.path || '')
+  ) {
+    return next();
+  }
+
+  if (!requestHasAllowedPublicOrigin(req)) {
+    return res.status(403).json({
+      code: 'PUBLIC_ORIGIN_FORBIDDEN',
+      message: 'Origem não permitida.',
+    });
+  }
+
+  if (!isCsrfTokenExemptRequest(req) && !hasValidCsrfToken(req)) {
+    return res.status(403).json({
+      code: 'CSRF_TOKEN_INVALID',
+      message: 'CSRF token inválido.',
+    });
+  }
+
+  return next();
 }
 
 function getContentType(filePath) {
@@ -596,16 +702,28 @@ function parseBuildRequestPath(requestPath) {
   return parseBuildPathFromUrl(requestPath);
 }
 
-async function getBearerUserId(req) {
+function getPublicBearerToken(req) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
-    return null;
+    return '';
   }
 
   const [scheme, token] = authHeader.split(' ');
 
   if (scheme !== 'Bearer' || !token) {
+    return '';
+  }
+
+  return token;
+}
+
+async function getPublicAuthenticatedUserId(req) {
+  const cookieToken = isPublicCookieAuthEnabled() ? getPublicSessionCookieValue(req) : '';
+  const bearerToken = isPublicBearerAuthLegacyEnabled() ? getPublicBearerToken(req) : '';
+  const token = cookieToken || bearerToken;
+
+  if (!token) {
     return null;
   }
 
@@ -842,7 +960,7 @@ async function authorizeBuildAccess(req, res, next) {
     const isAdmin = process.env.ADMIN_TOKEN_LEGACY_ENABLED === 'true'
       && Boolean(process.env.ADMIN_TOKEN)
       && timingSafeEqualString(req.headers['x-admin-token'], process.env.ADMIN_TOKEN);
-    const userId = await getBearerUserId(req);
+    const userId = await getPublicAuthenticatedUserId(req);
 
     if (isAdmin || (userId && String(project.userId) === String(userId))) {
       req.buildAccess = {
@@ -976,6 +1094,7 @@ app.set('trust proxy', 1);
 app.use(previewHostOnly);
 app.use(securityHeaders);
 app.use(cors(corsOptions));
+app.use(publicCsrfProtection);
 app.options(/^\/builds\/.+$/, authorizeBuildAccess, applyBuildArtifactCors, (req, res) => {
   res.sendStatus(204);
 });
@@ -1176,5 +1295,9 @@ module.exports = {
     corsOptions,
     isPreviewAllowedRoute,
     previewHostOnly,
+  },
+  publicAuthHelpers: {
+    publicCsrfProtection,
+    requestHasAllowedPublicOrigin,
   },
 };

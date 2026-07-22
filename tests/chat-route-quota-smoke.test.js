@@ -195,6 +195,7 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     JWT_SECRET: process.env.JWT_SECRET,
     NODE_ENV: process.env.NODE_ENV,
+    PUBLIC_BEARER_AUTH_LEGACY_ENABLED: process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED,
   };
   const previousLoad = Module._load;
   const previousFindOne = Session.findOne;
@@ -207,6 +208,7 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
 
   process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
   process.env.JWT_SECRET = 'test-jwt-secret';
+  process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED = 'true';
   delete process.env.NODE_ENV;
 
   Session.findOne = async () => ({ _id: 'session-id', lastSeenAt: new Date(), save: async () => {} });
@@ -241,6 +243,8 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free' }, f
     process.env.JWT_SECRET = previousEnv.JWT_SECRET;
     if (previousEnv.NODE_ENV === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previousEnv.NODE_ENV;
+    if (previousEnv.PUBLIC_BEARER_AUTH_LEGACY_ENABLED === undefined) delete process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED;
+    else process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED = previousEnv.PUBLIC_BEARER_AUTH_LEGACY_ENABLED;
     Session.findOne = previousFindOne;
     User.findById = previousFindById;
     rateLimit.getConnectedRedisClient = previousRedisProvider;

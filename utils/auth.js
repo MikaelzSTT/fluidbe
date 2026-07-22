@@ -108,6 +108,16 @@ async function createAuthToken(user, req) {
   return signAuthToken(user, session.jti);
 }
 
+async function createAuthTokenPair(user, req) {
+  const session = await createAuthSession(user, req);
+  const token = signAuthToken(user, session.jti);
+
+  return {
+    token,
+    session,
+  };
+}
+
 function hasPasswordHash(user) {
   return typeof user?.password === 'string' && user.password.trim().length > 0;
 }
@@ -156,6 +166,7 @@ module.exports = {
   AUTH_TOKEN_TTL_SECONDS,
   createAuthSession,
   createAuthToken,
+  createAuthTokenPair,
   hasPasswordHash,
   serializeAuthMetadata,
   serializeProfile,

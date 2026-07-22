@@ -9,11 +9,22 @@ const Project = require('../models/Project');
 const Session = require('../models/Session');
 const User = require('../models/User');
 const {
-  createAuthToken,
+  createAuthTokenPair,
   hasPasswordHash,
   serializeAuthMetadata,
   serializeUser,
 } = require('../utils/auth');
+const {
+  clearPublicCsrfCookie,
+  clearPublicSessionCookie,
+  createCsrfToken,
+  getPublicAuthMigrationDeadline,
+  getPublicSessionCookieValue,
+  isPublicBearerAuthLegacyEnabled,
+  isPublicCookieAuthEnabled,
+  setPublicCsrfCookie,
+  setPublicSessionCookie,
+} = require('../utils/publicAuthCookies');
 const {
   countRemainingRecoveryCodes,
   decryptTotpSecret,
@@ -78,13 +89,11 @@ function redirectToOAuthCodeError(res, code) {
   return res.redirect(`${getFrontendUrl()}/login.html?error=${encodeURIComponent(code)}`);
 }
 
-function redirectToOAuthSuccess(res, token, user, redirectPath = '') {
-  const encodedToken = encodeURIComponent(token);
-  const encodedUser = encodeURIComponent(JSON.stringify(user));
+function redirectToOAuthSuccess(res, redirectPath = '') {
   const redirect = redirectPath ? normalizeFrontendRedirectPath(redirectPath) : '';
-  const redirectParam = redirect ? `&redirect=${encodeURIComponent(redirect)}` : '';
+  const targetPath = redirect || DEFAULT_OAUTH_REDIRECT_PATH;
 
-  return res.redirect(`${getFrontendUrl()}/auth-callback.html#token=${encodedToken}&user=${encodedUser}${redirectParam}`);
+  return res.redirect(`${getFrontendUrl()}${targetPath}`);
 }
 
 function getGoogleOAuthConfig() {
@@ -508,6 +517,34 @@ function getBearerToken(req) {
   }
 
   return token;
+}
+
+function buildAuthenticatedPayload(payload, token) {
+  if (!isPublicCookieAuthEnabled() && token) {
+    return {
+      ...payload,
+      token,
+    };
+  }
+
+  return payload;
+}
+
+async function createSessionAndSetCookie(user, req, res) {
+  const { token, session } = await createAuthTokenPair(user, req);
+  setPublicSessionCookie(res, token, session.expiresAt);
+
+  return {
+    token,
+    session,
+  };
+}
+
+function setCsrfTokenResponse(res) {
+  const csrfToken = createCsrfToken();
+  setPublicCsrfCookie(res, csrfToken);
+
+  return csrfToken;
 }
 
 function serializeSession(session, currentSessionId) {
@@ -983,6 +1020,21 @@ router.get('/github', (req, res) => {
   setOAuthStateCookie(res, 'github', state, GITHUB_STATE_TTL_SECONDS * 1000);
 
   return res.redirect(authUrl.toString());
+});
+
+router.get('/csrf', (req, res) => {
+  try {
+    const csrfToken = setCsrfTokenResponse(res);
+
+    return res.json({
+      ok: true,
+      csrfToken,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Erro interno do servidor.',
+    });
+  }
 });
 
 router.get('/me', authMiddleware, async (req, res) => {
@@ -1532,6 +1584,9 @@ router.delete('/me/account', authMiddleware, async (req, res) => {
       deleteProjectsData(projectIds),
     ]);
 
+    clearPublicSessionCookie(res);
+    clearPublicCsrfCookie(res);
+
     return res.json({
       ok: true,
       message: 'ACCOUNT_DELETED',
@@ -1850,10 +1905,9 @@ router.get('/google/callback', async (req, res) => {
       });
     }
 
-    const token = await createAuthToken(user, req);
-    const serializedUser = serializeUser(user);
+    await createSessionAndSetCookie(user, req, res);
 
-    return redirectToOAuthSuccess(res, token, serializedUser, statePayload.redirect);
+    return redirectToOAuthSuccess(res, statePayload.redirect);
   } catch (error) {
     return redirectToOAuthError(res);
   }
@@ -1948,10 +2002,9 @@ router.get('/github/callback', async (req, res) => {
       });
     }
 
-    const token = await createAuthToken(user, req);
-    const serializedUser = serializeUser(user);
+    await createSessionAndSetCookie(user, req, res);
 
-    return redirectToOAuthSuccess(res, token, serializedUser, statePayload.redirect);
+    return redirectToOAuthSuccess(res, statePayload.redirect);
   } catch (error) {
     if (error?.code === 11000) {
       return redirectToOAuthCodeError(res, 'GITHUB_ACCOUNT_LINK_FAILED');
@@ -2075,13 +2128,12 @@ router.post('/2fa/verify-login', twoFactorVerifyLoginRateLimit, async (req, res)
       );
     }
 
-    const token = await createAuthToken(user, req);
+    const { token } = await createSessionAndSetCookie(user, req, res);
 
-    return res.json({
+    return res.json(buildAuthenticatedPayload({
       ok: true,
-      token,
       user: serializeUser(user),
-    });
+    }, token));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -2122,14 +2174,13 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const token = await createAuthToken(user, req);
+    const { token } = await createSessionAndSetCookie(user, req, res);
 
-    return res.json({
+    return res.json(buildAuthenticatedPayload({
       ok: true,
       message: 'Login realizado com sucesso.',
-      token,
       user: serializeUser(user),
-    });
+    }, token));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -2137,9 +2188,68 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/session/migrate', async (req, res) => {
+  try {
+    if (!isPublicCookieAuthEnabled() || !isPublicBearerAuthLegacyEnabled()) {
+      return res.status(404).json({ message: 'Not found.' });
+    }
+
+    const token = getBearerToken(req);
+
+    if (!token) {
+      return res.status(401).json({ message: 'Token não enviado.' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+
+    if (!decoded?.id || !decoded?.jti || decoded.runtimeUserId) {
+      return res.status(401).json({
+        code: 'SESSION_REFRESH_REQUIRED',
+        message: 'SESSION_REFRESH_REQUIRED',
+      });
+    }
+
+    const now = new Date();
+    const [session, user] = await Promise.all([
+      Session.findOne({
+        jti: decoded.jti,
+        userId: decoded.id,
+        revokedAt: null,
+        expiresAt: { $gt: now },
+      }),
+      User.findById(decoded.id).select('deletedAt'),
+    ]);
+
+    if (!session) {
+      return res.status(401).json({
+        code: 'SESSION_INVALID',
+        message: 'Sessão inválida ou expirada.',
+      });
+    }
+
+    if (user?.deletedAt) {
+      return res.status(401).json({
+        code: 'ACCOUNT_DELETED',
+        message: 'ACCOUNT_DELETED',
+      });
+    }
+
+    setPublicSessionCookie(res, token, session.expiresAt);
+    setCsrfTokenResponse(res);
+
+    return res.json({
+      ok: true,
+      migrationDeadline: getPublicAuthMigrationDeadline(),
+    });
+  } catch (error) {
+    return res.status(401).json({ message: 'Token inválido ou expirado.' });
+  }
+});
+
 router.post('/logout', async (req, res) => {
   try {
-    const token = getBearerToken(req);
+    const token = getPublicSessionCookieValue(req)
+      || (isPublicBearerAuthLegacyEnabled() ? getBearerToken(req) : '');
 
     if (token) {
       try {
@@ -2164,6 +2274,9 @@ router.post('/logout', async (req, res) => {
         // Logout stays idempotent for expired, malformed, or already invalid tokens.
       }
     }
+
+    clearPublicSessionCookie(res);
+    clearPublicCsrfCookie(res);
 
     return res.json({ ok: true });
   } catch (error) {

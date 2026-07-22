@@ -321,18 +321,6 @@
       'https://www.askfluid.now',
     ]);
     const PRODUCTION_API_ORIGIN = 'https://apps.askfluid.now';
-    const TOKEN_KEYS = [
-      'fluid-token',
-      'fluid.auth.token',
-      'fluid:auth:token',
-      'fluidToken',
-      'fluidAuthToken',
-      'fluid_token',
-      'fluid_auth_token',
-      'authToken',
-      'auth_token',
-      'token',
-    ];
     const USER_KEYS = [
       'fluid-user',
       'fluidUser',
@@ -340,13 +328,6 @@
       'fluid.auth.user',
       'user',
       'currentUser',
-    ];
-    const USER_TOKEN_FIELDS = [
-      'token',
-      'authToken',
-      'accessToken',
-      'jwt',
-      'idToken',
     ];
     const profileFields = ['displayName', 'username', 'bio', 'website', 'company', 'location', 'visibility'];
     const preferenceFields = ['language', 'appearance', 'soundOnComplete', 'chatSuggestions', 'autoSave', 'confirmBeforeDelete', 'compactMode'];
@@ -360,40 +341,7 @@
 
     let toastTimer = null;
     let currentSettings = null;
-
-    function normalizeToken(value) {
-      if (typeof value !== 'string') {
-        return '';
-      }
-
-      const token = value.replace(/^Bearer\s+/i, '').trim();
-      return token && token !== 'null' && token !== 'undefined' ? token : '';
-    }
-
-    function addTokenCandidate(candidates, seen, token) {
-      const normalized = normalizeToken(token);
-
-      if (!normalized || seen.has(normalized)) {
-        return;
-      }
-
-      seen.add(normalized);
-      candidates.push(normalized);
-    }
-
-    function collectUserObjectTokens(value, candidates, seen) {
-      if (!value || typeof value !== 'object') {
-        return;
-      }
-
-      USER_TOKEN_FIELDS.forEach((field) => {
-        addTokenCandidate(candidates, seen, value[field]);
-      });
-
-      collectUserObjectTokens(value.auth, candidates, seen);
-      collectUserObjectTokens(value.session, candidates, seen);
-      collectUserObjectTokens(value.user, candidates, seen);
-    }
+    let csrfToken = '';
 
     function readStorageItem(storage, key) {
       try {
@@ -401,72 +349,6 @@
       } catch (error) {
         return null;
       }
-    }
-
-    function readCookieValue(key) {
-      const prefix = `${encodeURIComponent(key)}=`;
-      const cookie = document.cookie
-        .split(';')
-        .map((part) => part.trim())
-        .find((part) => part.startsWith(prefix));
-
-      if (!cookie) {
-        return '';
-      }
-
-      try {
-        return decodeURIComponent(cookie.slice(prefix.length));
-      } catch (error) {
-        return cookie.slice(prefix.length);
-      }
-    }
-
-    function readTokenCandidates() {
-      const candidates = [];
-      const seen = new Set();
-      const stores = [localStorage, sessionStorage];
-
-      for (const key of TOKEN_KEYS) {
-        for (const store of stores) {
-          addTokenCandidate(candidates, seen, readStorageItem(store, key));
-        }
-
-        addTokenCandidate(candidates, seen, readCookieValue(key));
-      }
-
-      for (const key of USER_KEYS) {
-        const storedUsers = stores
-          .map((store) => readStorageItem(store, key))
-          .filter(Boolean);
-
-        for (const userJson of storedUsers) {
-          try {
-            collectUserObjectTokens(JSON.parse(userJson), candidates, seen);
-          } catch (error) {
-            // Ignore unrelated browser cache entries that are not JSON user payloads.
-          }
-        }
-      }
-
-      return candidates;
-    }
-
-    function readToken() {
-      return readTokenCandidates()[0] || '';
-    }
-
-    function readFluidToken() {
-      const stores = [localStorage, sessionStorage];
-
-      for (const store of stores) {
-        const token = normalizeToken(readStorageItem(store, 'fluid-token'));
-
-        if (token) {
-          return token;
-        }
-      }
-
-      return normalizeToken(readCookieValue('fluid-token'));
     }
 
     function showToast(message, tone = 'success') {
@@ -502,11 +384,11 @@
       });
     }
 
-    function createNoTokenError() {
+    function createNoSessionError() {
       const error = new Error('Sign in required.');
       error.status = 401;
-      error.code = 'NO_AUTH_TOKEN';
-      error.noToken = true;
+      error.code = 'NO_AUTH_SESSION';
+      error.noSession = true;
       return error;
     }
 
@@ -538,18 +420,60 @@
       return formatApiError(error, 'Could not save settings.');
     }
 
-    async function requestWithToken(path, options, token) {
+    function isMutableRequest(method) {
+      return !['GET', 'HEAD', 'OPTIONS'].includes(String(method || 'GET').toUpperCase());
+    }
+
+    async function getCsrfToken() {
+      if (csrfToken) {
+        return csrfToken;
+      }
+
+      const url = buildApiUrl('/api/auth/csrf');
+      let response;
+
+      try {
+        response = await fetch(url, {
+          credentials: 'include',
+        });
+      } catch (error) {
+        error.apiUrl = url;
+        throw createNetworkError(error);
+      }
+
+      const body = await response.json().catch(() => ({}));
+
+      if (!response.ok || !body.csrfToken) {
+        const error = new Error(body.message || body.code || 'CSRF request failed.');
+        error.status = response.status;
+        error.code = body.code || '';
+        error.apiUrl = url;
+        throw error;
+      }
+
+      csrfToken = body.csrfToken;
+      return csrfToken;
+    }
+
+    async function apiRequest(path, options = {}) {
       let response;
       const url = buildApiUrl(path);
+      const method = options.method || 'GET';
+      const headers = {
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.headers || {}),
+      };
+
+      if (isMutableRequest(method)) {
+        headers['X-CSRF-Token'] = await getCsrfToken();
+      }
 
       try {
         response = await fetch(url, {
           ...options,
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-            ...(options.headers || {}),
-          },
+          method,
+          credentials: 'include',
+          headers,
         });
       } catch (error) {
         error.apiUrl = url;
@@ -559,7 +483,9 @@
       const body = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        const error = new Error(body.message || body.code || 'Request failed.');
+        const error = response.status === 401
+          ? createNoSessionError()
+          : new Error(body.message || body.code || 'Request failed.');
         error.status = response.status;
         error.code = body.code || '';
         error.apiUrl = url;
@@ -567,34 +493,6 @@
       }
 
       return body.settings || body;
-    }
-
-    async function apiRequest(path, options = {}) {
-      const tokens = readTokenCandidates();
-
-      if (!tokens.length) {
-        throw createNoTokenError();
-      }
-
-      let lastError = null;
-
-      for (const token of tokens) {
-        try {
-          return await requestWithToken(path, options, token);
-        } catch (error) {
-          if (error.network) {
-            throw error;
-          }
-
-          lastError = error;
-
-          if (error.status !== 401) {
-            throw error;
-          }
-        }
-      }
-
-      throw lastError || createNoTokenError();
     }
 
     function getCachedSettings() {
@@ -735,16 +633,11 @@
     }
 
     async function loadSettings() {
-      if (!readToken()) {
-        setSignInRequired();
-        return;
-      }
-
       try {
         const settings = await apiRequest('/api/auth/me/settings');
         applySettings(settings);
       } catch (error) {
-        if (error.noToken || error.status === 401) {
+        if (error.noSession || error.status === 401) {
           setSignInRequired();
           return;
         }
@@ -762,14 +655,7 @@
     }
 
     async function saveSettingsSection(path, payload, successMessage) {
-      const tokens = readTokenCandidates();
       const url = buildApiUrl(path);
-
-      if (!tokens.length) {
-        warnSaveFailure(url, null, true);
-        showToast('Sign in required. Please log in again.', 'error');
-        return;
-      }
 
       try {
         const settings = await apiRequest(path, {
@@ -792,20 +678,13 @@
       button.disabled = true;
 
       try {
-        const token = readFluidToken();
         const url = buildApiUrl('/api/auth/me/profile');
 
-        if (!token) {
-          warnSaveFailure(url, null, true);
-          showToast('Sign in required. Please log in again.', 'error');
-          return;
-        }
-
         console.log(`Saving profile via backend: ${url}`);
-        const settings = await requestWithToken('/api/auth/me/profile', {
+        const settings = await apiRequest('/api/auth/me/profile', {
           method: 'PATCH',
           body: JSON.stringify(collectProfilePayload()),
-        }, token);
+        });
 
         applySettings(settings);
         console.log('Profile backend save OK');
