@@ -49,6 +49,18 @@ const GITHUB_EMAILS_URL = 'https://api.github.com/user/emails';
 const GITHUB_STATE_TTL_SECONDS = 10 * 60;
 const GOOGLE_STATE_TTL_SECONDS = 10 * 60;
 const DEFAULT_OAUTH_REDIRECT_PATH = '/projects.html';
+const PUBLIC_OAUTH_API_ORIGIN = 'https://apps.askfluid.now';
+const PUBLIC_OAUTH_FRONTEND_ORIGIN = 'https://askfluid.now';
+const PUBLIC_OAUTH_API_HOST = new URL(PUBLIC_OAUTH_API_ORIGIN).hostname;
+const GOOGLE_PUBLIC_REDIRECT_URI = `${PUBLIC_OAUTH_API_ORIGIN}/api/auth/google/callback`;
+const GITHUB_PUBLIC_REDIRECT_URI = `${PUBLIC_OAUTH_API_ORIGIN}/api/auth/github/callback`;
+const OAUTH_SUCCESS_CALLBACK_PATH = '/auth-callback.html';
+const OAUTH_ALLOWED_REDIRECT_PATHS = new Set([
+  DEFAULT_OAUTH_REDIRECT_PATH,
+  '/settings/account',
+  '/settings/account/',
+  '/settings/account/index.html',
+]);
 const OAUTH_STATE_COOKIE_PREFIX = 'fluid_oauth_state_';
 const MAX_PASSWORD_BYTES = 72;
 const MAX_EMAIL_CHARS = 320;
@@ -81,26 +93,55 @@ function getFrontendUrl() {
   return (process.env.FRONTEND_URL || 'https://askfluid.now').replace(/\/+$/, '');
 }
 
+function isProduction() {
+  return process.env.NODE_ENV === 'production';
+}
+
+function getOAuthFrontendUrl() {
+  return isProduction() ? PUBLIC_OAUTH_FRONTEND_ORIGIN : getFrontendUrl();
+}
+
 function redirectToOAuthError(res) {
-  return res.redirect(`${getFrontendUrl()}/login.html?oauth_error=google`);
+  return res.redirect(`${getOAuthFrontendUrl()}/login.html?oauth_error=google`);
 }
 
 function redirectToOAuthCodeError(res, code) {
-  return res.redirect(`${getFrontendUrl()}/login.html?error=${encodeURIComponent(code)}`);
+  return res.redirect(`${getOAuthFrontendUrl()}/login.html?error=${encodeURIComponent(code)}`);
 }
 
 function redirectToOAuthSuccess(res, redirectPath = '') {
   const redirect = redirectPath ? normalizeFrontendRedirectPath(redirectPath) : '';
   const targetPath = redirect || DEFAULT_OAUTH_REDIRECT_PATH;
+  const target = new URL(`${getOAuthFrontendUrl()}${OAUTH_SUCCESS_CALLBACK_PATH}`);
 
-  return res.redirect(`${getFrontendUrl()}${targetPath}`);
+  target.searchParams.set('redirect', targetPath);
+
+  return res.redirect(target.toString());
+}
+
+function getProductionOAuthRedirectUri(envName, canonicalRedirectUri) {
+  const configuredRedirectUri = process.env[envName];
+
+  return configuredRedirectUri === canonicalRedirectUri ? configuredRedirectUri : '';
+}
+
+function getOAuthRedirectUri(envName, legacyEnvName, canonicalRedirectUri) {
+  if (isProduction()) {
+    return getProductionOAuthRedirectUri(envName, canonicalRedirectUri);
+  }
+
+  return process.env[envName] || process.env[legacyEnvName] || canonicalRedirectUri;
 }
 
 function getGoogleOAuthConfig() {
   return {
     clientId: process.env.GOOGLE_CLIENT_ID,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackUrl: process.env.GOOGLE_CALLBACK_URL,
+    callbackUrl: getOAuthRedirectUri(
+      'GOOGLE_REDIRECT_URI',
+      'GOOGLE_CALLBACK_URL',
+      GOOGLE_PUBLIC_REDIRECT_URI
+    ),
   };
 }
 
@@ -112,7 +153,11 @@ function getGitHubOAuthConfig() {
   return {
     clientId: process.env.GITHUB_CLIENT_ID,
     clientSecret: process.env.GITHUB_CLIENT_SECRET,
-    callbackUrl: process.env.GITHUB_OAUTH_CALLBACK_URL,
+    callbackUrl: getOAuthRedirectUri(
+      'GITHUB_REDIRECT_URI',
+      'GITHUB_OAUTH_CALLBACK_URL',
+      GITHUB_PUBLIC_REDIRECT_URI
+    ),
   };
 }
 
@@ -132,13 +177,14 @@ function normalizeFrontendRedirectPath(value) {
   }
 
   try {
-    const parsed = new URL(trimmed, getFrontendUrl());
+    const frontendUrl = getOAuthFrontendUrl();
+    const parsed = new URL(trimmed, frontendUrl);
 
-    if (parsed.origin !== getFrontendUrl() || !parsed.pathname.startsWith('/')) {
+    if (parsed.origin !== frontendUrl || !parsed.pathname.startsWith('/')) {
       return DEFAULT_OAUTH_REDIRECT_PATH;
     }
 
-    if (/^\/(?:admin|wizard)(?:\.html|\/|$)/i.test(parsed.pathname)) {
+    if (!OAUTH_ALLOWED_REDIRECT_PATHS.has(parsed.pathname)) {
       return DEFAULT_OAUTH_REDIRECT_PATH;
     }
 
@@ -146,6 +192,62 @@ function normalizeFrontendRedirectPath(value) {
   } catch (error) {
     return DEFAULT_OAUTH_REDIRECT_PATH;
   }
+}
+
+function normalizeHeaderHost(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  const trimmed = value.trim().toLowerCase();
+
+  if (!trimmed) {
+    return '';
+  }
+
+  const host = trimmed.startsWith('[')
+    ? trimmed.slice(0, trimmed.indexOf(']') + 1)
+    : trimmed.split(':')[0];
+
+  return host.replace(/^\[|\]$/g, '');
+}
+
+function getForwardedHosts(req) {
+  const header = req.headers?.['x-forwarded-host'];
+
+  if (Array.isArray(header)) {
+    return header.flatMap((value) => String(value).split(','));
+  }
+
+  return typeof header === 'string' ? header.split(',') : [];
+}
+
+function hasCanonicalPublicOAuthHost(req) {
+  const hosts = [
+    req.hostname,
+    req.headers?.host,
+    ...getForwardedHosts(req),
+  ]
+    .map(normalizeHeaderHost)
+    .filter(Boolean);
+
+  return hosts.length > 0 && hosts.every((host) => host === PUBLIC_OAUTH_API_HOST);
+}
+
+function canonicalOAuthRequestUrl(req, provider, isCallback = false) {
+  const path = `/api/auth/${provider}${isCallback ? '/callback' : ''}`;
+  const query = String(req.originalUrl || req.url || '').split('?')[1] || '';
+
+  return `${PUBLIC_OAUTH_API_ORIGIN}${path}${query ? `?${query}` : ''}`;
+}
+
+function ensureCanonicalPublicOAuthRequest(req, res, provider, isCallback = false) {
+  if (!isProduction() || hasCanonicalPublicOAuthHost(req)) {
+    return true;
+  }
+
+  res.redirect(canonicalOAuthRequestUrl(req, provider, isCallback));
+  return false;
 }
 
 function parseCookieHeader(req) {
@@ -978,6 +1080,10 @@ async function markCurrentSessionMfaVerified(req, user, verifiedAt) {
 }
 
 router.get('/google', (req, res) => {
+  if (!ensureCanonicalPublicOAuthRequest(req, res, 'google')) {
+    return undefined;
+  }
+
   const config = getGoogleOAuthConfig();
 
   if (!hasGoogleOAuthConfig(config)) {
@@ -1002,6 +1108,10 @@ router.get('/google', (req, res) => {
 });
 
 router.get('/github', (req, res) => {
+  if (!ensureCanonicalPublicOAuthRequest(req, res, 'github')) {
+    return undefined;
+  }
+
   const config = getGitHubOAuthConfig();
 
   if (!hasGitHubOAuthConfig(config)) {
@@ -1840,6 +1950,10 @@ router.patch('/onboarding', authMiddleware, async (req, res) => {
 
 router.get('/google/callback', async (req, res) => {
   try {
+    if (!ensureCanonicalPublicOAuthRequest(req, res, 'google', true)) {
+      return undefined;
+    }
+
     const config = getGoogleOAuthConfig();
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     const state = typeof req.query.state === 'string' ? req.query.state : '';
@@ -1917,6 +2031,10 @@ router.get('/github/callback', async (req, res) => {
   let statePayload = null;
 
   try {
+    if (!ensureCanonicalPublicOAuthRequest(req, res, 'github', true)) {
+      return undefined;
+    }
+
     const config = getGitHubOAuthConfig();
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     const state = typeof req.query.state === 'string' ? req.query.state : '';

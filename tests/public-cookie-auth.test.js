@@ -14,6 +14,9 @@ const { app, previewIsolationHelpers, publicAuthHelpers } = require('../server')
 const USER_ID = '64f000000000000000000501';
 const JWT_SECRET = 'public-cookie-auth-test-secret';
 const PUBLIC_APP_ORIGIN = 'https://askfluid.now';
+const PUBLIC_OAUTH_API_ORIGIN = 'https://apps.askfluid.now';
+const GOOGLE_REDIRECT_URI = `${PUBLIC_OAUTH_API_ORIGIN}/api/auth/google/callback`;
+const GITHUB_REDIRECT_URI = `${PUBLIC_OAUTH_API_ORIGIN}/api/auth/github/callback`;
 const SESSION_COOKIE_NAME = '__Host-fluid_session';
 
 function selectable(document) {
@@ -44,6 +47,16 @@ function setCookieModeEnv() {
   process.env.PUBLIC_COOKIE_NAME = SESSION_COOKIE_NAME;
   process.env.PUBLIC_APP_ORIGIN = PUBLIC_APP_ORIGIN;
   process.env.PUBLIC_AUTH_MIGRATION_DEADLINE = '2026-08-15';
+}
+
+function setPublicOAuthEnv() {
+  setCookieModeEnv();
+  process.env.GOOGLE_CLIENT_ID = 'google-client-id';
+  process.env.GOOGLE_CLIENT_SECRET = 'google-client-secret';
+  process.env.GOOGLE_REDIRECT_URI = GOOGLE_REDIRECT_URI;
+  process.env.GITHUB_CLIENT_ID = 'github-client-id';
+  process.env.GITHUB_CLIENT_SECRET = 'github-client-secret';
+  process.env.GITHUB_REDIRECT_URI = GITHUB_REDIRECT_URI;
 }
 
 function listen() {
@@ -212,6 +225,136 @@ async function withPublicAuthStubs(fn) {
     Session.create = originalSessionCreate;
     Session.findOne = originalSessionFindOne;
     Session.updateOne = originalSessionUpdateOne;
+    restoreEnv(previousEnv);
+  }
+}
+
+async function withPublicOAuthStubs(fn) {
+  const previousEnv = snapshotEnv([
+    'JWT_SECRET',
+    'NODE_ENV',
+    'PUBLIC_COOKIE_AUTH_ENABLED',
+    'PUBLIC_BEARER_AUTH_LEGACY_ENABLED',
+    'PUBLIC_COOKIE_NAME',
+    'PUBLIC_APP_ORIGIN',
+    'PUBLIC_AUTH_MIGRATION_DEADLINE',
+    'GOOGLE_CLIENT_ID',
+    'GOOGLE_CLIENT_SECRET',
+    'GOOGLE_REDIRECT_URI',
+    'GOOGLE_CALLBACK_URL',
+    'GITHUB_CLIENT_ID',
+    'GITHUB_CLIENT_SECRET',
+    'GITHUB_REDIRECT_URI',
+    'GITHUB_OAUTH_CALLBACK_URL',
+    'FRONTEND_URL',
+  ]);
+  const originalFetch = global.fetch;
+  const originalUserFindOne = User.findOne;
+  const originalUserFindById = User.findById;
+  const originalUserCreate = User.create;
+  const originalUserExists = User.exists;
+  const originalSessionCreate = Session.create;
+  const fetchCalls = [];
+  const createdUsers = [];
+
+  setPublicOAuthEnv();
+  delete process.env.GOOGLE_CALLBACK_URL;
+  delete process.env.GITHUB_OAUTH_CALLBACK_URL;
+  User.findOne = async () => null;
+  User.findById = () => selectable(createdUsers[0] || null);
+  User.exists = async () => false;
+  User.create = async (payload) => {
+    const user = {
+      _id: `oauth-user-${createdUsers.length + 1}`,
+      deletedAt: null,
+      profile: {},
+      preferences: {},
+      twoFactor: { enabled: false },
+      save: async function saveUser() {
+        return this;
+      },
+      ...payload,
+    };
+    createdUsers.push(user);
+    return user;
+  };
+  Session.create = async (payload) => ({
+    _id: `oauth-session-${createdUsers.length || 1}`,
+    ...payload,
+    revokedAt: null,
+    expiresAt: payload.expiresAt || new Date(Date.now() + 60 * 60 * 1000),
+    save: async function saveSession() {
+      return this;
+    },
+  });
+  global.fetch = async (url, options = {}) => {
+    fetchCalls.push({ url: String(url), options });
+
+    if (String(url) === 'https://oauth2.googleapis.com/token') {
+      return {
+        ok: true,
+        json: async () => ({ access_token: 'google-access-token' }),
+      };
+    }
+
+    if (String(url) === 'https://www.googleapis.com/oauth2/v3/userinfo') {
+      return {
+        ok: true,
+        json: async () => ({
+          sub: 'google-user-id',
+          email: 'google-oauth@example.test',
+          email_verified: true,
+          name: 'Google OAuth User',
+          picture: 'https://cdn.example.test/google.png',
+        }),
+      };
+    }
+
+    if (String(url) === 'https://github.com/login/oauth/access_token') {
+      return {
+        ok: true,
+        json: async () => ({ access_token: 'github-access-token' }),
+      };
+    }
+
+    if (String(url) === 'https://api.github.com/user') {
+      return {
+        ok: true,
+        json: async () => ({
+          id: 12345,
+          login: 'github-oauth-user',
+          name: 'GitHub OAuth User',
+          avatar_url: 'https://cdn.example.test/github.png',
+        }),
+      };
+    }
+
+    if (String(url) === 'https://api.github.com/user/emails') {
+      return {
+        ok: true,
+        json: async () => ([{
+          email: 'github-oauth@example.test',
+          primary: true,
+          verified: true,
+        }]),
+      };
+    }
+
+    return {
+      ok: false,
+      json: async () => ({}),
+    };
+  };
+
+  try {
+    return await fn({ fetchCalls, createdUsers });
+  } finally {
+    global.fetch = originalFetch;
+    User.findOne = originalUserFindOne;
+    User.findById = originalUserFindById;
+    User.create = originalUserCreate;
+    User.exists = originalUserExists;
+    Session.create = originalSessionCreate;
     restoreEnv(previousEnv);
   }
 }
@@ -512,6 +655,177 @@ test('public CORS credentials are only allowed for the configured app origin', (
   } finally {
     restoreEnv(previousEnv);
   }
+});
+
+function formBodyValue(fetchCall, name) {
+  return new URLSearchParams(String(fetchCall?.options?.body || '')).get(name);
+}
+
+async function startOAuthFlow(server, provider, headers = {}) {
+  const response = await request(server, {
+    path: `/api/auth/${provider}?redirect=/projects.html`,
+    headers: {
+      Host: 'apps.askfluid.now',
+      ...headers,
+    },
+  });
+
+  assert.equal(response.statusCode, 302);
+  return response;
+}
+
+async function callbackOAuthFlow(server, provider, startResponse, headers = {}) {
+  const authUrl = new URL(startResponse.headers.location);
+  const state = authUrl.searchParams.get('state');
+  const cookie = cookieHeaderFromSetCookie(startResponse.headers['set-cookie']);
+
+  assert.ok(state);
+  assert.ok(cookie.includes(`fluid_oauth_state_${provider}=`));
+
+  const response = await request(server, {
+    path: `/api/auth/${provider}/callback?code=${provider}-code&state=${encodeURIComponent(state)}`,
+    headers: {
+      Host: 'apps.askfluid.now',
+      Cookie: cookie,
+      ...headers,
+    },
+  });
+
+  assert.equal(response.statusCode, 302);
+  return response;
+}
+
+test('Google OAuth start uses the canonical apps.askfluid.now callback URL in production', async () => {
+  await withPublicOAuthStubs(async () => {
+    const server = await listen();
+
+    try {
+      const response = await startOAuthFlow(server, 'google');
+      const authUrl = new URL(response.headers.location);
+
+      assert.equal(authUrl.origin, 'https://accounts.google.com');
+      assert.equal(authUrl.searchParams.get('redirect_uri'), GOOGLE_REDIRECT_URI);
+      assert.equal(response.headers.location.includes('onrender.com'), false);
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+test('GitHub OAuth start uses the canonical apps.askfluid.now callback URL in production', async () => {
+  await withPublicOAuthStubs(async () => {
+    const server = await listen();
+
+    try {
+      const response = await startOAuthFlow(server, 'github');
+      const authUrl = new URL(response.headers.location);
+
+      assert.equal(authUrl.origin, 'https://github.com');
+      assert.equal(authUrl.searchParams.get('redirect_uri'), GITHUB_REDIRECT_URI);
+      assert.equal(response.headers.location.includes('onrender.com'), false);
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+test('malicious Host and X-Forwarded-Host do not change the public OAuth redirect', async () => {
+  await withPublicOAuthStubs(async () => {
+    const server = await listen();
+
+    try {
+      const response = await request(server, {
+        path: '/api/auth/google?redirect=/projects.html',
+        headers: {
+          Host: 'apps.askfluid.now',
+          'X-Forwarded-Host': 'evil.example',
+        },
+      });
+
+      assert.equal(response.statusCode, 302);
+      assert.equal(response.headers.location, 'https://apps.askfluid.now/api/auth/google?redirect=/projects.html');
+      assert.equal(response.headers.location.includes('evil.example'), false);
+      assert.equal(response.headers.location.includes('onrender.com'), false);
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+test('production public OAuth does not fall back to onrender.com legacy callback envs', async () => {
+  await withPublicOAuthStubs(async () => {
+    const server = await listen();
+
+    delete process.env.GOOGLE_REDIRECT_URI;
+    delete process.env.GITHUB_REDIRECT_URI;
+    process.env.GOOGLE_CALLBACK_URL = 'https://fluidbe.onrender.com/api/auth/google/callback';
+    process.env.GITHUB_OAUTH_CALLBACK_URL = 'https://fluidbe.onrender.com/api/auth/github/callback';
+
+    try {
+      const google = await request(server, {
+        path: '/api/auth/google',
+        headers: { Host: 'apps.askfluid.now' },
+      });
+      const github = await request(server, {
+        path: '/api/auth/github',
+        headers: { Host: 'apps.askfluid.now' },
+      });
+
+      assert.equal(google.statusCode, 302);
+      assert.equal(github.statusCode, 302);
+      assert.equal(google.headers.location, 'https://askfluid.now/login.html?oauth_error=google');
+      assert.equal(github.headers.location, 'https://askfluid.now/login.html?error=GITHUB_OAUTH_NOT_CONFIGURED');
+      assert.equal(google.headers.location.includes('onrender.com'), false);
+      assert.equal(github.headers.location.includes('onrender.com'), false);
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+test('Google OAuth callback exchanges code with apps.askfluid.now and emits public session cookie', async () => {
+  await withPublicOAuthStubs(async ({ fetchCalls }) => {
+    const server = await listen();
+
+    try {
+      const start = await startOAuthFlow(server, 'google');
+      const callback = await callbackOAuthFlow(server, 'google', start);
+      const tokenExchange = fetchCalls.find((call) => call.url === 'https://oauth2.googleapis.com/token');
+      const sessionCookie = [].concat(callback.headers['set-cookie'] || [])
+        .find((cookie) => String(cookie).startsWith(`${SESSION_COOKIE_NAME}=`));
+
+      assert.equal(formBodyValue(tokenExchange, 'redirect_uri'), GOOGLE_REDIRECT_URI);
+      assert.equal(callback.headers.location, 'https://askfluid.now/auth-callback.html?redirect=%2Fprojects.html');
+      assert.equal(callback.headers.location.includes('token='), false);
+      assert.ok(sessionCookie);
+      assert.match(sessionCookie, /HttpOnly/i);
+      assert.match(sessionCookie, /Secure/i);
+      assert.match(sessionCookie, /Path=\//i);
+      assert.match(sessionCookie, /SameSite=Lax/i);
+      assert.doesNotMatch(sessionCookie, /Domain=/i);
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+test('GitHub OAuth callback exchanges code with apps.askfluid.now and omits token from redirect', async () => {
+  await withPublicOAuthStubs(async ({ fetchCalls }) => {
+    const server = await listen();
+
+    try {
+      const start = await startOAuthFlow(server, 'github');
+      const callback = await callbackOAuthFlow(server, 'github', start);
+      const tokenExchange = fetchCalls.find((call) => call.url === 'https://github.com/login/oauth/access_token');
+
+      assert.equal(formBodyValue(tokenExchange, 'redirect_uri'), GITHUB_REDIRECT_URI);
+      assert.equal(callback.headers.location, 'https://askfluid.now/auth-callback.html?redirect=%2Fprojects.html');
+      assert.equal(callback.headers.location.includes('token='), false);
+      assert.equal(callback.headers.location.includes('onrender.com'), false);
+    } finally {
+      await close(server);
+    }
+  });
 });
 
 test('OAuth callback source does not redirect with public token material', async () => {
