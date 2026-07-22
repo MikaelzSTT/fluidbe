@@ -161,6 +161,11 @@ const projectSchema = new mongoose.Schema(
       default: '',
     },
 
+    briefing: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+
     pages: {
       type: Array,
       default: [],

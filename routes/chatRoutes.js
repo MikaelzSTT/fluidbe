@@ -22,6 +22,12 @@ const {
   looksSensitiveForSnapshot,
 } = require('../utils/projectSnapshot');
 const { createSourceContext } = require('../utils/sourceContext');
+const {
+  buildBriefingQuestions,
+  buildBriefingSummary,
+  evaluateProjectBriefing,
+  hasExplicitBuildIntent,
+} = require('../utils/projectBriefing');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
@@ -856,6 +862,10 @@ Nunca use action "wizard" ou "clarify" apenas porque a mensagem contem um substa
 Use action "clarify" quando houver intencao clara de criar um projeto, mas o pedido ainda estiver vago ou incompleto para uma boa primeira geracao.
 ${hasUploadedImageContext ? 'Excecao importante: quando houver imagem anexada e o texto for vago, nao use uma resposta generica. Use action "chat" para fazer uma pergunta util baseada no que voce entendeu da imagem e inclua options curtas. A pergunta deve demonstrar que voce analisou a imagem.' : ''}
 
+Um projeto novo so esta pronto quando o briefing explicita tipo, objetivo, tema/oferta concreta e estilo. Landing pages, marketplaces, apps web e projetos de venda tambem precisam de publico; landing pages e projetos de venda precisam de CTA.
+Nao aceite como tema respostas vagas como "qualquer coisa", "nao sei", "algo legal" ou "vender produtos" sem especificar quais.
+Ao receber "vamos construir", "agora vamos construir" ou equivalente, inicie um briefing novo. Nao use personagens, marcas ou substantivos de conversa casual anterior como tema, salvo se o usuario os repetir explicitamente no pedido de criacao.
+
 Exemplos que devem ser "chat" se nao houver contexto anterior suficiente:
 - "wadsczx"
 - "teste"
@@ -903,54 +913,6 @@ Retorne somente JSON valido, sem markdown, sem texto antes ou depois, no formato
   "reply": "string",
   "options": ["string"]
 }
-`.trim();
-}
-
-function buildClarifySystemPrompt(projectContext = '', projectCodeContext = '') {
-  return `
-Voce e a IA de briefing da Fluid, em portugues do Brasil.
-
-Sua tarefa e gerar perguntas de clarificacao para melhorar a primeira geracao de um projeto digital.
-
-Regras obrigatorias:
-- Retorne somente JSON valido, sem markdown, sem texto antes ou depois.
-- Gere entre 2 e 4 perguntas.
-- Cada pergunta deve ter entre 2 e 4 opcoes.
-- As perguntas e opcoes devem ser dinamicas e contextuais ao pedido do usuario e ao historico, nunca hardcoded.
-- Tudo deve estar em portugues do Brasil.
-- Cada pergunta precisa ajudar a melhorar a primeira geracao do projeto.
-- Nao gere codigo, HTML, CSS ou JS.
-- Nao salve dados e nao mencione banco, ProjectBuild, MongoDB, JWT ou detalhes internos.
-- Nunca peca API key, token, senha ou secret no chat.
-- Sempre inclua uma pergunta de estilo visual quando fizer sentido.
-${projectContext ? '- Existe um projeto atual aberto; use o contexto dele apenas para evitar perguntas que contradigam o build atual.' : ''}
-
-Direcionamento por tipo de projeto:
-- Se for marketplace, pode perguntar sobre pagamentos, login, vendedores, checkout e visual.
-- Se for landing page, pode perguntar sobre objetivo, publico, CTA e visual.
-- Se for app, pode perguntar sobre plataforma, funcionalidades principais, login e visual.
-
-Formato exato:
-{
-  "questions": [
-    {
-      "id": "string_unica_curta_em_snake_case",
-      "question": "pergunta em portugues",
-      "options": [
-        {
-          "value": "string_curta_em_snake_case",
-          "label": "titulo curto",
-          "description": "explicacao curta"
-        }
-      ]
-    }
-  ]
-}
-
-Contexto do projeto atual:
-${projectContext || 'Nenhum projeto informado.'}
-
-${projectCodeContext || ''}
 `.trim();
 }
 
@@ -1110,7 +1072,7 @@ function hasExplicitBuildOrEditIntent(message, hasProject = false) {
   const directCreationNoun = /\b(quero|preciso)\b.*\b(app|aplicativo|site|website|landing page|marketplace|saas|dashboard|ecommerce|e commerce|loja|projeto|sistema|pagina|interface|plataforma)\b/.test(normalized);
   const editIntent = hasProject && /\b(edite|editar|altere|alterar|mude|mudar|troque|trocar|adicione|adicionar|remova|remover|ajuste|ajustar|aumente|aumentar|diminua|diminuir|deixa|deixe|maior|menor)\b/.test(normalized);
 
-  return creationIntent || directCreationNoun || editIntent;
+  return creationIntent || directCreationNoun || editIntent || (!hasProject && hasExplicitBuildIntent(message));
 }
 
 function getLastHistoryItem(history, role = null) {
@@ -1289,96 +1251,6 @@ function isCompleteFirstBuildPrompt(message, history, project) {
   return (hasTopic && hasExplicitName) || (hasTopic && featureCount >= 2) || featureCount >= 4;
 }
 
-function normalizeSlug(value, fallback) {
-  const normalized = String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 48);
-
-  return normalized || fallback;
-}
-
-function normalizeClarifyQuestions(questions) {
-  if (!Array.isArray(questions) || questions.length < 2) {
-    throw new Error('Perguntas de clarificacao invalidas.');
-  }
-
-  const usedQuestionIds = new Set();
-  const normalizedQuestions = [];
-
-  questions.forEach((question, questionIndex) => {
-    if (!question || typeof question !== 'object') {
-      return;
-    }
-
-    const questionText = String(question.question || '').replace(/\s+/g, ' ').trim();
-    const rawOptions = Array.isArray(question.options) ? question.options : [];
-
-    if (!questionText || rawOptions.length < 2) {
-      return;
-    }
-
-    let questionId = normalizeSlug(question.id || questionText, `pergunta_${questionIndex + 1}`);
-    let suffix = 2;
-
-    while (usedQuestionIds.has(questionId)) {
-      questionId = `${questionId}_${suffix}`;
-      suffix += 1;
-    }
-
-    const usedOptionValues = new Set();
-    const normalizedOptions = [];
-
-    rawOptions.forEach((option, optionIndex) => {
-      if (!option || typeof option !== 'object') {
-        return;
-      }
-
-      const label = String(option.label || '').replace(/\s+/g, ' ').trim();
-      const description = String(option.description || '').replace(/\s+/g, ' ').trim();
-
-      if (!label || !description) {
-        return;
-      }
-
-      let value = normalizeSlug(option.value || label, `opcao_${optionIndex + 1}`);
-      let optionSuffix = 2;
-
-      while (usedOptionValues.has(value)) {
-        value = `${value}_${optionSuffix}`;
-        optionSuffix += 1;
-      }
-
-      usedOptionValues.add(value);
-      normalizedOptions.push({
-        value,
-        label: label.slice(0, 80),
-        description: description.slice(0, 180),
-      });
-    });
-
-    if (normalizedOptions.length < 2) {
-      return;
-    }
-
-    usedQuestionIds.add(questionId);
-    normalizedQuestions.push({
-      id: questionId,
-      question: questionText,
-      options: normalizedOptions.slice(0, 4),
-    });
-  });
-
-  if (normalizedQuestions.length < 2) {
-    throw new Error('Perguntas de clarificacao invalidas.');
-  }
-
-  return normalizedQuestions.slice(0, 4);
-}
-
 async function callClaude({ messages, maxTokens = 700, aiQuotaContext }) {
   if (!process.env.ANTHROPIC_API_KEY) {
     setAiQuotaStage(aiQuotaContext, 'provider_call');
@@ -1514,25 +1386,6 @@ async function callOpenAiVision({ messages, imageAttachment, maxTokens = 700, ai
   return content;
 }
 
-async function getClarificationQuestions({ message, history, projectContext = '', projectCodeContext = '', aiQuotaContext }) {
-  const previousMessages = Array.isArray(history)
-    ? history.map(normalizeHistoryItem).filter(Boolean).slice(-12)
-    : [];
-
-  const content = await callClaude({
-    aiQuotaContext,
-    maxTokens: 1400,
-    messages: [
-      { role: 'system', content: buildClarifySystemPrompt(projectContext, projectCodeContext) },
-      ...previousMessages,
-      { role: 'user', content: message },
-    ],
-  });
-  const parsed = extractJson(content);
-
-  return normalizeClarifyQuestions(parsed.questions);
-}
-
 async function getFallbackChatReply({
   message, previousMessages, projectContext, projectCodeContext, projectVisualContext, imageAttachment, aiQuotaContext,
 }) {
@@ -1566,14 +1419,24 @@ async function getFallbackChatReply({
 
 async function getAiReply({
   message, history, project, projectCodeContext = '', projectVisualContext = '', imageAttachment, aiQuotaContext,
+  briefingInput = {},
 }) {
   const previousMessages = getPriorHistoryItems(history, message).slice(-12);
   const projectContext = buildProjectContext(project);
   const conversationalFollowUp = isLikelyConversationalFollowUp(message, previousMessages);
   const explicitBuildOrEditIntent = hasExplicitBuildOrEditIntent(message, Boolean(project));
+  const briefingEvaluation = project
+    ? null
+    : evaluateProjectBriefing({
+        ...briefingInput,
+        message,
+        history,
+      });
   const firstPromptBuildNow = !imageAttachment
     && !conversationalFollowUp
-    && isCompleteFirstBuildPrompt(message, history, project);
+    && !project
+    && explicitBuildOrEditIntent
+    && briefingEvaluation.complete;
 
   console.info('[chat] detectedBuildNow', {
     detectedBuildNow: firstPromptBuildNow,
@@ -1600,6 +1463,11 @@ async function getAiReply({
       status: 'in_progress',
       generationStatus: 'in_progress',
       generation_status: 'in_progress',
+      briefing: briefingEvaluation.briefing,
+      briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+      briefingComplete: true,
+      canBuild: true,
+      missingBriefingFields: [],
     };
   }
 
@@ -1634,6 +1502,18 @@ async function getAiReply({
       reply = 'Você quer falar sobre isso ou quer criar algum projeto com esse tema?';
     }
 
+    if (!project && explicitBuildOrEditIntent) {
+      if (briefingEvaluation.complete) {
+        action = 'wizard';
+        reply = reply && action === String(parsed.action || '').trim().toLowerCase()
+          ? reply
+          : 'O briefing mínimo está completo. Vou iniciar a criação.';
+      } else {
+        action = 'clarify';
+        reply = 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.';
+      }
+    }
+
     const firstPromptNoContext = !project && !hasFirstPromptHistory(history, message);
     const normalizedBuildText = firstPromptNoContext ? normalizeBuildIntentText(message) : '';
 
@@ -1661,12 +1541,18 @@ async function getAiReply({
       ];
     }
 
+    if (!project && briefingEvaluation.active && !briefingEvaluation.complete) {
+      action = 'clarify';
+      reply = 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.';
+      forcedImageClarifyOptions = null;
+    }
+
     const shouldIncludeOptions = action === 'chat' && isQuestion(reply) && !conversationalFollowUp && explicitBuildOrEditIntent;
     const options = normalizeOptions(
       forcedImageClarifyOptions || parsed.options,
       shouldIncludeOptions
     );
-    const readyForWizard = action === 'wizard';
+    const readyForWizard = action === 'wizard' && (Boolean(project) || briefingEvaluation.complete);
     const buildNowFromAi = readyForWizard && firstPromptNoContext;
     const connectorScope = project ? 'edit' : 'initial';
     const detectedRequiredConnectors = readyForWizard
@@ -1694,12 +1580,38 @@ async function getAiReply({
       status: buildNowFromAi ? 'in_progress' : null,
       generationStatus: buildNowFromAi ? 'in_progress' : null,
       generation_status: buildNowFromAi ? 'in_progress' : null,
+      briefing: briefingEvaluation?.briefing || null,
+      briefingSummary: briefingEvaluation ? buildBriefingSummary(briefingEvaluation.briefing) : null,
+      briefingComplete: briefingEvaluation?.complete || false,
+      canBuild: project ? readyForWizard : Boolean(briefingEvaluation?.complete && readyForWizard),
+      missingBriefingFields: briefingEvaluation?.missingFields || [],
     };
   } catch (error) {
     if (
       error instanceof SyntaxError ||
       error.message === 'Decisao invalida da IA.'
     ) {
+      if (!project && explicitBuildOrEditIntent) {
+        return {
+          reply: briefingEvaluation.complete
+            ? 'O briefing mínimo está completo. Vou iniciar a criação.'
+            : 'Vou fazer algumas perguntas rápidas para entender melhor o projeto.',
+          readyForWizard: briefingEvaluation.complete,
+          needsClarification: !briefingEvaluation.complete,
+          options: [],
+          requiredConnectors: [],
+          mode: briefingEvaluation.complete ? WIZARD_MODE : CLARIFY_MODE,
+          status: null,
+          generationStatus: null,
+          generation_status: null,
+          briefing: briefingEvaluation.briefing,
+          briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+          briefingComplete: briefingEvaluation.complete,
+          canBuild: briefingEvaluation.complete,
+          missingBriefingFields: briefingEvaluation.missingFields,
+        };
+      }
+
       return getFallbackChatReply({
         message,
         previousMessages,
@@ -1716,8 +1628,6 @@ async function getAiReply({
 }
 
 router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
-  const aiQuotaContext = createAiQuotaContext(req, { route: 'chat-clarify' });
-
   try {
     const { message, history, messages, projectId } = req.body;
 
@@ -1730,8 +1640,6 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
     }
 
     let project = null;
-    let projectContext = '';
-    let projectCodeContext = '';
     let effectiveHistory = history || messages;
 
     if (projectId) {
@@ -1748,39 +1656,32 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
         return res.status(404).json({ message: 'Projeto não encontrado.' });
       }
 
-      const currentSnapshot = await createCurrentProjectSnapshot(project);
-      projectContext = buildProjectContext(project);
-      projectCodeContext = currentSnapshot.promptBlock;
       effectiveHistory = await loadProjectMessageHistory(project._id);
     } else {
       const sessionHistory = await loadSessionMessageHistory(req);
       effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
     }
 
-    const questions = await getClarificationQuestions({
+    const briefingEvaluation = evaluateProjectBriefing({
+      ...req.body,
       message: message.trim(),
       history: effectiveHistory,
-      projectContext,
-      projectCodeContext,
-      aiQuotaContext,
     });
-    aiQuotaContext.providerUsefulResponse = true;
-    setAiQuotaStage(aiQuotaContext, 'quota_commit');
-    await commitAiQuotaContext(aiQuotaContext);
-    setAiQuotaStage(aiQuotaContext, null);
+    const questions = briefingEvaluation.complete
+      ? []
+      : buildBriefingQuestions(briefingEvaluation);
 
     return res.json({
       success: true,
       questions,
+      briefing: briefingEvaluation.briefing,
+      briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+      briefingComplete: briefingEvaluation.complete,
+      canBuild: briefingEvaluation.complete,
+      missingBriefingFields: briefingEvaluation.missingFields,
+      invalidBriefingFields: briefingEvaluation.invalidFields,
     });
   } catch (error) {
-    if (error?.code === AI_QUOTA_EXCEEDED_CODE || error?.code === AI_QUOTA_DUPLICATE_CODE) {
-      return sendAiQuotaError(res, error);
-    }
-
-    logSafeChatError(error, aiQuotaContext);
-    await refundAiQuotaAfterError(aiQuotaContext);
-
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });
@@ -1940,6 +1841,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       projectVisualContext,
       imageAttachment,
       aiQuotaContext,
+      briefingInput: req.body,
     });
     aiQuotaContext.providerUsefulResponse = true;
     setAiQuotaStage(aiQuotaContext, 'quota_commit');
@@ -1965,6 +1867,9 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
           status: aiReply.status || null,
           options: aiReply.options || [],
           requiredConnectors,
+          briefing: aiReply.briefing || null,
+          briefingComplete: Boolean(aiReply.briefingComplete),
+          missingBriefingFields: aiReply.missingBriefingFields || [],
           ...(safeImageMetadata || {}),
         },
       });
@@ -1996,6 +1901,9 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
           status: aiReply.status || null,
           options: aiReply.options || [],
           requiredConnectors,
+          briefing: aiReply.briefing || null,
+          briefingComplete: Boolean(aiReply.briefingComplete),
+          missingBriefingFields: aiReply.missingBriefingFields || [],
           ...(safeImageMetadata || {}),
         },
       });
@@ -2013,6 +1921,11 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       options: aiReply.options || [],
       requiredConnectors,
       changeRequest,
+      briefing: aiReply.briefing || null,
+      briefingSummary: aiReply.briefingSummary || null,
+      briefingComplete: Boolean(aiReply.briefingComplete),
+      canBuild: Boolean(aiReply.canBuild),
+      missingBriefingFields: aiReply.missingBriefingFields || [],
     };
 
     console.info('[chat] mode before response', {

@@ -43,6 +43,12 @@ const {
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
 const { deleteProjectsData } = require('../utils/projectDeletion');
 const {
+  buildBriefingQuestions,
+  buildBriefingSummary,
+  collectProjectBriefing,
+  evaluateProjectBriefing,
+} = require('../utils/projectBriefing');
+const {
   containsUnsafeMongoKey,
   isPlainObject,
 } = require('../utils/mongoSafety');
@@ -844,6 +850,13 @@ function buildProjectUpdate(body) {
     }
   }
 
+  if (Object.prototype.hasOwnProperty.call(source, 'briefing')) {
+    if (!isPlainObject(source.briefing)) {
+      return null;
+    }
+    update.briefing = collectProjectBriefing({ briefing: source.briefing });
+  }
+
   if (Object.prototype.hasOwnProperty.call(source, 'settings')) {
     if (!isPlainObject(source.settings)) {
       return null;
@@ -860,6 +873,26 @@ function buildProjectUpdate(body) {
   }
 
   return update;
+}
+
+function isBuildStartPayload(body = {}) {
+  return isBuildNowMode(body.mode)
+    || ['building', 'in_progress'].includes(String(body.status || '').trim().toLowerCase())
+    || String(body.generationStatus || body.generation_status || '').trim().toLowerCase() === 'in_progress';
+}
+
+function sendIncompleteBriefing(res, briefingEvaluation) {
+  return res.status(422).json({
+    code: 'BRIEFING_INCOMPLETE',
+    message: 'Complete o briefing mínimo antes de construir o projeto.',
+    briefing: briefingEvaluation.briefing,
+    briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+    briefingComplete: false,
+    canBuild: false,
+    missingBriefingFields: briefingEvaluation.missingFields,
+    invalidBriefingFields: briefingEvaluation.invalidFields,
+    questions: buildBriefingQuestions(briefingEvaluation),
+  });
 }
 
 function sendProjectUpdateError(res, error) {
@@ -919,6 +952,7 @@ router.post('/', authMiddleware, async (req, res) => {
       settings,
       requiredConnectors,
       mode,
+      briefing,
     } = req.body;
 
     if (!name) {
@@ -935,6 +969,19 @@ router.post('/', authMiddleware, async (req, res) => {
     );
     const projectStatus = buildNow ? 'in_progress' : status;
     const projectGenerationStatus = buildNow ? 'in_progress' : requestedWizardStatus;
+    const buildRequested = buildNow || requestedWizardStatus === 'in_progress' || status === 'building';
+    const briefingEvaluation = evaluateProjectBriefing({
+      ...req.body,
+      briefing,
+      prompt,
+      description,
+      type,
+    });
+
+    if (buildRequested && !briefingEvaluation.complete) {
+      return sendIncompleteBriefing(res, briefingEvaluation);
+    }
+
     const titlePrompt = [prompt, description, title, name].filter(Boolean).join(' ');
     const explicitProjectName = extractExplicitProjectName(titlePrompt);
     const projectTitle = await getUniqueProjectTitleForUser(req.userId, titlePrompt);
@@ -950,6 +997,7 @@ router.post('/', authMiddleware, async (req, res) => {
       generationStatus: projectGenerationStatus || undefined,
       generation_status: projectGenerationStatus || undefined,
       prompt,
+      briefing: briefingEvaluation.briefing,
       type,
       settings,
       appName: normalizeAppName(appName) || undefined,
@@ -1693,6 +1741,34 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
       return res.status(400).json({ message: 'Nenhum campo válido enviado para atualização.' });
     }
 
+    if (isBuildStartPayload(req.body)) {
+      const currentProject = await Project.findOne({
+        _id: req.projectObjectId,
+        userId: req.userId,
+      })
+        .select('name title description prompt type briefing settings status generationStatus generation_status')
+        .lean();
+
+      if (!currentProject) {
+        return res.status(404).json({ message: 'Projeto não encontrado.' });
+      }
+
+      const briefingEvaluation = evaluateProjectBriefing({
+        ...currentProject,
+        ...req.body,
+        briefing: {
+          ...(isPlainObject(currentProject.briefing) ? currentProject.briefing : {}),
+          ...(isPlainObject(req.body.briefing) ? req.body.briefing : {}),
+        },
+      });
+
+      if (!briefingEvaluation.complete) {
+        return sendIncompleteBriefing(res, briefingEvaluation);
+      }
+
+      update.briefing = briefingEvaluation.briefing;
+    }
+
     const project = await Project.findOneAndUpdate(
       {
         _id: req.projectObjectId,
@@ -1745,3 +1821,4 @@ module.exports = router;
 module.exports.buildProjectUpdate = buildProjectUpdate;
 module.exports.normalizeShopifyStoreUrl = normalizeShopifyStoreUrl;
 module.exports.sendProjectUpdateError = sendProjectUpdateError;
+module.exports.isBuildStartPayload = isBuildStartPayload;

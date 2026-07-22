@@ -50,6 +50,33 @@ async function runPut(body, findOneAndUpdate) {
   return res;
 }
 
+async function runBuildStartPut(body, currentProject, findOneAndUpdate) {
+  const originalFindOne = Project.findOne;
+  const originalFindOneAndUpdate = Project.findOneAndUpdate;
+  const handler = getProjectPutHandler();
+  const req = {
+    params: { id: '64f000000000000000000001' },
+    projectObjectId: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000002',
+    body,
+  };
+  const res = createResponse();
+
+  Project.findOne = () => ({
+    select() { return this; },
+    lean: async () => currentProject,
+  });
+  Project.findOneAndUpdate = findOneAndUpdate;
+  try {
+    await handler(req, res);
+  } finally {
+    Project.findOne = originalFindOne;
+    Project.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+
+  return res;
+}
+
 test('project update builds partial update without absent name', () => {
   assert.deepEqual(
     projectRoutes.buildProjectUpdate({
@@ -161,6 +188,64 @@ test('project PUT returns 400 for empty payload', async () => {
 
   assert.equal(res.statusCode, 400);
   assert.deepEqual(res.body, { message: 'Nenhum campo válido enviado para atualização.' });
+});
+
+test('project PUT blocks transition to in_progress with incomplete saved briefing', async () => {
+  let updated = false;
+  const res = await runBuildStartPut(
+    { generationStatus: 'in_progress' },
+    {
+      name: 'Generic Store',
+      type: 'landing-page',
+      prompt: 'landing page para vender produtos',
+      briefing: {
+        type: 'landing-page',
+        objective: 'vender',
+        mainContext: 'produtos',
+        audience: 'adultos',
+        style: 'moderno',
+        cta: 'Comprar',
+      },
+    },
+    async () => {
+      updated = true;
+      return null;
+    }
+  );
+
+  assert.equal(res.statusCode, 422);
+  assert.equal(res.body.code, 'BRIEFING_INCOMPLETE');
+  assert.equal(res.body.canBuild, false);
+  assert.equal(updated, false);
+});
+
+test('project PUT allows transition to in_progress with complete saved briefing', async () => {
+  let update;
+  const currentProject = {
+    name: 'English Now',
+    type: 'landing-page',
+    prompt: 'landing page para vender cursos de inglês para brasileiros adultos',
+    briefing: {
+      type: 'landing-page',
+      objective: 'vender',
+      mainContext: 'cursos de inglês',
+      audience: 'brasileiros adultos',
+      style: 'premium',
+      cta: 'Comprar',
+    },
+  };
+  const res = await runBuildStartPut(
+    { generationStatus: 'in_progress' },
+    currentProject,
+    async (query, nextUpdate) => {
+      update = nextUpdate;
+      return { _id: query._id, ...currentProject, generationStatus: 'in_progress' };
+    }
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(update.$set.generationStatus, 'in_progress');
+  assert.equal(update.$set.briefing.mainContext, 'cursos de inglês');
 });
 
 test('project PUT preserves normal wizard update fields and drops draft metadata', async () => {

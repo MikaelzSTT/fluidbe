@@ -162,7 +162,7 @@ function createAnthropicMock(providerState) {
   };
 }
 
-function createRequest(app, token, body, headers = {}) {
+function createRequest(app, token, body, headers = {}, path = '/api/chat') {
   return new Promise((resolve, reject) => {
     const server = http.createServer(app);
 
@@ -172,7 +172,7 @@ function createRequest(app, token, body, headers = {}) {
         method: 'POST',
         hostname: '127.0.0.1',
         port: server.address().port,
-        path: '/api/chat',
+        path,
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
@@ -637,6 +637,61 @@ test('POST /api/chat: substantivo curto isolado não dispara build intent mesmo 
     assert.equal(response.body.status, null);
     assert.equal(redis.reserveCalls, 1);
     assert.equal(redis.commitCalls, 1);
+  });
+});
+
+test('POST /api/chat: conversa sobre Superman seguida de "vamos construir" abre briefing novo', async () => {
+  const redis = new SmokeRedis();
+  const sessionMessages = [
+    { _id: 'm1', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'user', content: 'Quem ganha, Superman ou Hulk?', createdAt: new Date('2026-07-22T12:00:00Z') },
+    { _id: 'm2', userId: '64b7f0f0f0f0f0f0f0f0f0f0', sessionId: 'session-id', role: 'assistant', content: 'Superman.', createdAt: new Date('2026-07-22T12:01:00Z') },
+  ];
+  const providerState = {
+    calls: 0,
+    resultFromRequest() {
+      return { action: 'wizard', reply: 'Vou criar um projeto sobre Superman.' };
+    },
+  };
+
+  await withChatRouteSmoke({ redis, providerState, sessionMessages }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'agora vamos construir',
+      briefing: {
+        type: 'landing-page',
+        objective: 'vender',
+        style: 'moderno',
+      },
+    }, {
+      'Idempotency-Key': 'new-briefing-after-superman',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.mode, 'clarify');
+    assert.equal(response.body.readyForWizard, false);
+    assert.equal(response.body.canBuild, false);
+    assert.equal(response.body.briefing.mainContext, undefined);
+    assert.equal(JSON.stringify(response.body.briefing).includes('Superman'), false);
+  });
+});
+
+test('POST /api/chat/clarify gera perguntas sem duplicar quota de IA', async () => {
+  const redis = new SmokeRedis();
+  const providerState = { calls: 0 };
+
+  await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'vamos criar uma landing page para vender marmitas fitness',
+    }, {
+      'Idempotency-Key': 'local-clarification',
+    }, '/api/chat/clarify');
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.briefing.mainContext, 'marmitas fitness');
+    assert.equal(response.body.questions.some((question) => question.field === 'mainContext'), false);
+    assert.equal(response.body.questions.some((question) => question.field === 'audience'), true);
+    assert.equal(providerState.calls, 0);
+    assert.equal(redis.reserveCalls, 0);
+    assert.equal(redis.commitCalls, 0);
   });
 });
 
