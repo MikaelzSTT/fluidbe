@@ -6,6 +6,7 @@ const Module = require('module');
 const test = require('node:test');
 
 const ChatMessage = require('../models/ChatMessage');
+const BriefingSession = require('../models/BriefingSession');
 const Session = require('../models/Session');
 const User = require('../models/User');
 const Project = require('../models/Project');
@@ -234,7 +235,13 @@ function createFindManyChain(docs) {
   return chain;
 }
 
-async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', sessionMessages = null }, fn) {
+async function withChatRouteSmoke({
+  redis,
+  providerState,
+  userPlan = 'free',
+  sessionMessages = null,
+  briefingSessions = null,
+}, fn) {
   const previousEnv = {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     JWT_SECRET: process.env.JWT_SECRET,
@@ -244,6 +251,9 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', ses
   const previousLoad = Module._load;
   const previousChatFind = ChatMessage.find;
   const previousChatCreate = ChatMessage.create;
+  const previousBriefingFindOne = BriefingSession.findOne;
+  const previousBriefingFindOneAndUpdate = BriefingSession.findOneAndUpdate;
+  const previousBriefingCreate = BriefingSession.create;
   const previousFindOne = Session.findOne;
   const previousFindById = User.findById;
   const previousRedisProvider = rateLimit.getConnectedRedisClient;
@@ -252,6 +262,7 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', ses
   const previousConsoleError = console.error;
   const errorLogs = [];
   const storedSessionMessages = Array.isArray(sessionMessages) ? sessionMessages : [];
+  const storedBriefingSessions = Array.isArray(briefingSessions) ? briefingSessions : [];
 
   process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
   process.env.JWT_SECRET = 'test-jwt-secret';
@@ -277,6 +288,44 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', ses
     storedSessionMessages.push(message);
     return message;
   };
+  const matchesBriefingQuery = (session, query = {}) => {
+    if (query._id && String(session._id) !== String(query._id)) return false;
+    if (query.userId && String(session.userId) !== String(query.userId)) return false;
+    if (query.conversationId && session.conversationId !== query.conversationId) return false;
+    if (query.status && session.status !== query.status) return false;
+    if (query.expiresAt?.$gt && new Date(session.expiresAt) <= new Date(query.expiresAt.$gt)) return false;
+    return true;
+  };
+  BriefingSession.findOne = (query = {}) => {
+    let docs = storedBriefingSessions.filter((session) => matchesBriefingQuery(session, query));
+    const chain = {
+      sort() {
+        docs = [...docs].sort((left, right) => new Date(right.updatedAt || 0) - new Date(left.updatedAt || 0));
+        return this;
+      },
+      lean: async () => docs[0] || null,
+      then(resolve, reject) {
+        return Promise.resolve(docs[0] || null).then(resolve, reject);
+      },
+    };
+    return chain;
+  };
+  BriefingSession.findOneAndUpdate = async (query, update) => {
+    const session = storedBriefingSessions.find((item) => matchesBriefingQuery(item, query));
+    if (!session) return null;
+    Object.assign(session, update.$set || {}, { updatedAt: new Date() });
+    return session;
+  };
+  BriefingSession.create = async (payload) => {
+    const session = {
+      _id: `64f000000000000000000${String(storedBriefingSessions.length + 1).padStart(3, '0')}`,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...payload,
+    };
+    storedBriefingSessions.push(session);
+    return session;
+  };
   rateLimit.getConnectedRedisClient = async () => redis;
   console.info = () => {};
   console.warn = () => {};
@@ -299,7 +348,13 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', ses
     app.use('/api/chat', chatRoutes);
     const token = jwt.sign({ id: '64b7f0f0f0f0f0f0f0f0f0f0', jti: 'session-jti' }, process.env.JWT_SECRET, { algorithm: 'HS256' });
 
-    await fn({ app, token, errorLogs, sessionMessages: storedSessionMessages });
+    await fn({
+      app,
+      token,
+      errorLogs,
+      sessionMessages: storedSessionMessages,
+      briefingSessions: storedBriefingSessions,
+    });
   } finally {
     process.env.ANTHROPIC_API_KEY = previousEnv.ANTHROPIC_API_KEY;
     process.env.JWT_SECRET = previousEnv.JWT_SECRET;
@@ -309,6 +364,9 @@ async function withChatRouteSmoke({ redis, providerState, userPlan = 'free', ses
     else process.env.PUBLIC_BEARER_AUTH_LEGACY_ENABLED = previousEnv.PUBLIC_BEARER_AUTH_LEGACY_ENABLED;
     ChatMessage.find = previousChatFind;
     ChatMessage.create = previousChatCreate;
+    BriefingSession.findOne = previousBriefingFindOne;
+    BriefingSession.findOneAndUpdate = previousBriefingFindOneAndUpdate;
+    BriefingSession.create = previousBriefingCreate;
     Session.findOne = previousFindOne;
     User.findById = previousFindById;
     rateLimit.getConnectedRedisClient = previousRedisProvider;
@@ -530,6 +588,58 @@ test('POST /api/chat: usa snapshot do projeto atual e ignora histórico de outro
   }
 });
 
+test('POST /api/chat: inspeção de projeto existente ainda exige snapshot', async () => {
+  const redis = new SmokeRedis();
+  const userId = '64b7f0f0f0f0f0f0f0f0f0f0';
+  const projectId = '64f0000000000000000000a9';
+  const providerState = { calls: 0 };
+  const previousProjectFindOne = Project.findOne;
+  const previousBuildFindOne = ProjectBuild.findOne;
+  const previousMessageFind = ProjectMessage.find;
+  const previousMessageCreate = ProjectMessage.create;
+  const createdMessages = [];
+
+  Project.findOne = mockFindOne([{
+    _id: projectId,
+    userId,
+    name: 'Projeto sem build',
+    appName: 'Projeto sem build',
+  }]);
+  ProjectBuild.findOne = mockFindOne([]);
+  ProjectMessage.find = () => ({
+    sort() { return this; },
+    limit() { return this; },
+    select() { return this; },
+    lean: async () => [],
+  });
+  ProjectMessage.create = async (payload) => {
+    createdMessages.push(payload);
+    return { _id: `missing-snapshot-${createdMessages.length}`, ...payload };
+  };
+
+  try {
+    await withChatRouteSmoke({ redis, providerState }, async ({ app, token }) => {
+      const response = await createRequest(app, token, {
+        projectId,
+        projectFlow: 'existing_project',
+        message: 'O que tem na home?',
+      });
+
+      assert.equal(response.status, 200);
+      assert.match(response.body.reply, /não consegui inspecionar o snapshot atual/i);
+      assert.equal(response.body.mode, 'chat');
+      assert.equal(providerState.calls, 0);
+      assert.equal(redis.reserveCalls, 0);
+      assert.equal(createdMessages.length, 2);
+    });
+  } finally {
+    Project.findOne = previousProjectFindOne;
+    ProjectBuild.findOne = previousBuildFindOne;
+    ProjectMessage.find = previousMessageFind;
+    ProjectMessage.create = previousMessageCreate;
+  }
+});
+
 test('POST /api/chat: "Superman" seguido de "pq" mantém contexto da mesma sessão e conta uma chamada real por turno', async () => {
   const redis = new SmokeRedis();
   const providerState = {
@@ -692,6 +802,94 @@ test('POST /api/chat/clarify gera perguntas sem duplicar quota de IA', async () 
     assert.equal(providerState.calls, 0);
     assert.equal(redis.reserveCalls, 0);
     assert.equal(redis.commitCalls, 0);
+  });
+});
+
+test('POST /api/chat: briefing completo continua construível após espera sem snapshot nem nova cobrança', async () => {
+  const redis = new SmokeRedis();
+  const providerState = { calls: 0 };
+  const briefingSessionId = '64f0000000000000000000d1';
+  const briefing = {
+    type: 'landing-page',
+    objective: 'vender',
+    mainContext: 'marmitas fitness',
+    audience: 'profissionais ocupados',
+    style: 'moderno',
+    cta: 'Comprar agora',
+  };
+  const briefingSessions = [{
+    _id: briefingSessionId,
+    userId: '64b7f0f0f0f0f0f0f0f0f0f0',
+    conversationId: 'session-id',
+    status: 'active',
+    briefing,
+    briefingSummary: briefing,
+    structuredAnswers: briefing,
+    sourcePrompt: 'Crie uma landing page para vender marmitas fitness',
+    complete: true,
+    canBuild: true,
+    createdAt: new Date(Date.now() - 20 * 60 * 1000),
+    updatedAt: new Date(Date.now() - 10 * 60 * 1000),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    projectId: null,
+  }];
+
+  await withChatRouteSmoke({ redis, providerState, briefingSessions }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Construir projeto',
+      action: 'build_project',
+      projectFlow: 'new_project',
+      briefingSessionId,
+      projectId: '64f0000000000000000000e1',
+      history: [{ role: 'user', content: 'Conversa casual sobre Superman' }],
+    }, {
+      'Idempotency-Key': 'delayed-build-click',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.mode, 'build_now');
+    assert.equal(response.body.canBuild, true);
+    assert.equal(response.body.briefing.mainContext, 'marmitas fitness');
+    assert.equal(response.body.briefingSessionId, briefingSessionId);
+    assert.equal(providerState.calls, 0);
+    assert.equal(redis.reserveCalls, 0);
+    assert.equal(redis.commitCalls, 0);
+    assert.equal(redis.refundCalls, 0);
+    assert.doesNotMatch(response.body.reply, /snapshot/i);
+  });
+});
+
+test('POST /api/chat: ação com briefing expirado retorna erro restaurável específico', async () => {
+  const redis = new SmokeRedis();
+  const providerState = { calls: 0 };
+  const briefingSessionId = '64f0000000000000000000d2';
+  const briefingSessions = [{
+    _id: briefingSessionId,
+    userId: '64b7f0f0f0f0f0f0f0f0f0f0',
+    conversationId: 'session-id',
+    status: 'active',
+    briefing: {},
+    briefingSummary: {},
+    structuredAnswers: {},
+    complete: true,
+    canBuild: true,
+    expiresAt: new Date(Date.now() - 1000),
+  }];
+
+  await withChatRouteSmoke({ redis, providerState, briefingSessions }, async ({ app, token }) => {
+    const response = await createRequest(app, token, {
+      message: 'Construir projeto',
+      action: 'build_project',
+      projectFlow: 'new_project',
+      briefingSessionId,
+    });
+
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, 'BRIEFING_SESSION_EXPIRED');
+    assert.equal(response.body.restoreRequired, true);
+    assert.equal(providerState.calls, 0);
+    assert.equal(redis.reserveCalls, 0);
+    assert.doesNotMatch(response.body.message, /snapshot/i);
   });
 });
 

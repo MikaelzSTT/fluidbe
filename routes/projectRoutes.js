@@ -5,6 +5,7 @@ const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const BuildJob = require('../models/BuildJob');
 const ProjectMessage = require('../models/ProjectMessage');
+const BriefingSession = require('../models/BriefingSession');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/authMiddleware');
@@ -52,6 +53,12 @@ const {
   containsUnsafeMongoKey,
   isPlainObject,
 } = require('../utils/mongoSafety');
+const {
+  findBriefingSession,
+  getRequestedBriefingSessionId,
+  isExpired: isBriefingSessionExpired,
+  sendBriefingSessionExpired,
+} = require('../utils/briefingSessions');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -895,6 +902,43 @@ function sendIncompleteBriefing(res, briefingEvaluation) {
   });
 }
 
+function buildPersistedBriefingPrompt(briefingEvaluation) {
+  return JSON.stringify({
+    briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+    structuredAnswers: briefingEvaluation.briefing,
+  });
+}
+
+function getProjectCreationIdempotencyKey(req, briefingSession) {
+  if (briefingSession?._id) {
+    return `briefing-session:${briefingSession._id}`;
+  }
+
+  const provided = req.headers?.['idempotency-key']
+    || req.headers?.['x-idempotency-key']
+    || req.body?.idempotencyKey
+    || req.body?.requestId;
+  const normalized = String(provided || '').trim().slice(0, 180);
+  return normalized ? `request:${normalized}` : '';
+}
+
+async function findIdempotentCreatedProject(req, creationIdempotencyKey) {
+  if (!creationIdempotencyKey) return null;
+
+  return Project.findOne({
+    userId: req.userId,
+    creationIdempotencyKey,
+  });
+}
+
+function sendIdempotentCreatedProject(res, project) {
+  return res.status(200).json({
+    message: 'Projeto já criado para este briefing.',
+    project,
+    idempotent: true,
+  });
+}
+
 function sendProjectUpdateError(res, error) {
   if (error?.name === 'ValidationError') {
     return res.status(400).json({ message: 'Dados inválidos para atualização do projeto.' });
@@ -939,6 +983,8 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 router.post('/', authMiddleware, async (req, res) => {
+  let creationIdempotencyKey = '';
+
   try {
     const {
       name,
@@ -955,10 +1001,6 @@ router.post('/', authMiddleware, async (req, res) => {
       briefing,
     } = req.body;
 
-    if (!name) {
-      return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
-    }
-
     const buildNow = isBuildNowMode(mode) || isBuildNowMode(status);
     const requestedWizardStatus = normalizeWizardStatus(
       generationStatus !== undefined
@@ -970,51 +1012,141 @@ router.post('/', authMiddleware, async (req, res) => {
     const projectStatus = buildNow ? 'in_progress' : status;
     const projectGenerationStatus = buildNow ? 'in_progress' : requestedWizardStatus;
     const buildRequested = buildNow || requestedWizardStatus === 'in_progress' || status === 'building';
-    const briefingEvaluation = evaluateProjectBriefing({
-      ...req.body,
-      briefing,
-      prompt,
-      description,
-      type,
-    });
+    let persistedBriefingSession = null;
+    let effectivePrompt = prompt;
+    let effectiveDescription = description;
+    let effectiveType = type;
+    let persistedBriefingEvaluation = null;
 
-    if (buildRequested && !briefingEvaluation.complete) {
-      return sendIncompleteBriefing(res, briefingEvaluation);
+    if (buildRequested && (req.session || getRequestedBriefingSessionId(req.body))) {
+      persistedBriefingSession = await findBriefingSession(req, { includeCompleted: true });
+
+      if (!persistedBriefingSession) {
+        return sendBriefingSessionExpired(res);
+      }
+
+      creationIdempotencyKey = getProjectCreationIdempotencyKey(req, persistedBriefingSession);
+      const alreadyCreated = persistedBriefingSession.projectId
+        ? await Project.findOne({
+            _id: persistedBriefingSession.projectId,
+            userId: req.userId,
+          })
+        : await findIdempotentCreatedProject(req, creationIdempotencyKey);
+
+      if (alreadyCreated) {
+        return sendIdempotentCreatedProject(res, alreadyCreated);
+      }
+
+      if (isBriefingSessionExpired(persistedBriefingSession)) {
+        return sendBriefingSessionExpired(res);
+      }
+
+      persistedBriefingEvaluation = evaluateProjectBriefing({
+        briefing: persistedBriefingSession.briefing || {},
+        answers: persistedBriefingSession.structuredAnswers || {},
+      });
+      const sessionIsConsistent = Boolean(persistedBriefingSession.complete) === persistedBriefingEvaluation.complete
+        && Boolean(persistedBriefingSession.canBuild) === persistedBriefingEvaluation.complete;
+
+      if (!sessionIsConsistent) {
+        return sendBriefingSessionExpired(res);
+      }
+
+      if (!persistedBriefingEvaluation.complete) {
+        return sendIncompleteBriefing(res, persistedBriefingEvaluation);
+      }
+
+      effectivePrompt = buildPersistedBriefingPrompt(persistedBriefingEvaluation);
+      effectiveDescription = effectivePrompt;
+      effectiveType = persistedBriefingEvaluation.briefing.type || type;
+    } else {
+      creationIdempotencyKey = getProjectCreationIdempotencyKey(req, null);
+      const alreadyCreated = await findIdempotentCreatedProject(req, creationIdempotencyKey);
+      if (alreadyCreated) return sendIdempotentCreatedProject(res, alreadyCreated);
     }
 
-    const titlePrompt = [prompt, description, title, name].filter(Boolean).join(' ');
+    if (!name) {
+      return res.status(400).json({ message: 'Nome do projeto é obrigatório.' });
+    }
+
+    const briefingEvaluation = persistedBriefingSession
+      ? persistedBriefingEvaluation
+      : evaluateProjectBriefing({
+          ...req.body,
+          briefing,
+          prompt,
+          description,
+          type,
+        });
+
+    if (buildRequested && !briefingEvaluation.complete) {
+      return persistedBriefingSession
+        ? sendBriefingSessionExpired(res)
+        : sendIncompleteBriefing(res, briefingEvaluation);
+    }
+
+    const titlePrompt = [effectivePrompt, effectiveDescription, title, name].filter(Boolean).join(' ');
     const explicitProjectName = extractExplicitProjectName(titlePrompt);
     const projectTitle = await getUniqueProjectTitleForUser(req.userId, titlePrompt);
     const explicitAppName = extractExplicitAppName(titlePrompt);
-    const appName = explicitAppName || normalizeAppName(projectTitle) || generateFallbackAppName({ name: projectTitle, description, prompt }, prompt);
+    const appName = explicitAppName || normalizeAppName(projectTitle) || generateFallbackAppName({
+      name: projectTitle,
+      description: effectiveDescription,
+      prompt: effectivePrompt,
+    }, effectivePrompt);
 
     const project = await Project.create({
       userId: req.userId,
       name: projectTitle,
       title: projectTitle,
-      description,
+      description: effectiveDescription,
       status: projectStatus,
       generationStatus: projectGenerationStatus || undefined,
       generation_status: projectGenerationStatus || undefined,
-      prompt,
+      prompt: effectivePrompt,
       briefing: briefingEvaluation.briefing,
-      type,
+      briefingSessionId: persistedBriefingSession?._id || undefined,
+      creationIdempotencyKey: creationIdempotencyKey || undefined,
+      type: effectiveType,
       settings,
       appName: normalizeAppName(appName) || undefined,
       appNameSource: explicitProjectName ? 'user' : 'generated',
       appNameLocked: Boolean(explicitProjectName),
       requiredConnectors: detectInitialRequiredConnectors({
         name: projectTitle,
-        description,
-        prompt,
-        requiredConnectors,
+        description: effectiveDescription,
+        prompt: effectivePrompt,
+        requiredConnectors: persistedBriefingSession ? [] : requiredConnectors,
       }),
     });
+
+    if (persistedBriefingSession) {
+      await BriefingSession.findOneAndUpdate(
+        {
+          _id: persistedBriefingSession._id,
+          userId: req.userId,
+        },
+        {
+          $set: {
+            status: 'completed',
+            projectId: project._id,
+            completedAt: new Date(),
+          },
+        }
+      );
+    }
+
     return res.status(201).json({
       message: 'Projeto criado com sucesso.',
       project,
+      idempotent: false,
     });
   } catch (error) {
+    if (error?.code === 11000 && creationIdempotencyKey) {
+      const alreadyCreated = await findIdempotentCreatedProject(req, creationIdempotencyKey);
+      if (alreadyCreated) return sendIdempotentCreatedProject(res, alreadyCreated);
+    }
+
     return res.status(500).json({
       message: 'Erro interno do servidor.',
     });

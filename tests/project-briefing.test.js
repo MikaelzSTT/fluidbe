@@ -2,6 +2,7 @@ const assert = require('assert/strict');
 const test = require('node:test');
 
 const Project = require('../models/Project');
+const BriefingSession = require('../models/BriefingSession');
 const projectRoutes = require('../routes/projectRoutes');
 const {
   buildBriefingQuestions,
@@ -177,5 +178,224 @@ test('POST /api/projects inicia somente com briefing mínimo completo', async ()
   } finally {
     Project.find = originalFind;
     Project.create = originalCreate;
+  }
+});
+
+test('POST /api/projects usa briefing persistido após espera e ignora conversa casual do payload', async () => {
+  const originalBriefingFindOne = BriefingSession.findOne;
+  const originalBriefingUpdate = BriefingSession.findOneAndUpdate;
+  const originalProjectFindOne = Project.findOne;
+  const originalProjectFind = Project.find;
+  const originalProjectCreate = Project.create;
+  const briefingSessionId = '64f0000000000000000000b1';
+  const savedSession = {
+    _id: briefingSessionId,
+    userId: '64f000000000000000000001',
+    conversationId: 'session-id',
+    status: 'active',
+    briefing: {
+      type: 'landing-page',
+      objective: 'vender',
+      mainContext: 'cursos de inglês',
+      audience: 'brasileiros adultos',
+      style: 'premium',
+      cta: 'Comprar',
+    },
+    briefingSummary: {
+      type: 'landing-page',
+      objective: 'vender',
+      mainContext: 'cursos de inglês',
+      audience: 'brasileiros adultos',
+      style: 'premium',
+      cta: 'Comprar',
+    },
+    structuredAnswers: {
+      type: 'landing-page',
+      objective: 'vender',
+      mainContext: 'cursos de inglês',
+      audience: 'brasileiros adultos',
+      style: 'premium',
+      cta: 'Comprar',
+    },
+    complete: true,
+    canBuild: true,
+    updatedAt: new Date(Date.now() - 10 * 60 * 1000),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    projectId: null,
+  };
+  let createdPayload;
+
+  BriefingSession.findOne = () => ({ lean: async () => savedSession });
+  BriefingSession.findOneAndUpdate = async (query, update) => {
+    Object.assign(savedSession, update.$set);
+    return savedSession;
+  };
+  Project.findOne = async () => null;
+  Project.find = () => ({ select() { return this; }, lean: async () => [] });
+  Project.create = async (payload) => {
+    createdPayload = payload;
+    return { _id: '64f0000000000000000000c1', ...payload };
+  };
+
+  try {
+    const req = {
+      userId: savedSession.userId,
+      session: { _id: 'session-id' },
+      headers: {},
+      body: {
+        name: 'English Now',
+        mode: 'build_now',
+        projectFlow: 'new_project',
+        briefingSessionId,
+        prompt: 'Conversa casual anterior sobre Superman',
+        briefing: { mainContext: 'Superman' },
+        requiredConnectors: [{ provider: 'openai', reason: 'Conversa casual anterior' }],
+      },
+    };
+    const res = createResponse();
+
+    await getCreateProjectHandler()(req, res);
+
+    assert.equal(res.statusCode, 201);
+    assert.equal(createdPayload.briefing.mainContext, 'cursos de inglês');
+    assert.equal(createdPayload.briefingSessionId, briefingSessionId);
+    assert.match(createdPayload.prompt, /briefingSummary/);
+    assert.doesNotMatch(createdPayload.prompt, /Superman/);
+    assert.deepEqual(createdPayload.requiredConnectors, []);
+    assert.equal(savedSession.status, 'completed');
+  } finally {
+    BriefingSession.findOne = originalBriefingFindOne;
+    BriefingSession.findOneAndUpdate = originalBriefingUpdate;
+    Project.findOne = originalProjectFindOne;
+    Project.find = originalProjectFind;
+    Project.create = originalProjectCreate;
+  }
+});
+
+test('duplo clique em construir reutiliza o projeto e cria uma única vez', async () => {
+  const originalBriefingFindOne = BriefingSession.findOne;
+  const originalBriefingUpdate = BriefingSession.findOneAndUpdate;
+  const originalProjectFindOne = Project.findOne;
+  const originalProjectFind = Project.find;
+  const originalProjectCreate = Project.create;
+  const briefingSessionId = '64f0000000000000000000b2';
+  const projectId = '64f0000000000000000000c2';
+  const savedSession = {
+    _id: briefingSessionId,
+    userId: '64f000000000000000000001',
+    conversationId: 'session-id',
+    status: 'active',
+    briefing: {
+      type: 'website', objective: 'apresentar', mainContext: 'consultoria financeira', style: 'moderno',
+    },
+    briefingSummary: {
+      type: 'website', objective: 'apresentar', mainContext: 'consultoria financeira', style: 'moderno',
+    },
+    structuredAnswers: {
+      type: 'website', objective: 'apresentar', mainContext: 'consultoria financeira', style: 'moderno',
+    },
+    complete: true,
+    canBuild: true,
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    projectId: null,
+  };
+  let createdProject = null;
+  let createCalls = 0;
+
+  BriefingSession.findOne = () => ({ lean: async () => savedSession });
+  BriefingSession.findOneAndUpdate = async (query, update) => {
+    Object.assign(savedSession, update.$set);
+    return savedSession;
+  };
+  Project.findOne = async (query) => {
+    if (createdProject && (
+      String(query._id || '') === projectId
+      || query.creationIdempotencyKey === createdProject.creationIdempotencyKey
+    )) return createdProject;
+    return null;
+  };
+  Project.find = () => ({ select() { return this; }, lean: async () => [] });
+  Project.create = async (payload) => {
+    createCalls += 1;
+    createdProject = { _id: projectId, ...payload };
+    return createdProject;
+  };
+
+  try {
+    const requestBody = {
+      name: 'Fin Consult',
+      mode: 'build_now',
+      projectFlow: 'new_project',
+      briefingSessionId,
+    };
+    const firstRes = createResponse();
+    const secondRes = createResponse();
+
+    await getCreateProjectHandler()({
+      userId: savedSession.userId, session: { _id: 'session-id' }, headers: {}, body: requestBody,
+    }, firstRes);
+    await getCreateProjectHandler()({
+      userId: savedSession.userId, session: { _id: 'session-id' }, headers: {}, body: requestBody,
+    }, secondRes);
+
+    assert.equal(firstRes.statusCode, 201);
+    assert.equal(secondRes.statusCode, 200);
+    assert.equal(secondRes.body.idempotent, true);
+    assert.equal(String(secondRes.body.project._id), projectId);
+    assert.equal(createCalls, 1);
+  } finally {
+    BriefingSession.findOne = originalBriefingFindOne;
+    BriefingSession.findOneAndUpdate = originalBriefingUpdate;
+    Project.findOne = originalProjectFindOne;
+    Project.find = originalProjectFind;
+    Project.create = originalProjectCreate;
+  }
+});
+
+test('POST /api/projects retorna BRIEFING_SESSION_EXPIRED para briefing persistido expirado', async () => {
+  const originalBriefingFindOne = BriefingSession.findOne;
+  const originalProjectFindOne = Project.findOne;
+  const originalProjectCreate = Project.create;
+  let createCalled = false;
+
+  BriefingSession.findOne = () => ({
+    lean: async () => ({
+      _id: '64f0000000000000000000b3',
+      userId: '64f000000000000000000001',
+      conversationId: 'session-id',
+      status: 'active',
+      briefing: {},
+      complete: true,
+      canBuild: true,
+      expiresAt: new Date(Date.now() - 1000),
+      projectId: null,
+    }),
+  });
+  Project.findOne = async () => null;
+  Project.create = async () => {
+    createCalled = true;
+  };
+
+  try {
+    const res = createResponse();
+    await getCreateProjectHandler()({
+      userId: '64f000000000000000000001',
+      session: { _id: 'session-id' },
+      headers: {},
+      body: {
+        name: 'Expired',
+        mode: 'build_now',
+        briefingSessionId: '64f0000000000000000000b3',
+      },
+    }, res);
+
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'BRIEFING_SESSION_EXPIRED');
+    assert.equal(res.body.restoreRequired, true);
+    assert.equal(createCalled, false);
+  } finally {
+    BriefingSession.findOne = originalBriefingFindOne;
+    Project.findOne = originalProjectFindOne;
+    Project.create = originalProjectCreate;
   }
 });

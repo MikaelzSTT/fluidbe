@@ -166,6 +166,19 @@ const projectSchema = new mongoose.Schema(
       default: {},
     },
 
+    briefingSessionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'BriefingSession',
+      default: null,
+      index: true,
+    },
+
+    creationIdempotencyKey: {
+      type: String,
+      trim: true,
+      maxlength: 200,
+    },
+
     pages: {
       type: Array,
       default: [],
@@ -331,6 +344,13 @@ const projectSchema = new mongoose.Schema(
 );
 
 projectSchema.index({ slug: 1 }, { unique: true, sparse: true });
+projectSchema.index(
+  { userId: 1, creationIdempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { creationIdempotencyKey: { $type: 'string' } },
+  }
+);
 
 projectSchema.virtual('publicUrl').get(function getPublicUrl() {
   return this.slug ? buildPublishedProjectUrl(this.slug) : '';

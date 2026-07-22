@@ -22,12 +22,24 @@ const {
   looksSensitiveForSnapshot,
 } = require('../utils/projectSnapshot');
 const { createSourceContext } = require('../utils/sourceContext');
+const { isPlainObject } = require('../utils/mongoSafety');
 const {
   buildBriefingQuestions,
   buildBriefingSummary,
   evaluateProjectBriefing,
   hasExplicitBuildIntent,
 } = require('../utils/projectBriefing');
+const {
+  buildBriefingSessionPayload,
+  findBriefingSession,
+  getRequestedBriefingSessionId,
+  isBuildProjectAction,
+  isExistingProjectFlow,
+  isExpired,
+  isNewProjectFlow,
+  persistBriefingSession,
+  sendBriefingSessionExpired,
+} = require('../utils/briefingSessions');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
@@ -1466,6 +1478,7 @@ async function getAiReply({
       briefing: briefingEvaluation.briefing,
       briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
       briefingComplete: true,
+      briefingActive: true,
       canBuild: true,
       missingBriefingFields: [],
     };
@@ -1583,6 +1596,7 @@ async function getAiReply({
       briefing: briefingEvaluation?.briefing || null,
       briefingSummary: briefingEvaluation ? buildBriefingSummary(briefingEvaluation.briefing) : null,
       briefingComplete: briefingEvaluation?.complete || false,
+      briefingActive: briefingEvaluation?.active || false,
       canBuild: project ? readyForWizard : Boolean(briefingEvaluation?.complete && readyForWizard),
       missingBriefingFields: briefingEvaluation?.missingFields || [],
     };
@@ -1607,6 +1621,7 @@ async function getAiReply({
           briefing: briefingEvaluation.briefing,
           briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
           briefingComplete: briefingEvaluation.complete,
+          briefingActive: briefingEvaluation.active,
           canBuild: briefingEvaluation.complete,
           missingBriefingFields: briefingEvaluation.missingFields,
         };
@@ -1627,6 +1642,26 @@ async function getAiReply({
   }
 }
 
+router.get('/briefing', authMiddleware, async (req, res) => {
+  try {
+    const briefingSession = await findBriefingSession(req);
+
+    if (!briefingSession) {
+      return sendBriefingSessionExpired(res);
+    }
+
+    return res.json({
+      success: true,
+      ...buildBriefingSessionPayload(briefingSession),
+      expired: isExpired(briefingSession),
+      canBuild: !isExpired(briefingSession) && Boolean(briefingSession.canBuild),
+      restoreRequired: isExpired(briefingSession),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro interno do servidor.' });
+  }
+});
+
 router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
   try {
     const { message, history, messages, projectId } = req.body;
@@ -1642,7 +1677,10 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
     let project = null;
     let effectiveHistory = history || messages;
 
-    if (projectId) {
+    let savedBriefingSession = null;
+    const newProjectFlow = isNewProjectFlow(req.body) || !projectId;
+
+    if (projectId && !newProjectFlow) {
       if (!mongoose.Types.ObjectId.isValid(projectId)) {
         return res.status(400).json({ message: 'ID de projeto inválido.' });
       }
@@ -1660,26 +1698,50 @@ router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
     } else {
       const sessionHistory = await loadSessionMessageHistory(req);
       effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
+
+      savedBriefingSession = await findBriefingSession(req, { includeCompleted: false });
+      if (getRequestedBriefingSessionId(req.body) && (
+        !savedBriefingSession || isExpired(savedBriefingSession)
+      )) {
+        return sendBriefingSessionExpired(res);
+      }
     }
 
     const briefingEvaluation = evaluateProjectBriefing({
       ...req.body,
+      briefing: {
+        ...(savedBriefingSession?.briefing || {}),
+        ...(isPlainObject(req.body.briefing) ? req.body.briefing : {}),
+      },
       message: message.trim(),
       history: effectiveHistory,
     });
+    const briefingSummary = buildBriefingSummary(briefingEvaluation.briefing);
     const questions = briefingEvaluation.complete
       ? []
       : buildBriefingQuestions(briefingEvaluation);
+    const persistedBriefingSession = newProjectFlow
+      ? await persistBriefingSession(req, {
+          ...briefingEvaluation,
+          briefingSummary,
+        }, {
+          sourcePrompt: savedBriefingSession?.sourcePrompt || message.trim(),
+          structuredAnswers: {
+            ...briefingEvaluation.briefing,
+          },
+        })
+      : null;
 
     return res.json({
       success: true,
       questions,
       briefing: briefingEvaluation.briefing,
-      briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+      briefingSummary,
       briefingComplete: briefingEvaluation.complete,
       canBuild: briefingEvaluation.complete,
       missingBriefingFields: briefingEvaluation.missingFields,
       invalidBriefingFields: briefingEvaluation.invalidFields,
+      ...(persistedBriefingSession ? buildBriefingSessionPayload(persistedBriefingSession) : {}),
     });
   } catch (error) {
     return res.status(500).json({
@@ -1711,7 +1773,12 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
     let userMessage = null;
     let sessionUserMessage = null;
     let changeRequest = null;
+    let savedBriefingSession = null;
+    let persistedBriefingSession = null;
     const trimmedMessage = rawMessage.trim() || getDefaultImagePrompt(req);
+    const buildProjectAction = isBuildProjectAction(req.body, trimmedMessage);
+    const newProjectFlow = isNewProjectFlow(req.body)
+      || (buildProjectAction && !isExistingProjectFlow(req.body));
 
     if (rawMessage.length > MAX_CHAT_MESSAGE_CHARS) {
       return res.status(413).json({ code: 'CHAT_MESSAGE_TOO_LARGE', message: 'Mensagem muito longa.' });
@@ -1721,7 +1788,7 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       return res.status(400).json({ message: 'Mensagem obrigatória.' });
     }
 
-    if (projectId) {
+    if (projectId && !newProjectFlow) {
       if (!mongoose.Types.ObjectId.isValid(projectId)) {
         return res.status(400).json({ message: 'ID de projeto inválido.' });
       }
@@ -1822,6 +1889,41 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       projectVisualContext = imageVisualContext;
       const sessionHistory = await loadSessionMessageHistory(req);
       effectiveHistory = sessionHistory.length ? sessionHistory : effectiveHistory;
+
+      if (buildProjectAction) {
+        savedBriefingSession = await findBriefingSession(req, { includeCompleted: true });
+
+        if (!savedBriefingSession || isExpired(savedBriefingSession)) {
+          return sendBriefingSessionExpired(res);
+        }
+
+        const briefingEvaluation = evaluateProjectBriefing({
+          briefing: savedBriefingSession.briefing || {},
+          answers: savedBriefingSession.structuredAnswers || {},
+        });
+        const sessionIsConsistent = Boolean(savedBriefingSession.complete) === briefingEvaluation.complete
+          && Boolean(savedBriefingSession.canBuild) === briefingEvaluation.complete;
+
+        if (!sessionIsConsistent) {
+          return sendBriefingSessionExpired(res);
+        }
+
+        if (!briefingEvaluation.complete) {
+          return res.status(422).json({
+            code: 'BRIEFING_INCOMPLETE',
+            message: 'Complete o briefing mínimo antes de construir o projeto.',
+            briefing: briefingEvaluation.briefing,
+            briefingSummary: buildBriefingSummary(briefingEvaluation.briefing),
+            briefingComplete: false,
+            canBuild: false,
+            missingBriefingFields: briefingEvaluation.missingFields,
+            invalidBriefingFields: briefingEvaluation.invalidFields,
+            questions: buildBriefingQuestions(briefingEvaluation),
+            briefingSessionId: String(savedBriefingSession._id),
+          });
+        }
+      }
+
       sessionUserMessage = await createSessionChatMessage(req, {
         role: 'user',
         content: trimmedMessage,
@@ -1833,16 +1935,42 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       });
     }
 
-    const aiReply = await getAiReply({
-      message: trimmedMessage,
-      history: effectiveHistory,
-      project,
-      projectCodeContext,
-      projectVisualContext,
-      imageAttachment,
-      aiQuotaContext,
-      briefingInput: req.body,
-    });
+    const aiReply = savedBriefingSession && buildProjectAction
+      ? {
+          reply: BUILD_NOW_REPLY,
+          readyForWizard: true,
+          needsClarification: false,
+          options: [],
+          requiredConnectors: detectRequiredConnectors({
+            message: JSON.stringify({
+              briefingSummary: savedBriefingSession.briefingSummary || {},
+              structuredAnswers: savedBriefingSession.briefing || {},
+            }),
+            history: [],
+            project: null,
+            scope: 'initial',
+          }),
+          mode: BUILD_NOW_MODE,
+          status: 'in_progress',
+          generationStatus: 'in_progress',
+          generation_status: 'in_progress',
+          briefing: savedBriefingSession.briefing,
+          briefingSummary: savedBriefingSession.briefingSummary,
+          briefingComplete: true,
+          briefingActive: true,
+          canBuild: true,
+          missingBriefingFields: [],
+        }
+      : await getAiReply({
+          message: trimmedMessage,
+          history: effectiveHistory,
+          project,
+          projectCodeContext,
+          projectVisualContext,
+          imageAttachment,
+          aiQuotaContext,
+          briefingInput: req.body,
+        });
     aiQuotaContext.providerUsefulResponse = true;
     setAiQuotaStage(aiQuotaContext, 'quota_commit');
     await commitAiQuotaContext(aiQuotaContext);
@@ -1888,6 +2016,24 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
         await changeRequest.save();
       }
     } else {
+      if (aiReply.briefingActive) {
+        const briefingSummary = aiReply.briefingSummary || buildBriefingSummary(aiReply.briefing || {});
+        const startsNewBriefing = hasExplicitBuildIntent(trimmedMessage)
+          && !buildProjectAction
+          && !getRequestedBriefingSessionId(req.body);
+        persistedBriefingSession = savedBriefingSession || await persistBriefingSession(req, {
+          briefing: aiReply.briefing || {},
+          briefingSummary,
+          complete: Boolean(aiReply.briefingComplete),
+        }, {
+          sourcePrompt: startsNewBriefing ? trimmedMessage : '',
+          structuredAnswers: {
+            ...(aiReply.briefing || {}),
+          },
+          startNew: startsNewBriefing,
+        });
+      }
+
       await createSessionChatMessage(req, {
         role: 'assistant',
         content: aiReply.reply,
@@ -1926,6 +2072,9 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
       briefingComplete: Boolean(aiReply.briefingComplete),
       canBuild: Boolean(aiReply.canBuild),
       missingBriefingFields: aiReply.missingBriefingFields || [],
+      ...(persistedBriefingSession || savedBriefingSession
+        ? buildBriefingSessionPayload(persistedBriefingSession || savedBriefingSession)
+        : {}),
     };
 
     console.info('[chat] mode before response', {
