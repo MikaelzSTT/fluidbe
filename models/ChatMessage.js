@@ -7,21 +7,18 @@ const chatMessageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
 
     sessionId: {
       type: String,
       required: true,
       trim: true,
-      index: true,
     },
 
     role: {
       type: String,
       enum: MESSAGE_ROLES,
       required: true,
-      index: true,
     },
 
     content: {
@@ -43,6 +40,6 @@ const chatMessageSchema = new mongoose.Schema(
   }
 );
 
-chatMessageSchema.index({ userId: 1, sessionId: 1, createdAt: 1 });
+chatMessageSchema.index({ userId: 1, sessionId: 1, createdAt: 1, _id: 1 });
 
 module.exports = mongoose.model('ChatMessage', chatMessageSchema);

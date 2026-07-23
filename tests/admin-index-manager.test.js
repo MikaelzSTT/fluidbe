@@ -1,9 +1,12 @@
 const assert = require('assert/strict');
 const test = require('node:test');
 const {
+  buildIndexMigrationPlan,
   compareIndexSpecs,
   ensureModelIndexes,
   findExistingIndexesByName,
+  formatIndexMigrationPlan,
+  matchesIndexFilters,
   migrateIndex,
 } = require('../utils/adminIndexManager');
 
@@ -209,6 +212,126 @@ test('compareIndexSpecs preserves key order for compound indexes', () => {
       expected: { idempotencyKey: 1, result: 1 },
     },
   ]);
+});
+
+test('buildIndexMigrationPlan prefers collMod for briefing session TTL mismatch', () => {
+  const expectedIndex = {
+    key: { expiresAt: 1 },
+    name: 'expiresAt_1',
+    options: { expireAfterSeconds: 0 },
+    comparable: {
+      key: { expiresAt: 1 },
+      name: 'expiresAt_1',
+      expireAfterSeconds: 0,
+    },
+  };
+
+  const plan = buildIndexMigrationPlan({
+    collectionName: 'briefingsessions',
+    existingIndex: { key: { expiresAt: 1 }, name: 'expiresAt_1' },
+    expectedIndex,
+    differences: [{ field: 'expireAfterSeconds', existing: undefined, expected: 0 }],
+  });
+
+  assert.equal(plan.requiresDropRecreate, false);
+  assert.equal(plan.canIgnore, false);
+  assert.deepEqual(plan.commands, [
+    'db.runCommand({"collMod":"briefingsessions","index":{"keyPattern":{"expiresAt":1},"expireAfterSeconds":0}})',
+  ]);
+  assert.deepEqual(plan.fallbackCommands, [
+    'db.getCollection("briefingsessions").dropIndex("expiresAt_1")',
+    'db.getCollection("briefingsessions").createIndex({"expiresAt":1}, {"name":"expiresAt_1","expireAfterSeconds":0})',
+  ]);
+});
+
+test('buildIndexMigrationPlan marks non-unique briefingSessionId sparse mismatch as ignorable', () => {
+  const expectedIndex = {
+    key: { briefingSessionId: 1 },
+    name: 'briefingSessionId_1',
+    options: { sparse: true },
+    comparable: {
+      key: { briefingSessionId: 1 },
+      name: 'briefingSessionId_1',
+      sparse: true,
+    },
+  };
+
+  const plan = buildIndexMigrationPlan({
+    collectionName: 'projects',
+    existingIndex: { key: { briefingSessionId: 1 }, name: 'briefingSessionId_1' },
+    expectedIndex,
+    differences: [{ field: 'sparse', existing: undefined, expected: true }],
+  });
+
+  assert.equal(plan.canIgnore, true);
+  assert.equal(plan.requiresDropRecreate, true);
+  assert.match(plan.impact, /not required for functional correctness/);
+});
+
+test('buildIndexMigrationPlan stages Stripe unique partial indexes with a temporary name', () => {
+  const expectedIndex = {
+    key: { stripeCustomerId: 1 },
+    name: 'stripeCustomerId_1',
+    options: {
+      unique: true,
+      partialFilterExpression: {
+        stripeCustomerId: { $type: 'string', $gt: '' },
+      },
+    },
+    comparable: {
+      key: { stripeCustomerId: 1 },
+      name: 'stripeCustomerId_1',
+      unique: true,
+      partialFilterExpression: {
+        stripeCustomerId: { $type: 'string', $gt: '' },
+      },
+    },
+  };
+
+  const plan = buildIndexMigrationPlan({
+    collectionName: 'users',
+    existingIndex: { key: { stripeCustomerId: 1 }, name: 'stripeCustomerId_1' },
+    expectedIndex,
+    differences: [
+      { field: 'unique', existing: undefined, expected: true },
+      {
+        field: 'partialFilterExpression',
+        existing: undefined,
+        expected: { stripeCustomerId: { $type: 'string', $gt: '' } },
+      },
+    ],
+  });
+
+  assert.equal(plan.temporaryIndexName, 'stripeCustomerId_1_unique_partial_tmp');
+  assert.equal(plan.canIgnore, false);
+  assert.deepEqual(plan.commands.slice(0, 3), [
+    'db.getCollection("users").createIndex({"stripeCustomerId":1}, {"name":"stripeCustomerId_1_unique_partial_tmp","unique":true,"partialFilterExpression":{"stripeCustomerId":{"$type":"string","$gt":""}}})',
+    'db.getCollection("users").getIndexes().filter((index) => index.name === "stripeCustomerId_1_unique_partial_tmp")',
+    'db.getCollection("users").dropIndex("stripeCustomerId_1")',
+  ]);
+  assert.ok(formatIndexMigrationPlan(plan).some((line) => line.includes('Commands to run manually')));
+});
+
+test('matchesIndexFilters supports collection and index name filters', () => {
+  assert.equal(matchesIndexFilters({
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+  }, {
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+  }), true);
+  assert.equal(matchesIndexFilters({
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+  }, {
+    collectionName: 'projects',
+  }), false);
+  assert.equal(matchesIndexFilters({
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+  }, {
+    indexName: 'stripeSubscriptionId_1',
+  }), false);
 });
 
 test('migrateIndex without --confirm does not change incompatible index', async () => {

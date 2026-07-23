@@ -7,7 +7,6 @@ const adminAuditLogSchema = new mongoose.Schema(
       ref: 'AdminUser',
       default: null,
       immutable: true,
-      index: true,
     },
     actorType: {
       type: String,
@@ -21,7 +20,6 @@ const adminAuditLogSchema = new mongoose.Schema(
       trim: true,
       maxlength: 160,
       immutable: true,
-      index: true,
     },
     resourceType: {
       type: String,
@@ -41,14 +39,12 @@ const adminAuditLogSchema = new mongoose.Schema(
       enum: ['pending', 'success', 'failure'],
       required: true,
       immutable: true,
-      index: true,
     },
     idempotencyKey: {
       type: String,
       trim: true,
       maxlength: 160,
       immutable: true,
-      index: true,
     },
     requestHash: {
       type: String,
@@ -66,7 +62,6 @@ const adminAuditLogSchema = new mongoose.Schema(
       trim: true,
       maxlength: 160,
       immutable: true,
-      index: true,
     },
     ip: {
       type: String,

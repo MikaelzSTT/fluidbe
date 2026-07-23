@@ -6,7 +6,6 @@ const runtimeDocumentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
 
     collection: {
@@ -14,13 +13,11 @@ const runtimeDocumentSchema = new mongoose.Schema(
       required: true,
       trim: true,
       lowercase: true,
-      index: true,
     },
 
     ownerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'RuntimeDocument',
-      index: true,
     },
 
     data: {
@@ -36,7 +33,7 @@ const runtimeDocumentSchema = new mongoose.Schema(
 
 runtimeDocumentSchema.index({ projectId: 1, collection: 1, createdAt: -1 });
 runtimeDocumentSchema.index({ projectId: 1, collection: 1, updatedAt: -1 });
-runtimeDocumentSchema.index({ projectId: 1, ownerId: 1, createdAt: -1 });
+runtimeDocumentSchema.index({ projectId: 1, collection: 1, ownerId: 1, createdAt: -1 });
 runtimeDocumentSchema.index({ projectId: 1, collection: 1, 'data.email': 1 });
 
 module.exports = mongoose.model('RuntimeDocument', runtimeDocumentSchema);

@@ -29,20 +29,17 @@ const connectorSecretSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
     provider: {
       type: String,
       required: true,
       trim: true,
       lowercase: true,
-      index: true,
     },
     encryptedValues: {
       type: Map,

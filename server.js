@@ -1247,8 +1247,11 @@ app.get('/', (req, res) => {
 });
 
 function startServer() {
+  const autoIndex = process.env.NODE_ENV !== 'production'
+    && process.env.MONGOOSE_AUTO_INDEX !== 'false';
+
   mongoose
-    .connect(process.env.MONGODB_URI)
+    .connect(process.env.MONGODB_URI, { autoIndex })
     .then(() => {
       console.log('MongoDB conectado');
     })
@@ -1290,6 +1293,10 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
+  getMongooseConnectOptions: () => ({
+    autoIndex: process.env.NODE_ENV !== 'production'
+      && process.env.MONGOOSE_AUTO_INDEX !== 'false',
+  }),
   previewIsolationHelpers: {
     buildPreviewContentSecurityPolicy,
     corsOptions,

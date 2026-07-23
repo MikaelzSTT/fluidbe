@@ -24,14 +24,12 @@ const buildJobSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
 
     projectBuildId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ProjectBuild',
       required: true,
-      index: true,
     },
 
     sourceGridFsFileId: {
@@ -44,7 +42,6 @@ const buildJobSchema = new mongoose.Schema(
       enum: BUILD_JOB_STATUSES,
       required: true,
       default: 'queued',
-      index: true,
     },
 
     attempt: {
@@ -99,9 +96,11 @@ const buildJobSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-buildJobSchema.index({ status: 1, queuedAt: 1 });
+buildJobSchema.index({ projectId: 1 });
+buildJobSchema.index({ status: 1, queuedAt: 1, _id: 1 });
 buildJobSchema.index({ leaseUntil: 1 });
-buildJobSchema.index({ projectBuildId: 1, createdAt: -1 });
+buildJobSchema.index({ projectBuildId: 1, createdAt: -1, _id: -1 });
+buildJobSchema.index({ projectId: 1, projectBuildId: 1 });
 
 module.exports = mongoose.model('BuildJob', buildJobSchema);
 module.exports.BUILD_JOB_TYPES = BUILD_JOB_TYPES;

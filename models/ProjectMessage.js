@@ -8,14 +8,12 @@ const projectMessageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
 
     role: {
       type: String,
       enum: MESSAGE_ROLES,
       required: true,
-      index: true,
     },
 
     content: {
@@ -37,7 +35,7 @@ const projectMessageSchema = new mongoose.Schema(
   }
 );
 
-projectMessageSchema.index({ projectId: 1, createdAt: 1 });
+projectMessageSchema.index({ projectId: 1, createdAt: 1, _id: 1 });
 
 module.exports = mongoose.model('ProjectMessage', projectMessageSchema);
 module.exports.MESSAGE_ROLES = MESSAGE_ROLES;

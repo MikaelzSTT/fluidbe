@@ -6,7 +6,6 @@ const stripeWebhookEventSchema = new mongoose.Schema(
       type: String,
       required: true,
       unique: true,
-      index: true,
     },
     type: {
       type: String,
@@ -17,7 +16,6 @@ const stripeWebhookEventSchema = new mongoose.Schema(
       enum: ['processing', 'processed', 'failed'],
       required: true,
       default: 'processing',
-      index: true,
     },
     receivedAt: {
       type: Date,
@@ -33,6 +31,14 @@ const stripeWebhookEventSchema = new mongoose.Schema(
     },
   },
   { timestamps: true }
+);
+
+stripeWebhookEventSchema.index(
+  { receivedAt: 1 },
+  {
+    expireAfterSeconds: 90 * 24 * 60 * 60,
+    partialFilterExpression: { status: 'processed' },
+  }
 );
 
 module.exports = mongoose.model('StripeWebhookEvent', stripeWebhookEventSchema);

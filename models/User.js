@@ -115,37 +115,31 @@ const userSchema = new mongoose.Schema(
     stripeCustomerId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     stripeTestCustomerId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     stripeLiveCustomerId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     stripeSubscriptionId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     stripeTestSubscriptionId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     stripeLiveSubscriptionId: {
       type: String,
       trim: true,
-      index: true,
     },
 
     subscriptionStatus: {
@@ -270,7 +264,6 @@ const userSchema = new mongoose.Schema(
     deletedAt: {
       type: Date,
       default: null,
-      index: true,
     },
 
     deletedIdentityHashes: {
@@ -287,6 +280,27 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+function addNonEmptyUniqueStringIndex(fieldName) {
+  userSchema.index(
+    { [fieldName]: 1 },
+    {
+      unique: true,
+      partialFilterExpression: {
+        [fieldName]: { $type: 'string', $gt: '' },
+      },
+    }
+  );
+}
+
+[
+  'stripeCustomerId',
+  'stripeTestCustomerId',
+  'stripeLiveCustomerId',
+  'stripeSubscriptionId',
+  'stripeTestSubscriptionId',
+  'stripeLiveSubscriptionId',
+].forEach(addNonEmptyUniqueStringIndex);
 
 userSchema.index({ deletedAt: 1, deletedIdentityHashes: 1 });
 

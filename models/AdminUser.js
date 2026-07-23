@@ -26,7 +26,6 @@ const adminUserSchema = new mongoose.Schema(
     active: {
       type: Boolean,
       default: true,
-      index: true,
     },
     permissions: {
       type: [String],
@@ -92,8 +91,6 @@ const adminUserSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
-
-adminUserSchema.index({ active: 1, email: 1 });
 
 module.exports = mongoose.model('AdminUser', adminUserSchema);
 module.exports.ADMIN_PERMISSIONS = ADMIN_PERMISSIONS;

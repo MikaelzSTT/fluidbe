@@ -5,7 +5,6 @@ const sessionSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     required: true,
-    index: true,
   },
   jti: {
     type: String,
@@ -47,7 +46,7 @@ const sessionSchema = new mongoose.Schema({
   },
 });
 
-sessionSchema.index({ userId: 1, revokedAt: 1, expiresAt: 1 });
+sessionSchema.index({ userId: 1, revokedAt: 1, createdAt: -1, expiresAt: 1 });
 sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('Session', sessionSchema);

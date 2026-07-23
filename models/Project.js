@@ -170,7 +170,6 @@ const projectSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'BriefingSession',
       default: null,
-      index: true,
     },
 
     creationIdempotencyKey: {
@@ -317,13 +316,11 @@ const projectSchema = new mongoose.Schema(
     ownerDeleted: {
       type: Boolean,
       default: false,
-      index: true,
     },
 
     accountDeleted: {
       type: Boolean,
       default: false,
-      index: true,
     },
 
     ownerDeletedAt: {
@@ -344,6 +341,10 @@ const projectSchema = new mongoose.Schema(
 );
 
 projectSchema.index({ slug: 1 }, { unique: true, sparse: true });
+projectSchema.index({ userId: 1, createdAt: -1, _id: -1 });
+projectSchema.index({ userId: 1, isPublished: 1 });
+projectSchema.index({ updatedAt: -1, createdAt: -1, _id: -1 });
+projectSchema.index({ briefingSessionId: 1 }, { sparse: true });
 projectSchema.index(
   { userId: 1, creationIdempotencyKey: 1 },
   {

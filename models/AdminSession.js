@@ -5,7 +5,6 @@ const adminSessionSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'AdminUser',
     required: true,
-    index: true,
   },
   jti: {
     type: String,
@@ -47,7 +46,7 @@ const adminSessionSchema = new mongoose.Schema({
   },
 });
 
-adminSessionSchema.index({ adminUserId: 1, revokedAt: 1, expiresAt: 1 });
+adminSessionSchema.index({ adminUserId: 1, revokedAt: 1, createdAt: -1, expiresAt: 1 });
 adminSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('AdminSession', adminSessionSchema);

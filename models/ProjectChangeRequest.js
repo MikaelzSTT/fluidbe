@@ -8,21 +8,18 @@ const projectChangeRequestSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
 
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
 
     messageId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ProjectMessage',
       default: null,
-      index: true,
     },
 
     assistantMessageId: {
@@ -41,7 +38,6 @@ const projectChangeRequestSchema = new mongoose.Schema(
       type: String,
       enum: CHANGE_REQUEST_STATUSES,
       default: 'pending',
-      index: true,
     },
 
     requiredConnectors: {
@@ -74,8 +70,10 @@ const projectChangeRequestSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-projectChangeRequestSchema.index({ projectId: 1, status: 1, createdAt: -1 });
-projectChangeRequestSchema.index({ status: 1, createdAt: -1 });
+projectChangeRequestSchema.index({ projectId: 1, status: 1, createdAt: -1, _id: -1 });
+projectChangeRequestSchema.index({ projectId: 1, createdAt: -1, _id: -1 });
+projectChangeRequestSchema.index({ status: 1, createdAt: -1, _id: -1 });
+projectChangeRequestSchema.index({ createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model('ProjectChangeRequest', projectChangeRequestSchema);
 module.exports.CHANGE_REQUEST_STATUSES = CHANGE_REQUEST_STATUSES;

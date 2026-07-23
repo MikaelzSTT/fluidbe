@@ -9,14 +9,12 @@ const projectBuildSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       required: true,
-      index: true,
     },
 
     buildJobId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'BuildJob',
       default: null,
-      index: true,
     },
 
     type: {
@@ -31,7 +29,6 @@ const projectBuildSchema = new mongoose.Schema(
       enum: BUILD_STATUSES,
       required: true,
       default: 'draft',
-      index: true,
     },
 
     html: {
@@ -217,7 +214,9 @@ const projectBuildSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-projectBuildSchema.index({ projectId: 1, status: 1, createdAt: -1 });
+projectBuildSchema.index({ projectId: 1, status: 1, createdAt: -1, updatedAt: -1, _id: -1 });
+projectBuildSchema.index({ projectId: 1, createdAt: -1, updatedAt: -1, _id: -1 });
+projectBuildSchema.index({ projectId: 1, updatedAt: -1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model('ProjectBuild', projectBuildSchema);
 module.exports.BUILD_TYPES = BUILD_TYPES;

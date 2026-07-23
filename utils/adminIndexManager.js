@@ -5,6 +5,15 @@ const COMPARED_OPTION_FIELDS = [
   'expireAfterSeconds',
 ];
 
+const STRIPE_UNIQUE_PARTIAL_INDEX_FIELDS = new Set([
+  'stripeCustomerId',
+  'stripeTestCustomerId',
+  'stripeLiveCustomerId',
+  'stripeSubscriptionId',
+  'stripeTestSubscriptionId',
+  'stripeLiveSubscriptionId',
+]);
+
 function clonePlain(value) {
   if (value === undefined) {
     return undefined;
@@ -83,6 +92,21 @@ function getExpectedIndexes(model) {
   return model.schema.indexes().map(expectedIndexFromSchema);
 }
 
+function matchesIndexFilters({ collectionName, indexName }, filters = {}) {
+  const targetCollection = filters.collectionName || filters.collection;
+  const targetIndex = filters.indexName || filters.index;
+
+  if (targetCollection && collectionName !== targetCollection) {
+    return false;
+  }
+
+  if (targetIndex && indexName !== targetIndex) {
+    return false;
+  }
+
+  return true;
+}
+
 function compareIndexSpecs(existingIndex, expectedIndex) {
   const existing = comparableIndexSpec(existingIndex);
   const expected = expectedIndex.comparable || comparableIndexSpec(expectedIndex);
@@ -120,6 +144,140 @@ function getCollectionName(model) {
 
 function describeIndex(index) {
   return JSON.stringify(comparableIndexSpec(index), null, 2);
+}
+
+function mongoLiteral(value) {
+  return JSON.stringify(value);
+}
+
+function collectionExpression(collectionName) {
+  return `db.getCollection(${mongoLiteral(collectionName)})`;
+}
+
+function createIndexCommand(collectionName, key, options) {
+  return `${collectionExpression(collectionName)}.createIndex(${mongoLiteral(key)}, ${mongoLiteral(options)})`;
+}
+
+function dropIndexCommand(collectionName, indexName) {
+  return `${collectionExpression(collectionName)}.dropIndex(${mongoLiteral(indexName)})`;
+}
+
+function getSingleIndexField(key) {
+  const entries = Object.entries(key || {});
+  return entries.length === 1 ? entries[0][0] : null;
+}
+
+function expectedCreateOptions(expectedIndex) {
+  return {
+    name: expectedIndex.name,
+    ...(expectedIndex.options || {}),
+  };
+}
+
+function buildIndexMigrationPlan({ collectionName, existingIndex, expectedIndex, differences = [] }) {
+  const currentIndex = comparableIndexSpec(existingIndex);
+  const desiredIndex = expectedIndex.comparable || comparableIndexSpec(expectedIndex);
+  const indexName = desiredIndex.name;
+  const fieldName = getSingleIndexField(desiredIndex.key);
+  const basePlan = {
+    collectionName,
+    indexName,
+    currentIndex,
+    desiredIndex,
+    differences: clonePlain(differences),
+    canIgnore: false,
+    requiresDropRecreate: true,
+    dropRecreateDetail: 'Changing these index options requires a manual drop and recreate if the final index must keep the same name.',
+    blockingRisk: 'Moderate: building or rebuilding an index can add load to the collection and may briefly take metadata locks at the start/end of the operation.',
+    impact: 'Changes the index definition used by queries and writes.',
+    commands: [
+      dropIndexCommand(collectionName, indexName),
+      createIndexCommand(collectionName, desiredIndex.key, expectedCreateOptions(expectedIndex)),
+    ],
+  };
+
+  if (
+    collectionName === 'briefingsessions'
+    && indexName === 'expiresAt_1'
+    && desiredIndex.expireAfterSeconds === 0
+  ) {
+    return {
+      ...basePlan,
+      canIgnore: false,
+      requiresDropRecreate: false,
+      dropRecreateDetail: 'Use collMod on MongoDB 5.1+ to add or change expireAfterSeconds without rebuilding the index. On older versions, use manual drop/recreate in a maintenance window.',
+      blockingRisk: 'Low for collMod itself because it does not rebuild the index. Operational risk comes from TTL deletes: lowering the TTL can make existing expired documents eligible for deletion immediately.',
+      impact: 'Turns the existing expiresAt index into an absolute TTL index; sessions whose expiresAt date is in the past become eligible for TTL deletion.',
+      commands: [
+        `db.runCommand(${mongoLiteral({ collMod: collectionName, index: { keyPattern: desiredIndex.key, expireAfterSeconds: desiredIndex.expireAfterSeconds } })})`,
+      ],
+      fallbackCommands: [
+        dropIndexCommand(collectionName, indexName),
+        createIndexCommand(collectionName, desiredIndex.key, expectedCreateOptions(expectedIndex)),
+      ],
+    };
+  }
+
+  if (collectionName === 'projects' && indexName === 'briefingSessionId_1') {
+    return {
+      ...basePlan,
+      canIgnore: true,
+      requiresDropRecreate: true,
+      dropRecreateDetail: 'MongoDB cannot change sparse on an existing normal index in place; changing it requires manual drop/recreate.',
+      blockingRisk: 'Moderate if recreated. There is no correctness gap for this non-unique lookup index, but queries on briefingSessionId can be slower while the canonical index is absent.',
+      impact: 'Sparse only reduces index entries for documents without briefingSessionId. Because the index is not unique, sparse is not required for functional correctness.',
+    };
+  }
+
+  if (collectionName === 'users' && STRIPE_UNIQUE_PARTIAL_INDEX_FIELDS.has(fieldName)) {
+    const temporaryName = `${indexName}_unique_partial_tmp`;
+    const temporaryOptions = {
+      name: temporaryName,
+      unique: true,
+      partialFilterExpression: desiredIndex.partialFilterExpression,
+    };
+
+    return {
+      ...basePlan,
+      canIgnore: false,
+      requiresDropRecreate: true,
+      dropRecreateDetail: 'Keeping the canonical name requires dropping the old index name, but the unique partial index can be built first with a temporary name so the collection is never left without an index on this field.',
+      blockingRisk: 'Moderate: unique index creation scans indexed non-empty string values and can fail on duplicates; while building, writes continue but receive additional index-build load.',
+      impact: 'Adds uniqueness only for non-empty string Stripe IDs. Missing, null, empty, and non-string values remain outside the partial unique constraint.',
+      temporaryIndexName: temporaryName,
+      commands: [
+        createIndexCommand(collectionName, desiredIndex.key, temporaryOptions),
+        `${collectionExpression(collectionName)}.getIndexes().filter((index) => index.name === ${mongoLiteral(temporaryName)})`,
+        dropIndexCommand(collectionName, indexName),
+        createIndexCommand(collectionName, desiredIndex.key, expectedCreateOptions(expectedIndex)),
+        `${collectionExpression(collectionName)}.getIndexes().filter((index) => index.name === ${mongoLiteral(indexName)} || index.name === ${mongoLiteral(temporaryName)})`,
+        dropIndexCommand(collectionName, temporaryName),
+      ],
+    };
+  }
+
+  return basePlan;
+}
+
+function formatIndexMigrationPlan(plan) {
+  const lines = [
+    `Migration plan for ${plan.collectionName}.${plan.indexName}:`,
+    `Current index: ${JSON.stringify(plan.currentIndex)}`,
+    `Desired index: ${JSON.stringify(plan.desiredIndex)}`,
+    `Impact: ${plan.impact}`,
+    `Drop/recreate needed: ${plan.requiresDropRecreate ? 'yes' : 'no'}. ${plan.dropRecreateDetail}`,
+    `Blocking risk: ${plan.blockingRisk}`,
+    `Can ignore: ${plan.canIgnore ? 'yes' : 'no'}`,
+    'Commands to run manually; this script does not execute them:',
+    ...plan.commands.map((command) => `  ${command}`),
+  ];
+
+  if (plan.fallbackCommands?.length) {
+    lines.push('Fallback commands for MongoDB versions that do not support the preferred command:');
+    lines.push(...plan.fallbackCommands.map((command) => `  ${command}`));
+  }
+
+  return lines;
 }
 
 async function findExistingIndexesByName(models, indexName) {
@@ -177,10 +335,18 @@ function logIndexComparison({ logger, collectionName, existingIndex, expectedInd
   logger.log(JSON.stringify(comparison.differences, null, 2));
 }
 
-async function ensureModelIndexes(model, { logger = console } = {}) {
+async function ensureModelIndexes(model, {
+  logger = console,
+  dryRun = false,
+  failOnIncompatible = !dryRun,
+  filters = {},
+} = {}) {
   const collectionName = getCollectionName(model);
   const existingIndexes = await listIndexes(model);
-  const expectedIndexes = getExpectedIndexes(model);
+  const expectedIndexes = getExpectedIndexes(model).filter((expectedIndex) => matchesIndexFilters({
+    collectionName,
+    indexName: expectedIndex.name,
+  }, filters));
   const results = [];
 
   for (const expectedIndex of expectedIndexes) {
@@ -188,6 +354,12 @@ async function ensureModelIndexes(model, { logger = console } = {}) {
 
     if (!existingIndex) {
       logIndexComparison({ logger, collectionName, expectedIndex });
+      if (dryRun) {
+        logger.log(`Would create index ${collectionName}.${expectedIndex.name}.`);
+        results.push({ collectionName, expectedIndex, action: 'dry-run-create' });
+        continue;
+      }
+
       await model.collection.createIndex(expectedIndex.key, expectedIndex.options);
       const refreshedIndexes = await listIndexes(model);
       const createdIndex = refreshedIndexes.find((index) => index.name === expectedIndex.name);
@@ -208,6 +380,41 @@ async function ensureModelIndexes(model, { logger = console } = {}) {
     logIndexComparison({ logger, collectionName, existingIndex, expectedIndex, comparison });
 
     if (!comparison.equivalent) {
+      const migrationPlan = buildIndexMigrationPlan({
+        collectionName,
+        existingIndex,
+        expectedIndex,
+        differences: comparison.differences,
+      });
+
+      if (dryRun) {
+        logger.log(`Would fail index ${collectionName}.${expectedIndex.name}: incompatible options; no index would be dropped or recreated.`);
+        formatIndexMigrationPlan(migrationPlan).forEach((line) => logger.log(line));
+        results.push({
+          collectionName,
+          expectedIndex,
+          action: 'dry-run-incompatible',
+          differences: comparison.differences,
+          existingIndex: comparison.existing,
+          migrationPlan,
+        });
+        continue;
+      }
+
+      if (!failOnIncompatible) {
+        logger.log(`Skipping incompatible index ${collectionName}.${expectedIndex.name}; no index was dropped or recreated.`);
+        formatIndexMigrationPlan(migrationPlan).forEach((line) => logger.log(line));
+        results.push({
+          collectionName,
+          expectedIndex,
+          action: 'incompatible',
+          differences: comparison.differences,
+          existingIndex: comparison.existing,
+          migrationPlan,
+        });
+        continue;
+      }
+
       const error = new Error(
         [
           `Index ${collectionName}.${expectedIndex.name} exists with incompatible options.`,
@@ -355,6 +562,8 @@ async function migrateIndex(models, { collectionName, indexName, confirm = false
 
 module.exports = {
   COMPARED_OPTION_FIELDS,
+  STRIPE_UNIQUE_PARTIAL_INDEX_FIELDS,
+  buildIndexMigrationPlan,
   comparableIndexSpec,
   compareIndexSpecs,
   defaultIndexName,
@@ -362,9 +571,11 @@ module.exports = {
   ensureModelIndexes,
   findExistingIndexesByName,
   findExpectedIndex,
+  formatIndexMigrationPlan,
   getCollectionName,
   getExpectedIndexes,
   logExistingIndexMatches,
+  matchesIndexFilters,
   migrateIndex,
   validateDateFieldValues,
 };

@@ -8,14 +8,12 @@ const briefingSessionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
 
     conversationId: {
       type: String,
       required: true,
       trim: true,
-      index: true,
     },
 
     status: {
@@ -23,7 +21,6 @@ const briefingSessionSchema = new mongoose.Schema(
       enum: BRIEFING_SESSION_STATUSES,
       default: 'active',
       required: true,
-      index: true,
     },
 
     briefing: {
@@ -61,14 +58,12 @@ const briefingSessionSchema = new mongoose.Schema(
     expiresAt: {
       type: Date,
       required: true,
-      index: true,
     },
 
     projectId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Project',
       default: null,
-      index: true,
     },
 
     completedAt: {
@@ -79,7 +74,8 @@ const briefingSessionSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-briefingSessionSchema.index({ userId: 1, conversationId: 1, status: 1, updatedAt: -1 });
+briefingSessionSchema.index({ userId: 1, conversationId: 1, status: 1, updatedAt: -1, _id: -1, expiresAt: 1 });
+briefingSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('BriefingSession', briefingSessionSchema);
 module.exports.BRIEFING_SESSION_STATUSES = BRIEFING_SESSION_STATUSES;
