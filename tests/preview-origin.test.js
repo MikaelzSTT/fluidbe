@@ -196,6 +196,19 @@ test('preview and published URLs use the dedicated preview origin', () => {
   assert.doesNotMatch(payload.distUrl, /apps\.askfluid\.now/);
   assert.doesNotMatch(payload.previewUrl, /apps\.askfluid\.now/);
   assert.doesNotMatch(payload.buildUrl, /evil\.example/);
+
+  const dedicatedPayload = withAbsoluteBuildUrls(
+    {
+      protocol: 'https',
+      get: () => 'apps.askfluid.now',
+    },
+    {
+      previewUrl: `https://preview.askfluid.now${buildPath}`,
+    }
+  );
+
+  assert.match(dedicatedPayload.previewUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+  assert.match(dedicatedPayload.previewUrl, /\/index\.html\?previewToken=/);
 });
 
 test('preview URL parsing rejects host injection and unsafe build paths', () => {

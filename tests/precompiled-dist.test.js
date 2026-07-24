@@ -2,6 +2,7 @@ const assert = require('assert/strict');
 const crypto = require('crypto');
 const fsSync = require('fs');
 const fs = require('fs/promises');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const test = require('node:test');
@@ -9,11 +10,13 @@ const AdmZip = require('adm-zip');
 const mongoose = require('mongoose');
 
 process.env.BUILD_WORKER_ENABLED = 'false';
+process.env.PREVIEW_BASE_URL = 'https://preview.askfluid.now';
 
 const adminRoutes = require('../routes/adminRoutes');
 const BuildJob = require('../models/BuildJob');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
+const { app } = require('../server');
 const { publishProjectBuild } = require('../utils/projectPublication');
 const {
   publishValidatedDist,
@@ -39,6 +42,48 @@ async function writeZip(zipPath, entries) {
 
   await new Promise((resolve, reject) => {
     zip.writeZip(zipPath, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function listen() {
+  return new Promise((resolve) => {
+    const server = app.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function close(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function request(server, options) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: server.address().port,
+        method: 'GET',
+        ...options,
+        headers: {
+          Host: 'preview.askfluid.now',
+          ...(options.headers || {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end();
   });
 }
 
@@ -139,17 +184,32 @@ test('precompiled dist API creates a workerless draft that the publication flow 
   const uploadDir = path.join(root, 'isolated-upload');
   const zipPath = path.join(uploadDir, 'dist.zip');
   const originalBuildJobFindOne = BuildJob.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
   const originalBuildUpdate = ProjectBuild.findOneAndUpdate;
+  const originalProjectFindById = Project.findById;
   const originalSave = ProjectBuild.prototype.save;
   const originalProjectUpdate = Project.findByIdAndUpdate;
   const previousPreviewSecret = process.env.BUILD_PREVIEW_SECRET;
   let savedBuild = null;
+  let server = null;
 
   try {
     await fs.mkdir(uploadDir, { recursive: true });
     await writeZip(zipPath, [
-      { name: 'index.html', content: '<div id="root"></div>' },
+      {
+        name: 'index.html',
+        content: [
+          '<div id="root"></div>',
+          '<link rel="stylesheet" href="./assets/app.css">',
+          '<script type="module" src="./assets/app.js"></script>',
+          '<img src="./images/logo.png">',
+          '<link rel="icon" href="./favicon.svg">',
+        ].join(''),
+      },
       { name: 'assets/app.js', content: 'document.querySelector("#root").textContent = "ready";' },
+      { name: 'assets/app.css', content: 'body { color: #123; }' },
+      { name: 'images/logo.png', content: 'png-bytes' },
+      { name: 'favicon.svg', content: '<svg xmlns="http://www.w3.org/2000/svg"></svg>' },
     ]);
     process.env.BUILD_PREVIEW_SECRET = 'precompiled-dist-test-preview-secret';
     ProjectBuild.prototype.save = async function saveWithoutDatabase() {
@@ -164,10 +224,35 @@ test('precompiled dist API creates a workerless draft that the publication flow 
         return null;
       },
     });
+    ProjectBuild.findOne = () => ({
+      sort() {
+        return this;
+      },
+      select() {
+        return this;
+      },
+      lean: async () => ({
+        _id: savedBuild._id,
+        projectId,
+        status: savedBuild.status,
+      }),
+    });
     ProjectBuild.findOneAndUpdate = async () => {
       savedBuild.status = 'done';
       return savedBuild;
     };
+    Project.findById = () => ({
+      select() {
+        return {
+          lean: async () => ({
+            _id: projectId,
+            userId: new mongoose.Types.ObjectId(),
+            isPublished: false,
+            latestPublishedBuildId: null,
+          }),
+        };
+      },
+    });
     Project.findByIdAndUpdate = async (id, update) => ({
       _id: id,
       ...update,
@@ -196,6 +281,13 @@ test('precompiled dist API creates a workerless draft that the publication flow 
     assert.equal(res.body.detectedFormat, 'direct_dist');
     assert.equal(res.body.requiresBuildWorker, false);
     assert.equal(res.body.publicationRequired, true);
+    assert.match(res.body.previewUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+    assert.match(res.body.previewUrl, /\/index\.html\?previewToken=/);
+    assert.equal(res.body.previewUrl, res.body.build.previewUrl);
+    assert.equal(res.body.build.status, 'draft');
+    assert.match(res.body.build.buildUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+    assert.match(res.body.build.distUrl, /^https:\/\/preview\.askfluid\.now\/builds\//);
+    assert.doesNotMatch(JSON.stringify(res.body), /askfluid\.now\/assets/);
     assert.equal(savedBuild.status, 'draft');
     assert.equal(savedBuild.buildJobId, null);
     assert.equal(fsSync.existsSync(uploadDir), false);
@@ -204,8 +296,33 @@ test('precompiled dist API creates a workerless draft that the publication flow 
         path.join(__dirname, '..', 'public', 'builds', String(projectId), String(savedBuild._id), 'index.html'),
         'utf8'
       ),
-      '<div id="root"></div>'
+      [
+        '<div id="root"></div>',
+        '<link rel="stylesheet" href="./assets/app.css">',
+        '<script type="module" src="./assets/app.js"></script>',
+        '<img src="./images/logo.png">',
+        '<link rel="icon" href="./favicon.svg">',
+      ].join('')
     );
+
+    server = await listen();
+    const preview = new URL(res.body.previewUrl);
+    const index = await request(server, { path: `${preview.pathname}${preview.search}` });
+    assert.equal(index.statusCode, 200);
+    assert.match(index.body, /src="\.\/assets\/app\.js\?previewToken=/);
+    assert.match(index.body, /href="\.\/assets\/app\.css\?previewToken=/);
+    assert.match(index.body, /src="\.\/images\/logo\.png\?previewToken=/);
+    assert.match(index.body, /href="\.\/favicon\.svg\?previewToken=/);
+    assert.doesNotMatch(index.body, /askfluid\.now\/assets/);
+
+    for (const assetPath of ['assets/app.js', 'assets/app.css', 'images/logo.png', 'favicon.svg']) {
+      const asset = await request(server, {
+        path: `/builds/${projectId}/${savedBuild._id}/${assetPath}${preview.search}`,
+      });
+      assert.equal(asset.statusCode, 200);
+    }
+
+    assert.equal(savedBuild.status, 'draft');
 
     const publication = await publishProjectBuild({
       req,
@@ -217,8 +334,13 @@ test('precompiled dist API creates a workerless draft that the publication flow 
     assert.equal(publication.publishedBuild.status, 'done');
     assert.match(publication.publicUrl, /\/p\/precompiled-test$/);
   } finally {
+    if (server) {
+      await close(server);
+    }
     BuildJob.findOne = originalBuildJobFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
     ProjectBuild.findOneAndUpdate = originalBuildUpdate;
+    Project.findById = originalProjectFindById;
     ProjectBuild.prototype.save = originalSave;
     Project.findByIdAndUpdate = originalProjectUpdate;
     if (previousPreviewSecret === undefined) delete process.env.BUILD_PREVIEW_SECRET;

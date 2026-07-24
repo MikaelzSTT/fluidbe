@@ -31,7 +31,6 @@ const {
   scanBuildSecurity,
 } = require('../utils/projectPublication');
 const {
-  isBuildUrlLike,
   toDedicatedPreviewUrl,
 } = require('../utils/previewOrigin');
 const {
@@ -684,10 +683,6 @@ function toAbsoluteBackendUrl(req, value) {
   }
 
   const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
-    return '';
-  }
-
   const absoluteValue = dedicatedPreviewUrl !== value
     ? dedicatedPreviewUrl
     : value.startsWith('/builds/')

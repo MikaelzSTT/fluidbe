@@ -12,7 +12,6 @@ const {
 } = require('./projectNaming');
 const {
   buildPublishedProjectUrl,
-  isBuildUrlLike,
   parseBuildPathFromUrl,
   toDedicatedPreviewUrl,
 } = require('./previewOrigin');
@@ -50,10 +49,6 @@ function toAbsoluteBackendUrl(req, value) {
   }
 
   const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
-    return '';
-  }
-
   const absoluteValue = dedicatedPreviewUrl !== value
     ? dedicatedPreviewUrl
     : value.startsWith('/builds/')

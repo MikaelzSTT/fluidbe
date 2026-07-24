@@ -37,7 +37,6 @@ const {
 const { invalidateProjectSnapshotCache } = require('../utils/projectSnapshot');
 const {
   buildPreviewUrl,
-  isBuildUrlLike,
   parseBuildPathFromUrl,
   toDedicatedPreviewUrl,
 } = require('../utils/previewOrigin');
@@ -217,10 +216,6 @@ function toAbsoluteBackendUrl(req, value) {
   }
 
   const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  if (dedicatedPreviewUrl === value && isBuildUrlLike(value)) {
-    return '';
-  }
-
   const absoluteValue = dedicatedPreviewUrl !== value
     ? dedicatedPreviewUrl
     : value.startsWith('/builds/')
@@ -3345,6 +3340,7 @@ router.post(
         publicationRequired: true,
         publishEndpoint: `/api/admin/projects/${project._id}/builds/${build._id}/publish`,
         buildId: String(build._id),
+        previewUrl: toAbsoluteBackendUrl(req, previewUrl),
         build: withAbsoluteBuildUrls(req, build),
         security: securityScan,
       });
