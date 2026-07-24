@@ -19,7 +19,6 @@ const User = require('../models/User');
 const { getAdminTokenKey } = require('../middleware/rateLimit');
 const { ADMIN_PERMISSIONS, getRouteMetadata, requireAdmin } = require('../middleware/adminAuth');
 const {
-  createAdminCsrfToken,
   encryptAdminTotpSecret,
   signAdminToken,
 } = require('../utils/adminIdentity');
@@ -34,10 +33,7 @@ function setAdminEnv() {
   process.env.ADMIN_JWT_ISSUER = 'fluid-admin-test';
   process.env.ADMIN_JWT_AUDIENCE = 'fluid-admin-api-test';
   process.env.ADMIN_TWO_FACTOR_SECRET_KEY = 'admin-mfa-test-secret';
-  process.env.ADMIN_ACCESS_TTL_MINUTES = '20';
-  process.env.ADMIN_IDLE_TIMEOUT_MINUTES = '120';
-  process.env.ADMIN_ABSOLUTE_SESSION_HOURS = '12';
-  process.env.ADMIN_TRUSTED_DEVICE_DAYS = '7';
+  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
   process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
 }
 
@@ -148,10 +144,7 @@ async function callRequireAdmin({
     ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
     ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
     ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
-    ADMIN_ACCESS_TTL_MINUTES: process.env.ADMIN_ACCESS_TTL_MINUTES,
-    ADMIN_IDLE_TIMEOUT_MINUTES: process.env.ADMIN_IDLE_TIMEOUT_MINUTES,
-    ADMIN_ABSOLUTE_SESSION_HOURS: process.env.ADMIN_ABSOLUTE_SESSION_HOURS,
-    ADMIN_TRUSTED_DEVICE_DAYS: process.env.ADMIN_TRUSTED_DEVICE_DAYS,
+    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
     ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
   };
   const originalAdminSessionFindOne = AdminSession.findOne;
@@ -223,8 +216,7 @@ test('AdminUser without administrative MFA cannot access admin routes', async ()
   });
 
   assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 401);
-  assert.equal(res.body.code, 'ADMIN_REAUTH_REQUIRED');
+  assert.equal(res.statusCode, 403);
 });
 
 test('AdminUser with own MFA and valid AdminSession accesses admin routes', async () => {
@@ -261,8 +253,7 @@ test('critical admin route requires recent admin MFA from AdminSession', async (
   });
 
   assert.equal(nextCalled, false);
-  assert.equal(res.statusCode, 401);
-  assert.equal(res.body.code, 'ADMIN_REAUTH_REQUIRED');
+  assert.equal(res.statusCode, 403);
 });
 
 test('public user registration never creates AdminUser', async () => {
@@ -573,184 +564,6 @@ test('admin route metadata only marks mutating routes as audit-critical', () => 
   }).critical, true);
 });
 
-test('admin upload mutation does not require recent MFA while critical user action does', async () => {
-  const staleMfaSession = makeAdminSession({
-    createdAt: new Date(Date.now() - 10 * 60 * 1000),
-    mfaVerifiedAt: new Date(Date.now() - 10 * 60 * 1000),
-  });
-  const upload = await callRequireAdmin({
-    path: `/api/admin/projects/${USER_ID}/react-vite/dist`,
-    method: 'POST',
-    params: { id: USER_ID },
-    adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
-    adminSession: staleMfaSession,
-  });
-
-  assert.equal(upload.nextCalled, true);
-  assert.equal(upload.res.statusCode, 200);
-
-  const critical = await callRequireAdmin({
-    path: `/api/admin/users/${OTHER_USER_ID}/role`,
-    method: 'PATCH',
-    params: { userId: OTHER_USER_ID },
-    adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
-    adminSession: staleMfaSession,
-  });
-
-  assert.equal(critical.nextCalled, false);
-  assert.equal(critical.res.statusCode, 401);
-  assert.equal(critical.res.body.code, 'ADMIN_REAUTH_REQUIRED');
-});
-
-test('admin session survives short inactivity but respects idle and absolute expiry', async () => {
-  const activeAfterThirtySeconds = await callRequireAdmin({
-    adminSession: makeAdminSession({
-      lastSeenAt: new Date(Date.now() - 30 * 1000),
-      idleExpiresAt: new Date(Date.now() + 90 * 60 * 1000),
-      absoluteExpiresAt: new Date(Date.now() + 10 * 60 * 60 * 1000),
-      expiresAt: new Date(Date.now() + 10 * 60 * 60 * 1000),
-    }),
-  });
-
-  assert.equal(activeAfterThirtySeconds.nextCalled, true);
-
-  const idleExpired = await callRequireAdmin({
-    adminSession: makeAdminSession({
-      idleExpiresAt: new Date(Date.now() - 1000),
-      absoluteExpiresAt: new Date(Date.now() + 10 * 60 * 60 * 1000),
-      expiresAt: new Date(Date.now() + 10 * 60 * 60 * 1000),
-    }),
-  });
-
-  assert.equal(idleExpired.nextCalled, false);
-  assert.equal(idleExpired.res.statusCode, 401);
-  assert.equal(idleExpired.res.body.code, 'ADMIN_SESSION_EXPIRED');
-
-  const absoluteExpired = await callRequireAdmin({
-    adminSession: makeAdminSession({
-      idleExpiresAt: new Date(Date.now() + 90 * 60 * 1000),
-      absoluteExpiresAt: new Date(Date.now() - 1000),
-      expiresAt: new Date(Date.now() + 10 * 60 * 60 * 1000),
-    }),
-  });
-
-  assert.equal(absoluteExpired.nextCalled, false);
-  assert.equal(absoluteExpired.res.statusCode, 401);
-  assert.equal(absoluteExpired.res.body.code, 'ADMIN_SESSION_EXPIRED');
-});
-
-test('cookie admin mutations require CSRF and accept a valid CSRF token', async () => {
-  setAdminEnv();
-  const adminUser = makeAdminUser({ permissions: ADMIN_PERMISSIONS });
-  const adminSession = makeAdminSession();
-  const token = signAdminToken(adminUser, adminSession.jti);
-  const missingCsrf = await callRequireAdmin({
-    path: `/api/admin/users/${OTHER_USER_ID}/role`,
-    method: 'PATCH',
-    params: { userId: OTHER_USER_ID },
-    adminUser,
-    adminSession,
-    headers: {
-      authorization: undefined,
-      cookie: `fluid_admin_session=${token}`,
-    },
-  });
-
-  assert.equal(missingCsrf.nextCalled, false);
-  assert.equal(missingCsrf.res.statusCode, 403);
-  assert.equal(missingCsrf.res.body.code, 'CSRF_TOKEN_INVALID');
-
-  setAdminEnv();
-  const csrfToken = createAdminCsrfToken();
-  const validCsrf = await callRequireAdmin({
-    path: `/api/admin/users/${OTHER_USER_ID}/role`,
-    method: 'PATCH',
-    params: { userId: OTHER_USER_ID },
-    adminUser,
-    adminSession,
-    headers: {
-      authorization: undefined,
-      cookie: `fluid_admin_session=${token}; fluid_admin_csrf=${csrfToken}`,
-      'x-csrf-token': csrfToken,
-    },
-  });
-
-  assert.equal(validCsrf.nextCalled, true);
-  assert.equal(validCsrf.res.statusCode, 200);
-});
-
-test('password or MFA changes invalidate older admin sessions', async () => {
-  const previousEnv = {
-    JWT_SECRET: process.env.JWT_SECRET,
-    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
-    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
-    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
-    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
-  };
-  const originalAdminSessionFindOne = AdminSession.findOne;
-  const originalAdminSessionUpdateOne = AdminSession.updateOne;
-  const originalAdminUserFindById = AdminUser.findById;
-  const originalAuditCreate = AdminAuditLog.create;
-  const originalAuditFindOne = AdminAuditLog.findOne;
-  const session = makeAdminSession({
-    createdAt: new Date(Date.now() - 60 * 1000),
-    idleExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
-    absoluteExpiresAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
-    expiresAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
-  });
-  const adminUser = makeAdminUser({
-    passwordChangedAt: new Date(Date.now() - 1000),
-    permissions: ADMIN_PERMISSIONS,
-  });
-  let revokeReason = '';
-
-  setAdminEnv();
-  const token = signAdminToken(adminUser, session.jti);
-  AdminSession.findOne = async () => session;
-  AdminSession.updateOne = async (query, update) => {
-    revokeReason = update?.$set?.revokedReason || '';
-    return { matchedCount: 1, modifiedCount: 1 };
-  };
-  AdminUser.findById = () => selectable(adminUser);
-  AdminAuditLog.findOne = () => ({ sort: async () => null });
-  AdminAuditLog.create = async () => ({ _id: 'audit-id' });
-
-  try {
-    const req = {
-      method: 'GET',
-      originalUrl: '/api/admin/status',
-      url: '/status',
-      params: {},
-      query: {},
-      body: {},
-      ip: '203.0.113.10',
-      socket: {},
-      headers: {
-        authorization: `Bearer ${token}`,
-        'user-agent': 'Node Test Browser/1.0',
-      },
-    };
-    const res = createResponse();
-    let nextCalled = false;
-
-    await requireAdmin(req, res, () => {
-      nextCalled = true;
-    });
-
-    assert.equal(nextCalled, false);
-    assert.equal(res.statusCode, 401);
-    assert.equal(res.body.code, 'ADMIN_SESSION_EXPIRED');
-    assert.equal(revokeReason, 'password_changed');
-  } finally {
-    AdminSession.findOne = originalAdminSessionFindOne;
-    AdminSession.updateOne = originalAdminSessionUpdateOne;
-    AdminUser.findById = originalAdminUserFindById;
-    AdminAuditLog.create = originalAuditCreate;
-    AdminAuditLog.findOne = originalAuditFindOne;
-    restoreEnv(previousEnv);
-  }
-});
-
 async function startTestApp() {
   const app = express();
   app.set('trust proxy', 1);
@@ -785,34 +598,8 @@ async function requestJson(baseUrl, requestPath, options = {}) {
 
   return {
     status: response.status,
-    headers: response.headers,
     body,
   };
-}
-
-function cookieHeaderFromResponse(response) {
-  const setCookieHeader = response.headers.get('set-cookie') || '';
-
-  return setCookieHeader
-    .split(/,(?=[^;,]+=)/)
-    .map((cookie) => cookie.split(';')[0].trim())
-    .filter(Boolean)
-    .join('; ');
-}
-
-function mergeCookieHeaders(...headers) {
-  const cookies = new Map();
-
-  for (const header of headers) {
-    String(header || '').split(';').forEach((part) => {
-      const trimmed = part.trim();
-      const separator = trimmed.indexOf('=');
-      if (separator < 1) return;
-      cookies.set(trimmed.slice(0, separator), trimmed);
-    });
-  }
-
-  return Array.from(cookies.values()).join('; ');
 }
 
 test('public User and AdminUser can share email without sharing session or permissions', async () => {
@@ -822,10 +609,7 @@ test('public User and AdminUser can share email without sharing session or permi
     ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
     ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
     ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
-    ADMIN_ACCESS_TTL_MINUTES: process.env.ADMIN_ACCESS_TTL_MINUTES,
-    ADMIN_IDLE_TIMEOUT_MINUTES: process.env.ADMIN_IDLE_TIMEOUT_MINUTES,
-    ADMIN_ABSOLUTE_SESSION_HOURS: process.env.ADMIN_ABSOLUTE_SESSION_HOURS,
-    ADMIN_TRUSTED_DEVICE_DAYS: process.env.ADMIN_TRUSTED_DEVICE_DAYS,
+    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
     ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
   };
   const originalUserFindOne = User.findOne;
@@ -922,12 +706,6 @@ test('public User and AdminUser can share email without sharing session or permi
       ...payload,
       revokedAt: null,
       save: async function saveAdminSession() {
-        for (const [jti, storedSession] of adminSessionsByJti.entries()) {
-          if (String(storedSession._id) === String(this._id) && jti !== this.jti) {
-            adminSessionsByJti.delete(jti);
-          }
-        }
-        adminSessionsByJti.set(this.jti, this);
         return this;
       },
     };
@@ -935,13 +713,9 @@ test('public User and AdminUser can share email without sharing session or permi
     return session;
   };
   AdminSession.findOne = async (query) => {
-    const session = query?.['trustedDevice.tokenHash']
-      ? Array.from(adminSessionsByJti.values()).find((item) => (
-        item.trustedDevice?.tokenHash === query['trustedDevice.tokenHash']
-      ))
-      : adminSessionsByJti.get(query?.jti);
+    const session = adminSessionsByJti.get(query?.jti);
 
-    if (!session || (query?.adminUserId && String(session.adminUserId) !== String(query.adminUserId))) {
+    if (!session || String(session.adminUserId) !== String(query?.adminUserId)) {
       return null;
     }
 
@@ -955,21 +729,7 @@ test('public User and AdminUser can share email without sharing session or permi
 
     return session;
   };
-  AdminSession.updateOne = async (query, update) => {
-    const session = query?.jti
-      ? adminSessionsByJti.get(query.jti)
-      : query?.['trustedDevice.tokenHash']
-        ? Array.from(adminSessionsByJti.values()).find((item) => (
-          item.trustedDevice?.tokenHash === query['trustedDevice.tokenHash']
-        ))
-        : null;
-
-    if (session && update?.$set) {
-      Object.assign(session, update.$set);
-    }
-
-    return { matchedCount: session ? 1 : 0, modifiedCount: session ? 1 : 0 };
-  };
+  AdminSession.updateOne = async () => ({ matchedCount: 1, modifiedCount: 1 });
   AdminAuditLog.findOne = () => ({ sort: async () => null });
   AdminAuditLog.create = async () => ({ _id: 'audit-id' });
 
@@ -1001,99 +761,19 @@ test('public User and AdminUser can share email without sharing session or permi
       },
     });
     assert.equal(adminMfa.status, 200);
-    assert.equal(Object.prototype.hasOwnProperty.call(adminMfa.body, 'token'), false);
-    assert.equal(adminMfa.body.session.limits.accessTtlMinutes, 20);
-    assert.equal(adminMfa.body.session.limits.idleTimeoutMinutes, 120);
-    assert.equal(adminMfa.body.session.limits.absoluteSessionHours, 12);
-    const adminCookie = cookieHeaderFromResponse(adminMfa);
-    assert.match(adminCookie, /fluid_admin_session=/);
-    const encodedAdminJwt = adminCookie
-      .split('; ')
-      .find((cookie) => cookie.startsWith('fluid_admin_session='))
-      .split('=')[1];
-    const decodedAdminJwt = jwt.decode(encodedAdminJwt);
-    assert.ok(decodedAdminJwt.exp - decodedAdminJwt.iat <= 20 * 60);
-    const createdAdminSession = Array.from(adminSessionsByJti.values())
-      .find((session) => !session.revokedAt);
-    assert.ok(new Date(createdAdminSession.expiresAt).getTime() - Date.now() > 11 * 60 * 60 * 1000);
-    const sessionCookie = adminMfa.headers.get('set-cookie');
-    assert.match(sessionCookie, /fluid_admin_session=/);
-    assert.match(sessionCookie, /HttpOnly/i);
-    assert.match(sessionCookie, /SameSite=Lax/i);
+    assert.ok(adminMfa.body.token);
 
     const adminStatus = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: { Cookie: adminCookie },
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
     });
     assert.equal(adminStatus.status, 200);
     assert.equal(adminStatus.body.admin.actorType, 'admin_user');
     assert.equal(adminStatus.body.admin.userId, ADMIN_USER_ID);
 
     const adminTokenRejectedByPublicAuth = await requestJson(app.baseUrl, '/api/auth/me', {
-      headers: { Cookie: adminCookie },
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
     });
     assert.equal(adminTokenRejectedByPublicAuth.status, 401);
-
-    const restored = await requestJson(app.baseUrl, '/api/admin-auth/session', {
-      headers: { Cookie: adminCookie },
-    });
-    assert.equal(restored.status, 200);
-    assert.equal(restored.body.adminUser.id, ADMIN_USER_ID);
-    const renewedCookie = mergeCookieHeaders(adminCookie, cookieHeaderFromResponse(restored));
-    assert.match(renewedCookie, /fluid_admin_session=/);
-
-    const statusAfterReload = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: { Cookie: renewedCookie },
-    });
-    assert.equal(statusAfterReload.status, 200);
-
-    const logout = await requestJson(app.baseUrl, '/api/admin-auth/logout', {
-      method: 'POST',
-      headers: {
-        Cookie: renewedCookie,
-        'X-CSRF-Token': restored.body.csrfToken,
-      },
-    });
-    assert.equal(logout.status, 200);
-
-    const deniedAfterLogout = await requestJson(app.baseUrl, '/api/admin/status', {
-      headers: { Cookie: renewedCookie },
-    });
-    assert.equal(deniedAfterLogout.status, 401);
-    assert.equal(deniedAfterLogout.body.code, 'ADMIN_SESSION_EXPIRED');
-
-    const trustedLogin = await requestJson(app.baseUrl, '/api/admin-auth/login', {
-      method: 'POST',
-      body: { email, password: adminPassword },
-    });
-    assert.equal(trustedLogin.status, 200);
-
-    const trustedMfa = await requestJson(app.baseUrl, '/api/admin-auth/mfa/verify', {
-      method: 'POST',
-      body: {
-        loginChallenge: trustedLogin.body.loginChallenge,
-        code: generateSync({ secret: totpSecret }),
-        trustDevice: true,
-      },
-    });
-    assert.equal(trustedMfa.status, 200);
-    assert.equal(trustedMfa.body.session.trustedDevice, true);
-    const trustedCookies = cookieHeaderFromResponse(trustedMfa);
-    assert.match(trustedCookies, /fluid_admin_trusted=/);
-    const trustedOnlyCookie = trustedCookies
-      .split('; ')
-      .filter((cookie) => cookie.startsWith('fluid_admin_trusted='))
-      .join('; ');
-    const trustedSession = Array.from(adminSessionsByJti.values()).find((session) => (
-      session.trustedDevice?.tokenHash && !session.revokedAt
-    ));
-    trustedSession.idleExpiresAt = new Date(Date.now() - 1000);
-
-    const restoredFromTrustedDevice = await requestJson(app.baseUrl, '/api/admin-auth/session', {
-      headers: { Cookie: trustedOnlyCookie },
-    });
-    assert.equal(restoredFromTrustedDevice.status, 200);
-    assert.equal(restoredFromTrustedDevice.body.adminUser.id, ADMIN_USER_ID);
-    assert.equal(restoredFromTrustedDevice.body.session.trustedDevice, true);
   } finally {
     await app.close();
     User.findOne = originalUserFindOne;

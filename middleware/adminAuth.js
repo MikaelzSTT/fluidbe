@@ -5,20 +5,8 @@ const AdminSession = require('../models/AdminSession');
 const AdminUser = require('../models/AdminUser');
 const { getClientIp } = require('./rateLimit');
 const {
-  clearAdminSessionCookie,
-  createAdminCsrfToken,
-  decodeAdminTokenIgnoringExpiration,
-  getAdminAccessTtlMs,
-  getAdminSessionCookieValue,
-  getServerSessionExpiry,
-  hasValidAdminCsrfToken,
   getAdminReauthTtlMs,
-  isAdminSessionWithinServerLimits,
-  renewAdminSession,
-  setAdminCsrfCookie,
-  setAdminSessionCookie,
-  setAdminTrustedDeviceCookie,
-  touchAdminSession,
+  getAdminSessionTtlMs,
   verifyAdminToken,
 } = require('../utils/adminIdentity');
 const { timingSafeEqualString } = require('../utils/timingSafe');
@@ -38,8 +26,7 @@ function getBearerToken(req) {
 }
 
 function safeAdminMessage(res, statusCode) {
-  const code = statusCode === 403 ? 'ADMIN_FORBIDDEN' : 'ADMIN_SESSION_EXPIRED';
-  return res.status(statusCode).json({ ok: false, code, message: code });
+  return res.status(statusCode).json({ message: 'Admin não autorizado' });
 }
 
 function logAdminAuthDenial(req, reason) {
@@ -51,18 +38,7 @@ function logAdminAuthDenial(req, reason) {
 
 function denyAdmin(req, res, statusCode, reason) {
   logAdminAuthDenial(req, reason);
-  const codeByReason = {
-    csrf_invalid: 'CSRF_TOKEN_INVALID',
-    missing_session: 'ADMIN_SESSION_EXPIRED',
-    expired_session: 'ADMIN_SESSION_EXPIRED',
-    invalid_session: 'ADMIN_SESSION_EXPIRED',
-    mfa_not_verified: 'ADMIN_REAUTH_REQUIRED',
-    reauth_expired: 'ADMIN_REAUTH_REQUIRED',
-    permission_denied: 'ADMIN_FORBIDDEN',
-    not_admin: 'ADMIN_FORBIDDEN',
-  };
-  const code = codeByReason[reason] || (statusCode === 403 ? 'ADMIN_FORBIDDEN' : 'ADMIN_SESSION_EXPIRED');
-  return res.status(statusCode).json({ ok: false, code, message: code });
+  return safeAdminMessage(res, statusCode);
 }
 
 function normalizeIp(ip) {
@@ -292,20 +268,19 @@ function getRouteMetadata(req) {
   const mutating = method !== 'GET';
   let resourceType = 'admin';
   let permission = mutating ? 'admin:write' : 'admin:read';
-  let recentReauthRequired = false;
+  let recentReauthRequired = mutating;
 
   if (path.startsWith('/users/')) {
     resourceType = 'user';
     permission = 'admin:users';
-    recentReauthRequired = mutating;
   } else if (path.includes('/connectors')) {
     resourceType = 'connector';
     permission = 'admin:secrets';
-    recentReauthRequired = mutating;
+    recentReauthRequired = true;
   } else if (path.includes('/builds') || path.includes('/react-vite') || path.includes('/security-scan')) {
     resourceType = 'build';
     permission = 'admin:build';
-    recentReauthRequired = path.includes('/publish') || path.includes('/security-scan');
+    recentReauthRequired = mutating || path.includes('/publish') || path.includes('/security-scan');
   } else if (path.includes('/change-requests')) {
     resourceType = 'change_request';
   } else if (path.includes('/projects')) {
@@ -352,7 +327,8 @@ function isMfaVerifiedForSession(adminUser, session, now) {
     return false;
   }
 
-  return lastVerifiedAt + MFA_LOGIN_CLOCK_SKEW_MS >= sessionCreatedAt;
+  return lastVerifiedAt + MFA_LOGIN_CLOCK_SKEW_MS >= sessionCreatedAt
+    && now.getTime() - sessionCreatedAt <= getAdminSessionTtlMs();
 }
 
 function hasRecentAdminReauth(session, now) {
@@ -415,31 +391,18 @@ function legacyAdminAllowedForMetadata(req, res, metadata) {
 }
 
 async function authenticateAdminSession(req, res, metadata) {
-  const cookieToken = getAdminSessionCookieValue(req);
-  const token = cookieToken || getBearerToken(req);
-  const usesCookieSession = Boolean(cookieToken);
+  const token = getBearerToken(req);
 
   if (!token) {
     return denyAdmin(req, res, 401, 'missing_session');
   }
 
   let decoded;
-  let accessExpired = false;
 
   try {
     decoded = verifyAdminToken(token);
   } catch (error) {
-    if (error?.name !== 'TokenExpiredError') {
-      return denyAdmin(req, res, 401, 'invalid_session');
-    }
-
-    accessExpired = true;
-
-    try {
-      decoded = decodeAdminTokenIgnoringExpiration(token);
-    } catch (decodeError) {
-      return denyAdmin(req, res, 401, 'invalid_session');
-    }
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
   if (
@@ -460,16 +423,10 @@ async function authenticateAdminSession(req, res, metadata) {
   });
 
   if (!session) {
-    clearAdminSessionCookie(res);
-    return denyAdmin(req, res, 401, 'expired_session');
+    return denyAdmin(req, res, 401, 'missing_session');
   }
 
-  if (!isAdminSessionWithinServerLimits(session, now)) {
-    clearAdminSessionCookie(res);
-    return denyAdmin(req, res, 401, 'expired_session');
-  }
-
-  const adminUser = await AdminUser.findById(decoded.sub).select('active permissions mfa.enabled mfa.enabledAt passwordChangedAt');
+  const adminUser = await AdminUser.findById(decoded.sub).select('active permissions mfa.enabled');
 
   const permissionDenialReason = getAdminPermissionDenialReason(adminUser, metadata.permission);
 
@@ -477,74 +434,22 @@ async function authenticateAdminSession(req, res, metadata) {
     return denyAdmin(req, res, 403, permissionDenialReason);
   }
 
-  const sessionCreatedAt = new Date(session.createdAt || 0).getTime();
-  const passwordChangedAt = new Date(adminUser.passwordChangedAt || 0).getTime();
-  const mfaEnabledAt = new Date(adminUser.mfa?.enabledAt || 0).getTime();
-
-  if (
-    (Number.isFinite(passwordChangedAt) && passwordChangedAt > sessionCreatedAt) ||
-    (Number.isFinite(mfaEnabledAt) && mfaEnabledAt > sessionCreatedAt)
-  ) {
-    await AdminSession.updateOne(
-      { _id: session._id, revokedAt: null },
-      {
-        $set: {
-          revokedAt: now,
-          revokedReason: passwordChangedAt > sessionCreatedAt ? 'password_changed' : 'mfa_changed',
-        },
-      }
-    ).catch(() => {});
-    clearAdminSessionCookie(res);
-    return denyAdmin(req, res, 401, 'expired_session');
-  }
-
   if (!isMfaVerifiedForSession(adminUser, session, now)) {
-    return denyAdmin(req, res, 401, 'mfa_not_verified');
+    return denyAdmin(req, res, 403, 'mfa_not_verified');
   }
 
   if (metadata.recentReauthRequired && !hasRecentAdminReauth(session, now)) {
-    return denyAdmin(req, res, 401, 'reauth_expired');
-  }
-
-  if (
-    usesCookieSession &&
-    !['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || 'GET').toUpperCase()) &&
-    !hasValidAdminCsrfToken(req)
-  ) {
-    return denyAdmin(req, res, 403, 'csrf_invalid');
-  }
-
-  let activeSession = session;
-
-  if (accessExpired || new Date(session.accessExpiresAt || 0).getTime() - now.getTime() < getAdminAccessTtlMs() / 3) {
-    const renewed = await renewAdminSession(adminUser, session, req);
-    activeSession = renewed.session;
-    setAdminSessionCookie(res, renewed.token, renewed.cookieExpiresAt || activeSession.expiresAt);
-
-    if (renewed.trustedDeviceToken) {
-      setAdminTrustedDeviceCookie(
-        res,
-        renewed.trustedDeviceToken,
-        renewed.trustedDeviceExpiresAt || renewed.cookieExpiresAt || activeSession.expiresAt
-      );
-    }
-
-    const csrfToken = createAdminCsrfToken();
-    setAdminCsrfCookie(res, csrfToken);
-    res.set('X-Admin-Session-Renewed', 'true');
-  } else {
-    await touchAdminSession(session, now);
+    return denyAdmin(req, res, 403, 'reauth_expired');
   }
 
   req.adminAuth = {
     actorType: 'admin_user',
     adminUserId: adminUser._id,
-    sessionId: activeSession._id,
+    sessionId: session._id,
     permission: metadata.permission,
-    viaCookie: usesCookieSession,
   };
   req.adminUser = adminUser;
-  req.adminSession = activeSession;
+  req.adminSession = session;
   return true;
 }
 
