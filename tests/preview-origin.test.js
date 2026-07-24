@@ -229,6 +229,9 @@ test('preview CSP allows safe image sources and keeps script/connect restricted'
     assert.deepEqual(directives.get('script-src'), ["'self'"]);
     assert.deepEqual(directives.get('connect-src'), ["'self'"]);
     assert.deepEqual(directives.get('frame-ancestors'), ['https://askfluid.now']);
+    assert.ok(directives.get('style-src').includes('https://fonts.googleapis.com'));
+    assert.ok(directives.get('style-src-elem').includes('https://fonts.googleapis.com'));
+    assert.ok(directives.get('font-src').includes('https://fonts.gstatic.com'));
 
     const imgSrc = directives.get('img-src');
     assert.ok(imgSrc.includes("'self'"));

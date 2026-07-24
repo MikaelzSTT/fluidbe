@@ -6,6 +6,7 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const test = require('node:test');
+const { execFile } = require('child_process');
 const AdmZip = require('adm-zip');
 const mongoose = require('mongoose');
 
@@ -37,12 +38,39 @@ async function writeZip(zipPath, entries) {
   const zip = new AdmZip();
 
   for (const entry of entries) {
-    zip.addFile(entry.name, Buffer.from(entry.content || 'x'));
+    zip.addFile(entry.name, Buffer.isBuffer(entry.content) ? entry.content : Buffer.from(entry.content || 'x'));
   }
 
   await new Promise((resolve, reject) => {
     zip.writeZip(zipPath, (error) => error ? reject(error) : resolve());
   });
+}
+
+function sha256(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function nodeCheck(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--check', filePath], (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function writeFiles(rootDir, files) {
+  for (const [relativePath, content] of Object.entries(files)) {
+    const absolutePath = path.join(rootDir, relativePath);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+  }
 }
 
 function listen() {
@@ -74,10 +102,12 @@ function request(server, options) {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const body = Buffer.concat(chunks);
           resolve({
             statusCode: res.statusCode,
             headers: res.headers,
-            body: Buffer.concat(chunks).toString('utf8'),
+            body,
+            text: body.toString('utf8'),
           });
         });
       }
@@ -184,6 +214,7 @@ test('precompiled dist API creates a workerless draft that the publication flow 
   const uploadDir = path.join(root, 'isolated-upload');
   const zipPath = path.join(uploadDir, 'dist.zip');
   const originalBuildJobFindOne = BuildJob.findOne;
+  const originalBuildFind = ProjectBuild.find;
   const originalBuildFindOne = ProjectBuild.findOne;
   const originalBuildUpdate = ProjectBuild.findOneAndUpdate;
   const originalProjectFindById = Project.findById;
@@ -192,24 +223,52 @@ test('precompiled dist API creates a workerless draft that the publication flow 
   const previousPreviewSecret = process.env.BUILD_PREVIEW_SECRET;
   let savedBuild = null;
   let server = null;
+  let projectPublicationState = {
+    isPublished: false,
+    latestPublishedBuildId: null,
+  };
 
   try {
     await fs.mkdir(uploadDir, { recursive: true });
+    const originalFiles = {
+      'index.html': Buffer.from([
+        '<!doctype html>',
+        '<html><head>',
+        '<meta charset="UTF-8">',
+        '<link rel="stylesheet" href="./assets/index-Df5xQ9.css">',
+        '<script type="module" crossorigin src="./assets/index-DECovwbJ.js"></script>',
+        '<link rel="icon" href="./favicon.svg">',
+        '</head><body>',
+        '<div id="root"></div>',
+        '<img src="./images/logo.png">',
+        '</body></html>',
+      ].join('')),
+      'assets/index-DECovwbJ.js': Buffer.from(
+        [
+          'import{createElement as e}from"./chunk-Bn9t.js";',
+          'const label="São Paulo café";',
+          'document.querySelector("#root").textContent=`ready ${label}`;',
+          'export{label};',
+        ].join('\n'),
+        'utf8'
+      ),
+      'assets/chunk-Bn9t.js': Buffer.from('export const createElement = (name) => ({ name });\n'),
+      'assets/index-Df5xQ9.css': Buffer.from(
+        'body{margin:0;color:#123;font-family:"Inter",sans-serif}.logo{background:url("../images/logo.png")}\n'
+      ),
+      'images/logo.png': Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lP5VhQAAAABJRU5ErkJggg==',
+        'base64'
+      ),
+      'favicon.svg': Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>'),
+    };
     await writeZip(zipPath, [
-      {
-        name: 'index.html',
-        content: [
-          '<div id="root"></div>',
-          '<link rel="stylesheet" href="./assets/app.css">',
-          '<script type="module" src="./assets/app.js"></script>',
-          '<img src="./images/logo.png">',
-          '<link rel="icon" href="./favicon.svg">',
-        ].join(''),
-      },
-      { name: 'assets/app.js', content: 'document.querySelector("#root").textContent = "ready";' },
-      { name: 'assets/app.css', content: 'body { color: #123; }' },
-      { name: 'images/logo.png', content: 'png-bytes' },
-      { name: 'favicon.svg', content: '<svg xmlns="http://www.w3.org/2000/svg"></svg>' },
+      { name: 'index.html', content: originalFiles['index.html'] },
+      { name: 'assets/index-DECovwbJ.js', content: originalFiles['assets/index-DECovwbJ.js'] },
+      { name: 'assets/chunk-Bn9t.js', content: originalFiles['assets/chunk-Bn9t.js'] },
+      { name: 'assets/index-Df5xQ9.css', content: originalFiles['assets/index-Df5xQ9.css'] },
+      { name: 'images/logo.png', content: originalFiles['images/logo.png'] },
+      { name: 'favicon.svg', content: originalFiles['favicon.svg'] },
     ]);
     process.env.BUILD_PREVIEW_SECRET = 'precompiled-dist-test-preview-secret';
     ProjectBuild.prototype.save = async function saveWithoutDatabase() {
@@ -224,17 +283,30 @@ test('precompiled dist API creates a workerless draft that the publication flow 
         return null;
       },
     });
+    ProjectBuild.find = () => ({
+      sort: async () => savedBuild ? [savedBuild] : [],
+    });
     ProjectBuild.findOne = () => ({
       sort() {
         return this;
       },
-      select() {
+      select(fields) {
+        if (String(fields || '').includes('artifactFiles')) {
+          return Promise.resolve(savedBuild);
+        }
+
         return this;
       },
       lean: async () => ({
         _id: savedBuild._id,
         projectId,
         status: savedBuild.status,
+        distUrl: savedBuild.distUrl,
+        previewUrl: savedBuild.previewUrl,
+        buildUrl: savedBuild.buildUrl,
+        deployUrl: savedBuild.deployUrl,
+        artifactFiles: savedBuild.artifactFiles,
+        fullHtml: savedBuild.fullHtml,
       }),
     });
     ProjectBuild.findOneAndUpdate = async () => {
@@ -247,17 +319,25 @@ test('precompiled dist API creates a workerless draft that the publication flow 
           lean: async () => ({
             _id: projectId,
             userId: new mongoose.Types.ObjectId(),
-            isPublished: false,
-            latestPublishedBuildId: null,
+            isPublished: projectPublicationState.isPublished,
+            latestPublishedBuildId: projectPublicationState.latestPublishedBuildId,
           }),
         };
       },
     });
-    Project.findByIdAndUpdate = async (id, update) => ({
-      _id: id,
-      ...update,
-      publicUrl: update['deploy.url'] || '',
-    });
+    Project.findByIdAndUpdate = async (id, update) => {
+      projectPublicationState = {
+        isPublished: update.isPublished === true || update['deploy.isPublished'] === true,
+        latestPublishedBuildId: update.latestPublishedBuildId || projectPublicationState.latestPublishedBuildId,
+      };
+      return {
+        _id: id,
+        ...update,
+        isPublished: projectPublicationState.isPublished,
+        latestPublishedBuildId: projectPublicationState.latestPublishedBuildId,
+        publicUrl: update['deploy.url'] || '',
+      };
+    };
 
     const project = {
       _id: projectId,
@@ -291,38 +371,81 @@ test('precompiled dist API creates a workerless draft that the publication flow 
     assert.equal(savedBuild.status, 'draft');
     assert.equal(savedBuild.buildJobId, null);
     assert.equal(fsSync.existsSync(uploadDir), false);
+    const publicBuildDir = path.join(__dirname, '..', 'public', 'builds', String(projectId), String(savedBuild._id));
+    assert.deepEqual(await fs.readFile(path.join(publicBuildDir, 'index.html')), originalFiles['index.html']);
+    assert.equal(savedBuild.artifactFiles.find((file) => file.relativePath === 'assets/index-DECovwbJ.js').encoding, 'base64');
     assert.equal(
-      await fs.readFile(
-        path.join(__dirname, '..', 'public', 'builds', String(projectId), String(savedBuild._id), 'index.html'),
-        'utf8'
-      ),
-      [
-        '<div id="root"></div>',
-        '<link rel="stylesheet" href="./assets/app.css">',
-        '<script type="module" src="./assets/app.js"></script>',
-        '<img src="./images/logo.png">',
-        '<link rel="icon" href="./favicon.svg">',
-      ].join('')
+      savedBuild.artifactFiles.find((file) => file.relativePath === 'assets/index-DECovwbJ.js').content,
+      originalFiles['assets/index-DECovwbJ.js'].toString('base64')
     );
 
     server = await listen();
     const preview = new URL(res.body.previewUrl);
     const index = await request(server, { path: `${preview.pathname}${preview.search}` });
     assert.equal(index.statusCode, 200);
-    assert.match(index.body, /src="\.\/assets\/app\.js\?previewToken=/);
-    assert.match(index.body, /href="\.\/assets\/app\.css\?previewToken=/);
-    assert.match(index.body, /src="\.\/images\/logo\.png\?previewToken=/);
-    assert.match(index.body, /href="\.\/favicon\.svg\?previewToken=/);
-    assert.doesNotMatch(index.body, /askfluid\.now\/assets/);
+    assert.deepEqual(index.body, originalFiles['index.html']);
+    assert.equal(index.headers['content-type'], 'text/html; charset=utf-8');
+    assert.equal(index.headers['content-length'], String(originalFiles['index.html'].length));
+    assert.equal(index.headers['content-encoding'], undefined);
+    assert.match(String(index.headers['set-cookie'] || ''), /fluid_build_preview=/);
+    assert.equal(index.headers['x-build-artifact-sha256'], sha256(originalFiles['index.html']));
 
-    for (const assetPath of ['assets/app.js', 'assets/app.css', 'images/logo.png', 'favicon.svg']) {
+    const expectedContentTypes = {
+      'index.html': 'text/html; charset=utf-8',
+      'assets/index-DECovwbJ.js': 'application/javascript; charset=utf-8',
+      'assets/index-Df5xQ9.css': 'text/css; charset=utf-8',
+      'images/logo.png': 'image/png',
+      'favicon.svg': 'image/svg+xml',
+    };
+    for (const [assetPath, expectedContent] of Object.entries(originalFiles)) {
+      if (!expectedContentTypes[assetPath]) {
+        continue;
+      }
+
       const asset = await request(server, {
         path: `/builds/${projectId}/${savedBuild._id}/${assetPath}${preview.search}`,
       });
       assert.equal(asset.statusCode, 200);
+      assert.deepEqual(asset.body, expectedContent);
+      assert.equal(asset.headers['content-type'], expectedContentTypes[assetPath]);
+      assert.equal(asset.headers['content-length'], String(expectedContent.length));
+      assert.equal(asset.headers['content-encoding'], undefined);
+      assert.equal(asset.headers['x-build-artifact-sha256'], sha256(expectedContent));
     }
+    assert.equal(
+      (await request(server, {
+        path: `/builds/${projectId}/${savedBuild._id}/assets/missing.js${preview.search}`,
+      })).statusCode,
+      404
+    );
+
+    const returnedJs = await request(server, {
+      path: `/builds/${projectId}/${savedBuild._id}/assets/index-DECovwbJ.js${preview.search}`,
+    });
+    const temporaryJsPath = path.join(root, 'returned-index-DECovwbJ.js');
+    await fs.writeFile(temporaryJsPath, returnedJs.body);
+    await nodeCheck(temporaryJsPath);
 
     assert.equal(savedBuild.status, 'draft');
+    await fs.rm(publicBuildDir, { recursive: true, force: true });
+
+    for (const [assetPath, expectedContent] of Object.entries(originalFiles)) {
+      if (!expectedContentTypes[assetPath]) {
+        continue;
+      }
+
+      const fallbackAsset = await request(server, {
+        path: `/builds/${projectId}/${savedBuild._id}/${assetPath}${preview.search}`,
+      });
+      assert.equal(fallbackAsset.statusCode, 200);
+      assert.deepEqual(fallbackAsset.body, expectedContent);
+      assert.equal(fallbackAsset.headers['content-type'], expectedContentTypes[assetPath]);
+      assert.equal(fallbackAsset.headers['content-length'], String(expectedContent.length));
+      assert.equal(fallbackAsset.headers['content-encoding'], undefined);
+      assert.equal(fallbackAsset.headers['x-build-artifact-sha256'], sha256(expectedContent));
+      assert.equal(fallbackAsset.headers['x-build-artifact-expected-sha256'], sha256(expectedContent));
+      assert.equal(fallbackAsset.headers['x-build-artifact-sha256-match'], 'true');
+    }
 
     const publication = await publishProjectBuild({
       req,
@@ -333,11 +456,23 @@ test('precompiled dist API creates a workerless draft that the publication flow 
     assert.equal(publication.alreadyPublished, false);
     assert.equal(publication.publishedBuild.status, 'done');
     assert.match(publication.publicUrl, /\/p\/precompiled-test$/);
+
+    const republishedDistDir = path.join(root, 'republished-dist');
+    await writeFiles(republishedDistDir, originalFiles);
+    await publishValidatedDist(republishedDistDir, publicBuildDir);
+    const publishedJs = await request(server, {
+      path: `/builds/${projectId}/${savedBuild._id}/assets/index-DECovwbJ.js`,
+    });
+    assert.equal(publishedJs.statusCode, 200);
+    assert.deepEqual(publishedJs.body, originalFiles['assets/index-DECovwbJ.js']);
+    assert.equal(publishedJs.headers['content-type'], 'application/javascript; charset=utf-8');
+    assert.equal(publishedJs.headers['x-build-artifact-sha256'], sha256(originalFiles['assets/index-DECovwbJ.js']));
   } finally {
     if (server) {
       await close(server);
     }
     BuildJob.findOne = originalBuildJobFindOne;
+    ProjectBuild.find = originalBuildFind;
     ProjectBuild.findOne = originalBuildFindOne;
     ProjectBuild.findOneAndUpdate = originalBuildUpdate;
     Project.findById = originalProjectFindById;

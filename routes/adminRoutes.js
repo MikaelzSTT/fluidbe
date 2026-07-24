@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const fsSync = require('fs');
 const fs = require('fs/promises');
 const { spawn } = require('child_process');
@@ -194,6 +195,10 @@ const CONTENT_TYPES = {
 
 function getContentType(filePath) {
   return CONTENT_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
+
+function sha256Buffer(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
 function getBackendBaseUrl(req) {
@@ -817,8 +822,9 @@ async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
   return '';
 }
 
-async function collectBuildArtifactFiles(distDir) {
+async function collectBuildArtifactFiles(distDir, options = {}) {
   const distRoot = path.resolve(distDir);
+  const zipSha256ByPath = options.zipSha256ByPath instanceof Map ? options.zipSha256ByPath : new Map();
   const candidates = [];
   const files = [];
   let totalBytes = 0;
@@ -894,7 +900,16 @@ async function collectBuildArtifactFiles(distDir) {
 
     const content = await fs.readFile(candidate.absolutePath);
     const mimeType = getContentType(candidate.relativePath);
+    const sha256 = sha256Buffer(content);
+    const zipSha256 = zipSha256ByPath.get(candidate.relativePath) || '';
     totalBytes += candidate.size;
+    if (zipSha256 && zipSha256 !== sha256) {
+      console.warn('[precompiled-dist-artifact-sha256-mismatch]', {
+        relativePath: candidate.relativePath,
+        zipSha256,
+        storedSha256: sha256,
+      });
+    }
     files.push({
       relativePath: candidate.relativePath,
       path: candidate.relativePath,
@@ -902,6 +917,8 @@ async function collectBuildArtifactFiles(distDir) {
       contentType: mimeType,
       encoding: 'base64',
       content: content.toString('base64'),
+      sha256: zipSha256 || sha256,
+      byteLength: content.length,
     });
   }
 
@@ -1174,6 +1191,7 @@ async function collectProjectSourceFiles(sourceDir) {
 
     const content = await fs.readFile(candidate.absolutePath);
     const mimeType = getContentType(candidate.relativePath);
+    const sha256 = sha256Buffer(content);
     totalBytes += candidate.size;
     files.push({
       relativePath: candidate.relativePath,
@@ -1182,6 +1200,8 @@ async function collectProjectSourceFiles(sourceDir) {
       contentType: mimeType,
       encoding: 'base64',
       content: content.toString('base64'),
+      sha256,
+      byteLength: content.length,
     });
   }
 
@@ -3296,7 +3316,12 @@ router.post(
       const securityScan = await assertPrecompiledDistSecurityAllowsPublication(validation);
 
       const fullHtml = await fs.readFile(path.join(extractedDistDir, 'index.html'), 'utf8');
-      const artifactSnapshot = await collectBuildArtifactFiles(extractedDistDir);
+      const zipSha256ByPath = new Map(
+        precompiledManifest.entries
+          .filter((entry) => !entry.isDirectory && entry.sha256)
+          .map((entry) => [entry.relativePath, entry.sha256])
+      );
+      const artifactSnapshot = await collectBuildArtifactFiles(extractedDistDir, { zipSha256ByPath });
       build = new ProjectBuild({
         projectId: project._id,
         type: 'react_vite',

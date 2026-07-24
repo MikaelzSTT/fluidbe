@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 const fs = require('fs/promises');
 const jwt = require('jsonwebtoken');
@@ -27,10 +28,6 @@ const {
   createBuildPreviewToken,
   verifyBuildPreviewToken,
 } = require('./utils/buildPreviewAccess');
-const {
-  injectBuildPreviewTokenIntoCodeAssets,
-  injectBuildPreviewTokenIntoHtmlAssets,
-} = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 const { payloadTooLargeHandler } = require('./utils/payloadErrors');
 const { timingSafeEqualString } = require('./utils/timingSafe');
@@ -275,6 +272,40 @@ function getArtifactContentType(artifact, fallbackPath) {
   return storedContentType;
 }
 
+function sha256Buffer(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function setBuildArtifactIntegrityHeaders(res, body, expectedSha256 = '') {
+  const servedSha256 = sha256Buffer(body);
+
+  res.setHeader('Content-Length', String(body.length));
+  res.removeHeader('Content-Encoding');
+  res.setHeader('X-Build-Artifact-SHA256', servedSha256);
+
+  if (expectedSha256) {
+    res.setHeader('X-Build-Artifact-Expected-SHA256', expectedSha256);
+    res.setHeader('X-Build-Artifact-SHA256-Match', String(servedSha256 === expectedSha256));
+  }
+
+  return servedSha256;
+}
+
+function sendBuildArtifactBuffer(req, res, artifactPath, contentType, body, expectedSha256 = '') {
+  const servedSha256 = setBuildArtifactIntegrityHeaders(res, body, expectedSha256);
+
+  console.info('[build-artifact-serve]', {
+    artifactPath,
+    byteLength: body.length,
+    contentType,
+    expectedSha256: expectedSha256 || null,
+    servedSha256,
+    sha256Match: expectedSha256 ? servedSha256 === expectedSha256 : null,
+  });
+
+  return res.status(200).set('Content-Type', contentType).send(body);
+}
+
 function isEmbeddableBuildRoute(req) {
   const pathname = req.path || '';
 
@@ -459,9 +490,10 @@ function buildPreviewContentSecurityPolicy() {
     "form-action 'none'",
     `frame-ancestors ${frameAncestors}`,
     "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com",
     `img-src ${imgSrc}`,
-    "font-src 'self' data:",
+    "font-src 'self' data: https://fonts.gstatic.com",
     "media-src 'self' data: blob:",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
@@ -823,10 +855,14 @@ async function serveBuildIndexWithCapabilities(req, res, next) {
   }
 
   try {
-    const html = await fs.readFile(indexPath, 'utf8');
-    return res
-      .type('html')
-      .send(injectBuildPreviewTokenIntoHtmlAssets(html, access.parsedPath, access.previewToken));
+    const body = await fs.readFile(indexPath);
+    return sendBuildArtifactBuffer(
+      req,
+      res,
+      access.parsedPath.artifactPath,
+      getContentType(indexPath),
+      body
+    );
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       return next();
@@ -836,35 +872,40 @@ async function serveBuildIndexWithCapabilities(req, res, next) {
   }
 }
 
-async function serveBuildCodeAssetWithCapabilities(req, res, next) {
+async function serveBuildArtifactFromDisk(req, res, next) {
   const access = req.buildAccess;
 
-  if (
-    !access ||
-    access.isPublished === true ||
-    !access.previewToken ||
-    !/\.(?:css|js|mjs)$/.test(access.parsedPath.artifactPath)
-  ) {
+  if (!access || !access.parsedPath) {
     return next();
   }
 
   const buildsRoot = path.resolve(PUBLIC_BUILDS_DIR);
-  const assetPath = path.resolve(
+  const artifactPath = path.resolve(
     buildsRoot,
     access.parsedPath.projectId,
     access.parsedPath.buildKey,
     access.parsedPath.artifactPath
   );
 
-  if (assetPath !== buildsRoot && !assetPath.startsWith(`${buildsRoot}${path.sep}`)) {
+  if (artifactPath !== buildsRoot && !artifactPath.startsWith(`${buildsRoot}${path.sep}`)) {
     return res.sendStatus(404);
   }
 
   try {
-    const code = await fs.readFile(assetPath, 'utf8');
-    return res
-      .type(path.extname(assetPath).toLowerCase() === '.css' ? 'css' : 'js')
-      .send(injectBuildPreviewTokenIntoCodeAssets(code, access.parsedPath, access.previewToken));
+    const stats = await fs.stat(artifactPath);
+
+    if (!stats.isFile()) {
+      return next();
+    }
+
+    const body = await fs.readFile(artifactPath);
+    return sendBuildArtifactBuffer(
+      req,
+      res,
+      access.parsedPath.artifactPath,
+      getContentType(artifactPath),
+      body
+    );
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       return next();
@@ -932,11 +973,11 @@ async function authorizeBuildAccess(req, res, next) {
     const previewHostRequest = isPreviewHost(req);
     const previewCookieName = 'fluid_build_preview';
     const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
-    const cookieToken = previewHostRequest ? '' : getCookie(req, previewCookieName);
+    const cookieToken = getCookie(req, previewCookieName);
     const previewToken = queryToken || cookieToken;
 
     if (verifyBuildPreviewToken(previewToken, parsedPath.projectId, parsedPath.buildKey)) {
-      if (queryToken && !previewHostRequest) {
+      if (queryToken) {
         res.cookie(previewCookieName, queryToken, {
           httpOnly: true,
           secure: process.env.NODE_ENV === 'production',
@@ -1018,7 +1059,8 @@ async function findMongoBuildArtifact(requestPath) {
       logArtifactLookup(true);
       return {
         contentType: getArtifactContentType(artifact, parsedPath.artifactPath),
-        body: Buffer.from(artifact.content, artifact.encoding || 'base64'),
+        body: Buffer.from(artifact.content, 'base64'),
+        expectedSha256: artifact.sha256 || '',
       };
     }
   }
@@ -1109,7 +1151,7 @@ app.use(
   authorizeBuildAccess,
   applyBuildArtifactCors,
   serveBuildIndexWithCapabilities,
-  serveBuildCodeAssetWithCapabilities,
+  serveBuildArtifactFromDisk,
   express.static(PUBLIC_BUILDS_DIR)
 );
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
@@ -1127,38 +1169,24 @@ app.get(/^\/builds\/.+$/, async (req, res, next) => {
       req.buildAccess.parsedPath.artifactPath === 'index.html' &&
       String(artifact.contentType || '').startsWith('text/html')
     ) {
-      const html = Buffer.isBuffer(artifact.body)
-        ? artifact.body.toString('utf8')
-        : String(artifact.body || '');
-      return res
-        .set('Content-Type', artifact.contentType)
-        .send(injectBuildPreviewTokenIntoHtmlAssets(
-          html,
-          req.buildAccess.parsedPath,
-          req.buildAccess.previewToken
-        ));
+      return sendBuildArtifactBuffer(
+        req,
+        res,
+        req.buildAccess.parsedPath.artifactPath,
+        artifact.contentType,
+        artifact.body,
+        artifact.expectedSha256
+      );
     }
 
-    if (
-      req.buildAccess &&
-      req.buildAccess.isPublished !== true &&
-      req.buildAccess.previewToken &&
-      /\.(?:css|js|mjs)$/.test(req.buildAccess.parsedPath.artifactPath) &&
-      /^text\/css|(?:application|text)\/javascript/.test(String(artifact.contentType || ''))
-    ) {
-      const code = Buffer.isBuffer(artifact.body)
-        ? artifact.body.toString('utf8')
-        : String(artifact.body || '');
-      return res
-        .set('Content-Type', artifact.contentType)
-        .send(injectBuildPreviewTokenIntoCodeAssets(
-          code,
-          req.buildAccess.parsedPath,
-          req.buildAccess.previewToken
-        ));
-    }
-
-    return res.set('Content-Type', artifact.contentType).send(artifact.body);
+    return sendBuildArtifactBuffer(
+      req,
+      res,
+      req.buildAccess?.parsedPath?.artifactPath || req.path,
+      artifact.contentType,
+      artifact.body,
+      artifact.expectedSha256
+    );
   } catch (error) {
     return next(error);
   }

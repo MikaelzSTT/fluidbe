@@ -104,6 +104,15 @@ const projectBuildSchema = new mongoose.Schema(
             type: String,
             required: true,
           },
+          sha256: {
+            type: String,
+            default: '',
+          },
+          byteLength: {
+            type: Number,
+            default: 0,
+            min: 0,
+          },
         },
       ],
       default: [],
@@ -136,6 +145,15 @@ const projectBuildSchema = new mongoose.Schema(
           content: {
             type: String,
             required: true,
+          },
+          sha256: {
+            type: String,
+            default: '',
+          },
+          byteLength: {
+            type: Number,
+            default: 0,
+            min: 0,
           },
         },
       ],
@@ -200,6 +218,15 @@ const projectBuildSchema = new mongoose.Schema(
           content: {
             type: String,
             required: true,
+          },
+          sha256: {
+            type: String,
+            default: '',
+          },
+          byteLength: {
+            type: Number,
+            default: 0,
+            min: 0,
           },
         },
       ],

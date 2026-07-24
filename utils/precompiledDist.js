@@ -1,5 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
+const crypto = require('crypto');
 const AdmZip = require('adm-zip');
 const { scanBuildSecurity } = require('./projectPublication');
 
@@ -156,6 +157,10 @@ function hasExecutableSignature(data) {
   }
 
   return false;
+}
+
+function sha256Buffer(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
 function inspectPrecompiledDistZip(zipPath, options = {}) {
@@ -355,6 +360,7 @@ async function extractPrecompiledDistZipSafely(zipPath, destinationDir, options 
         throw createInvalidPrecompiledDistError('executable_or_invalid_content');
       }
 
+      inspected.sha256 = sha256Buffer(data);
       await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
       await fs.writeFile(targetPath, data, { flag: 'wx', mode: 0o600 });
     }
