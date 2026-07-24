@@ -25,8 +25,50 @@ function getBearerToken(req) {
   return scheme === 'Bearer' && token ? token : null;
 }
 
-function safeAdminMessage(res, statusCode) {
-  return res.status(statusCode).json({ message: 'Admin não autorizado' });
+const ADMIN_DENIAL_RESPONSES = Object.freeze({
+  missing_session: {
+    statusCode: 401,
+    code: 'ADMIN_SESSION_INVALID',
+    message: 'Sessão administrativa inválida.',
+  },
+  not_admin: {
+    statusCode: 403,
+    code: 'ADMIN_FORBIDDEN',
+    message: 'Admin não autorizado.',
+  },
+  permission_denied: {
+    statusCode: 403,
+    code: 'ADMIN_FORBIDDEN',
+    message: 'Admin não autorizado.',
+  },
+  mfa_not_verified: {
+    statusCode: 403,
+    code: 'ADMIN_FORBIDDEN',
+    message: 'Admin não autorizado.',
+  },
+  reauth_expired: {
+    statusCode: 403,
+    code: 'ADMIN_REAUTH_REQUIRED',
+    message: 'Reautenticação administrativa necessária.',
+  },
+});
+
+function safeAdminMessage(res, statusCode, reason) {
+  const response = ADMIN_DENIAL_RESPONSES[reason] || null;
+
+  if (response) {
+    return res.status(response.statusCode).json({
+      ok: false,
+      code: response.code,
+      message: response.message,
+    });
+  }
+
+  return res.status(statusCode).json({
+    ok: false,
+    code: statusCode === 401 ? 'ADMIN_SESSION_INVALID' : 'ADMIN_FORBIDDEN',
+    message: 'Admin não autorizado.',
+  });
 }
 
 function logAdminAuthDenial(req, reason) {
@@ -38,7 +80,7 @@ function logAdminAuthDenial(req, reason) {
 
 function denyAdmin(req, res, statusCode, reason) {
   logAdminAuthDenial(req, reason);
-  return safeAdminMessage(res, statusCode);
+  return safeAdminMessage(res, statusCode, reason);
 }
 
 function normalizeIp(ip) {
@@ -276,7 +318,7 @@ function getRouteMetadata(req) {
   } else if (path.includes('/connectors')) {
     resourceType = 'connector';
     permission = 'admin:secrets';
-    recentReauthRequired = true;
+    recentReauthRequired = mutating;
   } else if (path.includes('/builds') || path.includes('/react-vite') || path.includes('/security-scan')) {
     resourceType = 'build';
     permission = 'admin:build';
@@ -647,7 +689,7 @@ async function requireAdmin(req, res, next) {
       code: error?.code || null,
       requestId: req.adminRequestId || null,
     });
-    return safeAdminMessage(res, 401);
+    return safeAdminMessage(res, 401, 'missing_session');
   }
 }
 

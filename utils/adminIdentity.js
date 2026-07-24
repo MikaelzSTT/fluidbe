@@ -16,11 +16,11 @@ const GCM_IV_BYTES = 12;
 const ENCRYPTION_VERSION = 'v1';
 
 function getAdminSessionTtlMs() {
-  return Number(process.env.ADMIN_SESSION_TTL_MS || 20 * 60 * 1000);
+  return Number(process.env.ADMIN_SESSION_TTL_MS || 8 * 60 * 60 * 1000);
 }
 
 function getAdminReauthTtlMs() {
-  return Number(process.env.ADMIN_REAUTH_TTL_MS || 5 * 60 * 1000);
+  return Number(process.env.ADMIN_REAUTH_TTL_MS || 30 * 60 * 1000);
 }
 
 function getAdminJwtIssuer() {
@@ -284,5 +284,6 @@ module.exports = {
   signAdminToken,
   verifyAdminLoginChallenge,
   verifyAdminMfaCredential,
+  verifyAdminTotp,
   verifyAdminToken,
 };

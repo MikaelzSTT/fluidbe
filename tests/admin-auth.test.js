@@ -27,14 +27,21 @@ const ADMIN_USER_ID = '64f000000000000000000011';
 const USER_ID = '64f000000000000000000001';
 const OTHER_USER_ID = '64f000000000000000000002';
 
-function setAdminEnv() {
+function setAdminEnv(options = {}) {
   process.env.JWT_SECRET = 'public-auth-test-secret';
   process.env.ADMIN_JWT_SECRET = 'separate-admin-auth-test-secret';
   process.env.ADMIN_JWT_ISSUER = 'fluid-admin-test';
   process.env.ADMIN_JWT_AUDIENCE = 'fluid-admin-api-test';
   process.env.ADMIN_TWO_FACTOR_SECRET_KEY = 'admin-mfa-test-secret';
-  process.env.ADMIN_SESSION_TTL_MS = String(20 * 60 * 1000);
-  process.env.ADMIN_REAUTH_TTL_MS = String(5 * 60 * 1000);
+
+  if (options.includeTtls === false) {
+    delete process.env.ADMIN_SESSION_TTL_MS;
+    delete process.env.ADMIN_REAUTH_TTL_MS;
+    return;
+  }
+
+  process.env.ADMIN_SESSION_TTL_MS = String(options.sessionTtlMs || 8 * 60 * 60 * 1000);
+  process.env.ADMIN_REAUTH_TTL_MS = String(options.reauthTtlMs || 30 * 60 * 1000);
 }
 
 function restoreEnv(previousEnv) {
@@ -240,8 +247,8 @@ test('expired or revoked AdminSession fails closed', async () => {
 
 test('critical admin route requires recent admin MFA from AdminSession', async () => {
   const staleMfaSession = makeAdminSession({
-    createdAt: new Date(Date.now() - 10 * 60 * 1000),
-    mfaVerifiedAt: new Date(Date.now() - 10 * 60 * 1000),
+    createdAt: new Date(Date.now() - 40 * 60 * 1000),
+    mfaVerifiedAt: new Date(Date.now() - 40 * 60 * 1000),
   });
   const { res, nextCalled } = await callRequireAdmin({
     path: `/api/admin/users/${OTHER_USER_ID}/role`,
@@ -254,6 +261,32 @@ test('critical admin route requires recent admin MFA from AdminSession', async (
 
   assert.equal(nextCalled, false);
   assert.equal(res.statusCode, 403);
+  assert.equal(res.body.code, 'ADMIN_REAUTH_REQUIRED');
+});
+
+test('stale reauth does not block normal admin GET routes', async () => {
+  const staleMfaSession = makeAdminSession({
+    createdAt: new Date(Date.now() - 40 * 60 * 1000),
+    mfaVerifiedAt: new Date(Date.now() - 40 * 60 * 1000),
+  });
+  const normalGet = await callRequireAdmin({
+    path: '/api/admin/projects',
+    method: 'GET',
+    adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
+    adminSession: staleMfaSession,
+  });
+  const connectorsGet = await callRequireAdmin({
+    path: `/api/admin/projects/${OTHER_USER_ID}/connectors`,
+    method: 'GET',
+    adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
+    adminSession: staleMfaSession,
+    params: { id: OTHER_USER_ID },
+  });
+
+  assert.equal(normalGet.nextCalled, true);
+  assert.equal(normalGet.res.statusCode, 200);
+  assert.equal(connectorsGet.nextCalled, true);
+  assert.equal(connectorsGet.res.statusCode, 200);
 });
 
 test('public user registration never creates AdminUser', async () => {
@@ -558,6 +591,16 @@ test('admin route metadata only marks mutating routes as audit-critical', () => 
     params: { id: '64f000000000000000000099' },
   }).critical, false);
   assert.equal(getRouteMetadata({
+    method: 'GET',
+    originalUrl: '/api/admin/projects/64f000000000000000000099/connectors',
+    params: { id: '64f000000000000000000099' },
+  }).recentReauthRequired, false);
+  assert.equal(getRouteMetadata({
+    method: 'PATCH',
+    originalUrl: '/api/admin/projects/64f000000000000000000099/connectors',
+    params: { id: '64f000000000000000000099' },
+  }).recentReauthRequired, true);
+  assert.equal(getRouteMetadata({
     method: 'PATCH',
     originalUrl: `/api/admin/users/${OTHER_USER_ID}/role`,
     params: { userId: OTHER_USER_ID },
@@ -788,6 +831,242 @@ test('public User and AdminUser can share email without sharing session or permi
     AdminSession.updateOne = originalAdminSessionUpdateOne;
     AdminAuditLog.create = originalAuditCreate;
     AdminAuditLog.findOne = originalAuditFindOne;
+    restoreEnv(previousEnv);
+  }
+});
+
+test('admin session defaults to 8h and reauth step-up renews only MFA freshness', async () => {
+  const previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    ADMIN_JWT_SECRET: process.env.ADMIN_JWT_SECRET,
+    ADMIN_JWT_ISSUER: process.env.ADMIN_JWT_ISSUER,
+    ADMIN_JWT_AUDIENCE: process.env.ADMIN_JWT_AUDIENCE,
+    ADMIN_TWO_FACTOR_SECRET_KEY: process.env.ADMIN_TWO_FACTOR_SECRET_KEY,
+    ADMIN_SESSION_TTL_MS: process.env.ADMIN_SESSION_TTL_MS,
+    ADMIN_REAUTH_TTL_MS: process.env.ADMIN_REAUTH_TTL_MS,
+  };
+  const originalAdminUserFindOne = AdminUser.findOne;
+  const originalAdminUserFindById = AdminUser.findById;
+  const originalAdminUserUpdateOne = AdminUser.updateOne;
+  const originalAdminSessionCreate = AdminSession.create;
+  const originalAdminSessionFindOne = AdminSession.findOne;
+  const originalAdminSessionUpdateOne = AdminSession.updateOne;
+  const app = await startTestApp();
+
+  setAdminEnv({ includeTtls: false });
+
+  const email = 'stepup@example.com';
+  const adminPassword = 'admin-password-long';
+  const totpSecret = 'S47NGTYLRNCFTSKGFW3FXLFED24EQ3TT';
+  const adminUser = {
+    _id: ADMIN_USER_ID,
+    email,
+    passwordHash: await bcrypt.hash(adminPassword, 12),
+    active: true,
+    permissions: ADMIN_PERMISSIONS,
+    mfa: {
+      enabled: true,
+      secretEnc: encryptAdminTotpSecret(totpSecret),
+      recoveryCodes: [],
+    },
+    failedLoginCount: 0,
+    save: async function saveAdminUser() {
+      return this;
+    },
+  };
+  const adminSessionsByJti = new Map();
+  let createdSessionPayload = null;
+  let invalidReauthSessionExpiresAt = null;
+
+  AdminUser.findOne = () => ({ select: async () => adminUser });
+  AdminUser.findById = () => selectable(adminUser);
+  AdminUser.updateOne = async (query, update) => {
+    if (update?.$set?.['mfa.lastVerifiedAt']) {
+      adminUser.mfa.lastVerifiedAt = update.$set['mfa.lastVerifiedAt'];
+    }
+
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+  AdminSession.create = async (payload) => {
+    createdSessionPayload = payload;
+    const session = {
+      _id: `admin-session-${adminSessionsByJti.size + 1}`,
+      ...payload,
+      revokedAt: null,
+      save: async function saveAdminSession() {
+        return this;
+      },
+    };
+    adminSessionsByJti.set(session.jti, session);
+    return session;
+  };
+  AdminSession.findOne = async (query) => {
+    const session = adminSessionsByJti.get(query?.jti);
+
+    if (!session || String(session.adminUserId) !== String(query?.adminUserId)) {
+      return null;
+    }
+
+    if (query.revokedAt === null && session.revokedAt) {
+      return null;
+    }
+
+    if (query.expiresAt?.$gt && !(session.expiresAt > query.expiresAt.$gt)) {
+      return null;
+    }
+
+    return session;
+  };
+  AdminSession.updateOne = async (query, update) => {
+    const session = adminSessionsByJti.get(query?.jti);
+    if (!session) return { matchedCount: 0, modifiedCount: 0 };
+    Object.assign(session, update?.$set || {});
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+
+  try {
+    const adminLogin = await requestJson(app.baseUrl, '/api/admin-auth/login', {
+      method: 'POST',
+      body: { email, password: adminPassword },
+    });
+    assert.equal(adminLogin.status, 200);
+
+    const adminMfa = await requestJson(app.baseUrl, '/api/admin-auth/mfa/verify', {
+      method: 'POST',
+      body: {
+        loginChallenge: adminLogin.body.loginChallenge,
+        code: generateSync({ secret: totpSecret }),
+      },
+    });
+    assert.equal(adminMfa.status, 200);
+    assert.ok(adminMfa.body.token);
+
+    const decoded = jwt.decode(adminMfa.body.token);
+    assert.equal(decoded.exp - decoded.iat, 8 * 60 * 60);
+    assert.ok(createdSessionPayload);
+    assert.equal(
+      createdSessionPayload.expiresAt.getTime() - createdSessionPayload.createdAt.getTime(),
+      8 * 60 * 60 * 1000
+    );
+
+    const session = adminSessionsByJti.get(decoded.jti);
+    const originalExpiresAt = session.expiresAt;
+    session.createdAt = new Date(Date.now() - 31 * 60 * 1000);
+    session.mfaVerifiedAt = new Date(Date.now() - 31 * 60 * 1000);
+
+    const meWithStaleReauth = await requestJson(app.baseUrl, '/api/admin-auth/me', {
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
+    });
+    assert.equal(meWithStaleReauth.status, 200);
+
+    const staleSensitive = await callRequireAdmin({
+      path: `/api/admin/users/${OTHER_USER_ID}/role`,
+      method: 'PATCH',
+      adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
+      adminSession: session,
+      token: adminMfa.body.token,
+      params: { userId: OTHER_USER_ID },
+      body: { role: 'admin' },
+    });
+    assert.equal(staleSensitive.nextCalled, false);
+    assert.equal(staleSensitive.res.statusCode, 403);
+    assert.equal(staleSensitive.res.body.code, 'ADMIN_REAUTH_REQUIRED');
+    assert.equal(adminSessionsByJti.has(decoded.jti), true);
+    assert.equal(session.revokedAt, null);
+
+    const invalidCode = '987654';
+    const originalConsoleWarn = console.warn;
+    const originalConsoleError = console.error;
+    const originalConsoleLog = console.log;
+    const logs = [];
+    console.warn = (...args) => logs.push(args.join(' '));
+    console.error = (...args) => logs.push(args.join(' '));
+    console.log = (...args) => logs.push(args.join(' '));
+
+    const invalidReauth = await requestJson(app.baseUrl, '/api/admin-auth/reauth', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
+      body: { code: invalidCode },
+    });
+
+    console.warn = originalConsoleWarn;
+    console.error = originalConsoleError;
+    console.log = originalConsoleLog;
+
+    assert.equal(invalidReauth.status, 400);
+    assert.equal(invalidReauth.body.code, 'ADMIN_MFA_INVALID');
+    assert.equal(adminSessionsByJti.has(decoded.jti), true);
+    assert.equal(session.revokedAt, null);
+    assert.equal(logs.join('\n').includes(invalidCode), false);
+    invalidReauthSessionExpiresAt = session.expiresAt;
+
+    const validReauth = await requestJson(app.baseUrl, '/api/admin-auth/reauth', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminMfa.body.token}` },
+      body: { code: generateSync({ secret: totpSecret }) },
+    });
+    assert.equal(validReauth.status, 200);
+    assert.deepEqual(validReauth.body, {
+      ok: true,
+      reauthenticated: true,
+    });
+    assert.ok(session.mfaVerifiedAt > new Date(Date.now() - 5 * 1000));
+    assert.ok(session.lastSeenAt > new Date(Date.now() - 5 * 1000));
+    assert.equal(session.expiresAt, originalExpiresAt);
+    assert.equal(session.expiresAt, invalidReauthSessionExpiresAt);
+
+    const freshSensitive = await callRequireAdmin({
+      path: `/api/admin/users/${OTHER_USER_ID}/role`,
+      method: 'PATCH',
+      adminUser: makeAdminUser({ permissions: ADMIN_PERMISSIONS }),
+      adminSession: session,
+      token: adminMfa.body.token,
+      params: { userId: OTHER_USER_ID },
+      body: { role: 'admin' },
+    });
+    assert.equal(freshSensitive.nextCalled, true);
+    assert.equal(freshSensitive.res.statusCode, 200);
+
+    const expiredToken = jwt.sign(
+      {
+        sub: ADMIN_USER_ID,
+        jti: 'expired-session-jti',
+        typ: 'admin',
+      },
+      process.env.ADMIN_JWT_SECRET,
+      {
+        algorithm: 'HS256',
+        expiresIn: -1,
+        issuer: process.env.ADMIN_JWT_ISSUER,
+        audience: process.env.ADMIN_JWT_AUDIENCE,
+      }
+    );
+    const expiredMe = await requestJson(app.baseUrl, '/api/admin-auth/me', {
+      headers: { Authorization: `Bearer ${expiredToken}` },
+    });
+    assert.equal(expiredMe.status, 401);
+    assert.equal(expiredMe.body.code, 'ADMIN_SESSION_INVALID');
+
+    let lastRateLimitResponse = null;
+    for (let attempt = 0; attempt < 11; attempt += 1) {
+      lastRateLimitResponse = await requestJson(app.baseUrl, '/api/admin-auth/reauth', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${adminMfa.body.token}`,
+          'X-Forwarded-For': '198.51.100.77',
+        },
+        body: { code: '111111' },
+      });
+    }
+    assert.equal(lastRateLimitResponse.status, 429);
+  } finally {
+    await app.close();
+    AdminUser.findOne = originalAdminUserFindOne;
+    AdminUser.findById = originalAdminUserFindById;
+    AdminUser.updateOne = originalAdminUserUpdateOne;
+    AdminSession.create = originalAdminSessionCreate;
+    AdminSession.findOne = originalAdminSessionFindOne;
+    AdminSession.updateOne = originalAdminSessionUpdateOne;
     restoreEnv(previousEnv);
   }
 });

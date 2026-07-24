@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const AdminUser = require('../models/AdminUser');
 const AdminSession = require('../models/AdminSession');
+const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const {
   createAdminSession,
   hashAdminIp,
@@ -9,6 +10,7 @@ const {
   signAdminLoginChallenge,
   verifyAdminLoginChallenge,
   verifyAdminMfaCredential,
+  verifyAdminTotp,
   verifyAdminToken,
 } = require('../utils/adminIdentity');
 
@@ -19,6 +21,12 @@ const INVALID_PASSWORD_HASH = '$2b$10$oE4adb62xrznmIZJwK9GYOgfO83CCk9wNy5mZUnKXt
 const MAX_FAILED_LOGIN_ATTEMPTS = Number(process.env.ADMIN_MAX_FAILED_LOGIN_ATTEMPTS || 8);
 const LOGIN_LOCK_MS = Number(process.env.ADMIN_LOGIN_LOCK_MS || 15 * 60 * 1000);
 const LAST_SEEN_UPDATE_INTERVAL_MS = 60 * 1000;
+const adminReauthRateLimit = createRateLimit({
+  name: 'admin-reauth',
+  windowMs: Number(process.env.ADMIN_REAUTH_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000),
+  max: Number(process.env.ADMIN_REAUTH_RATE_LIMIT_MAX || 10),
+  keyGenerator: (req) => `${getClientIp(req)}:${getAdminTokenKey(req)}`,
+});
 
 function getObjectBody(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
@@ -41,6 +49,56 @@ function jsonCode(res, status, code) {
     code,
     message: code,
   });
+}
+
+async function getValidatedAdminSessionFromBearer(req, res) {
+  const token = getBearerToken(req);
+
+  if (!token) {
+    jsonCode(res, 401, 'ADMIN_SESSION_REQUIRED');
+    return null;
+  }
+
+  let decoded;
+
+  try {
+    decoded = verifyAdminToken(token);
+  } catch (error) {
+    jsonCode(res, 401, 'ADMIN_SESSION_INVALID');
+    return null;
+  }
+
+  if (!decoded?.sub || !decoded?.jti || decoded.typ !== 'admin') {
+    jsonCode(res, 401, 'ADMIN_SESSION_INVALID');
+    return null;
+  }
+
+  const now = new Date();
+  const session = await AdminSession.findOne({
+    jti: decoded.jti,
+    adminUserId: decoded.sub,
+    revokedAt: null,
+    expiresAt: { $gt: now },
+  });
+
+  if (!session) {
+    jsonCode(res, 401, 'ADMIN_SESSION_INVALID');
+    return null;
+  }
+
+  const adminUser = await AdminUser.findById(decoded.sub).select(adminAuthSelect());
+
+  if (!adminUser || !adminUser.active || !adminUser.mfa?.enabled) {
+    jsonCode(res, 403, 'ADMIN_FORBIDDEN');
+    return null;
+  }
+
+  return {
+    adminUser,
+    decoded,
+    now,
+    session,
+  };
 }
 
 function adminAuthSelect() {
@@ -120,41 +178,13 @@ async function recordSuccessfulPasswordStep(adminUser, req) {
 }
 
 async function authenticateAdminRequest(req, res, next) {
-  const token = getBearerToken(req);
+  const context = await getValidatedAdminSessionFromBearer(req, res);
 
-  if (!token) {
-    return jsonCode(res, 401, 'ADMIN_SESSION_REQUIRED');
+  if (!context) {
+    return undefined;
   }
 
-  let decoded;
-
-  try {
-    decoded = verifyAdminToken(token);
-  } catch (error) {
-    return jsonCode(res, 401, 'ADMIN_SESSION_INVALID');
-  }
-
-  if (!decoded?.sub || !decoded?.jti || decoded.typ !== 'admin') {
-    return jsonCode(res, 401, 'ADMIN_SESSION_INVALID');
-  }
-
-  const now = new Date();
-  const session = await AdminSession.findOne({
-    jti: decoded.jti,
-    adminUserId: decoded.sub,
-    revokedAt: null,
-    expiresAt: { $gt: now },
-  });
-
-  if (!session?.mfaVerifiedAt) {
-    return jsonCode(res, 403, 'ADMIN_MFA_REQUIRED');
-  }
-
-  const adminUser = await AdminUser.findById(decoded.sub);
-
-  if (!adminUser || !adminUser.active || !adminUser.mfa?.enabled) {
-    return jsonCode(res, 403, 'ADMIN_FORBIDDEN');
-  }
+  const { adminUser, now, session } = context;
 
   req.adminUser = adminUser;
   req.adminSession = session;
@@ -256,6 +286,50 @@ router.post('/mfa/verify', async (req, res) => {
       token: adminSession.token,
       expiresAt: adminSession.expiresAt,
       adminUser: serializeAdminUser(adminUser),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro interno do servidor.' });
+  }
+});
+
+router.post('/reauth', adminReauthRateLimit, async (req, res) => {
+  try {
+    const context = await getValidatedAdminSessionFromBearer(req, res);
+
+    if (!context) {
+      return undefined;
+    }
+
+    const body = getObjectBody(req.body);
+    if (!verifyAdminTotp(context.adminUser, body.code)) {
+      return jsonCode(res, 400, 'ADMIN_MFA_INVALID');
+    }
+
+    context.session.mfaVerifiedAt = context.now;
+    context.session.lastSeenAt = context.now;
+
+    if (typeof context.session.save === 'function') {
+      await context.session.save();
+    } else {
+      await AdminSession.updateOne(
+        {
+          _id: context.session._id,
+          adminUserId: context.adminUser._id,
+          revokedAt: null,
+          expiresAt: { $gt: context.now },
+        },
+        {
+          $set: {
+            mfaVerifiedAt: context.now,
+            lastSeenAt: context.now,
+          },
+        }
+      );
+    }
+
+    return res.json({
+      ok: true,
+      reauthenticated: true,
     });
   } catch (error) {
     return res.status(500).json({ message: 'Erro interno do servidor.' });
