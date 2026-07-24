@@ -148,6 +148,7 @@ test('unique indexes are declared for identity and billing lookup fields', () =>
   assertSchemaIndex(User, { 'profile.username': 1 }, { unique: true, sparse: true });
   assertSchemaIndex(Session, { jti: 1 }, { unique: true });
   assertSchemaIndex(AdminSession, { jti: 1 }, { unique: true });
+  assertSchemaIndex(AdminSession, { 'trustedDevice.tokenHash': 1 }, { sparse: true });
   assertSchemaIndex(StripeWebhookEvent, { eventId: 1 }, { unique: true });
 
   for (const fieldName of [

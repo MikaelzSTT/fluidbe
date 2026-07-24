@@ -20,6 +20,10 @@ const adminSessionSchema = new mongoose.Schema({
     type: String,
     trim: true,
   },
+  deviceHash: {
+    type: String,
+    trim: true,
+  },
   mfaVerifiedAt: {
     type: Date,
   },
@@ -31,9 +35,31 @@ const adminSessionSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  idleExpiresAt: {
+    type: Date,
+  },
+  absoluteExpiresAt: {
+    type: Date,
+  },
+  accessExpiresAt: {
+    type: Date,
+  },
   expiresAt: {
     type: Date,
     required: true,
+  },
+  trustedDevice: {
+    tokenHash: {
+      type: String,
+      trim: true,
+      select: false,
+    },
+    expiresAt: {
+      type: Date,
+    },
+    rotatedAt: {
+      type: Date,
+    },
   },
   revokedAt: {
     type: Date,
@@ -47,6 +73,7 @@ const adminSessionSchema = new mongoose.Schema({
 });
 
 adminSessionSchema.index({ adminUserId: 1, revokedAt: 1, createdAt: -1, expiresAt: 1 });
+adminSessionSchema.index({ 'trustedDevice.tokenHash': 1 }, { sparse: true });
 adminSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('AdminSession', adminSessionSchema);

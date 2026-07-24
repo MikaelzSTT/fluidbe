@@ -36,6 +36,20 @@ let redisClient = null;
 let redisConnectPromise = null;
 let lastRedisFallbackLogAt = 0;
 
+function getCookieValue(req, name) {
+  const header = typeof req.headers?.cookie === 'string' ? req.headers.cookie : '';
+
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 1) continue;
+    const cookieName = part.slice(0, separator).trim();
+    if (cookieName !== name) continue;
+    return part.slice(separator + 1).trim();
+  }
+
+  return '';
+}
+
 function getClientIp(req) {
   return req.ip || req.socket?.remoteAddress || 'unknown';
 }
@@ -44,6 +58,13 @@ function getAdminTokenKey(req) {
   const token = req.headers['x-admin-token'];
 
   if (!token) {
+    const adminCookieName = process.env.ADMIN_SESSION_COOKIE_NAME || 'fluid_admin_session';
+    const adminCookie = getCookieValue(req, adminCookieName);
+
+    if (adminCookie) {
+      return `admin-cookie:${crypto.createHash('sha256').update(String(adminCookie)).digest('hex')}`;
+    }
+
     const authHeader = req.headers.authorization;
     const [scheme, bearerToken] = typeof authHeader === 'string' ? authHeader.split(/\s+/) : [];
 

@@ -94,6 +94,7 @@ const allowedOrigins = [
 const baseCorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-admin-token', 'x-admin-key', 'Idempotency-Key', 'X-Idempotency-Key'],
+  exposedHeaders: ['X-Request-Id', 'X-Admin-Session-Renewed'],
   optionsSuccessStatus: 204
 };
 function corsOptions(req, callback) {
