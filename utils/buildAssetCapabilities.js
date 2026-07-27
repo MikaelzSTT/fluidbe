@@ -29,6 +29,36 @@ function getAllowedAssetOrigins(options = {}) {
   return origins;
 }
 
+function isLikelyBuildAssetReference(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const trimmedValue = value.trim();
+
+  if (
+    !trimmedValue ||
+    trimmedValue.startsWith('#') ||
+    trimmedValue.includes('\\') ||
+    /[\s<>]/.test(trimmedValue) ||
+    /^(?:data|blob|mailto|tel|javascript):/i.test(trimmedValue)
+  ) {
+    return false;
+  }
+
+  if (
+    trimmedValue.startsWith('/builds/') ||
+    trimmedValue.startsWith('./') ||
+    trimmedValue.startsWith('../') ||
+    trimmedValue.startsWith('assets/') ||
+    /^https?:\/\//i.test(trimmedValue)
+  ) {
+    return true;
+  }
+
+  return /\.(?:avif|css|gif|html|ico|jpeg|jpg|js|json|mjs|mp3|mp4|ogg|png|svg|ttf|txt|wasm|wav|webm|webp|woff|woff2)(?:[?#]|$)/i.test(trimmedValue);
+}
+
 function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken, options = {}) {
   if (typeof rawValue !== 'string' || !rawValue || !previewToken) {
     return rawValue;
@@ -118,14 +148,14 @@ function injectBuildPreviewTokenIntoCodeAssets(code, parsedPath, previewToken, o
       }
     )
     .replace(
-      /\bimport\s+(["'])([^"']+)\1/g,
+      /\bimport(?!\s*\.)\s*(["'])([^"']+)\1/g,
       (match, quote, assetValue) => {
         const rewrittenValue = rewriteAssetUrl(assetValue);
         return `import ${quote}${rewrittenValue}${quote}`;
       }
     )
     .replace(
-      /\bfrom\s+(["'])([^"']+)\1/g,
+      /\bfrom\s*(["'])([^"']+)\1/g,
       (match, quote, assetValue) => {
         const rewrittenValue = rewriteAssetUrl(assetValue);
         return `from ${quote}${rewrittenValue}${quote}`;
@@ -136,6 +166,17 @@ function injectBuildPreviewTokenIntoCodeAssets(code, parsedPath, previewToken, o
       (match, quote, assetValue) => {
         const rewrittenValue = rewriteAssetUrl(assetValue);
         return `new URL(${quote}${rewrittenValue}${quote}, import.meta.url)`;
+      }
+    )
+    .replace(
+      /(["'])([^"'\\]*(?:\\.[^"'\\]*)*)\1/g,
+      (match, quote, assetValue) => {
+        if (!isLikelyBuildAssetReference(assetValue)) {
+          return match;
+        }
+
+        const rewrittenValue = rewriteAssetUrl(assetValue);
+        return `${quote}${rewrittenValue}${quote}`;
       }
     );
 }

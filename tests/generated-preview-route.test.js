@@ -33,6 +33,7 @@ function sha256(buffer) {
 
 const MONGO_ENTRY_BODY = Buffer.from([
   'import "./mongo-chunk.js";',
+  'const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/mongo-vite-chunk.js","/builds/64f000000000000000000301/64f000000000000000000311/assets/mongo-root.js?from=mongo#root","/builds/64f000000000000000000301/other-build/assets/mongo-leak.js","https://cdn.example/mongo-preload.js"])))=>i.map(i=>d[i]);',
   'const logo = new URL("./mongo-logo.png?size=1#v", import.meta.url);',
   'const cdn = "https://cdn.example/mongo.js";',
   'export { logo, cdn };',
@@ -216,23 +217,34 @@ async function writeBuild(projectId, buildId, label) {
     path.join(root, 'assets', 'app.js'),
     [
       'import "./chunk.js";',
+      'import"./minified-static.js";',
       'import "./imported.css";',
       'import("./dynamic.js").then((mod) => mod.run());',
+      'const chartLoader=()=>import("./charts-rVXgnjvt.js").then((mod)=>mod.render());',
       'export { value } from "./shared.js";',
+      'export{icon}from"./icons-AbCdEf12.js";',
       'const workerUrl = new URL("./worker.js#worker", import.meta.url);',
+      'const viteWorker = new Worker(new URL("worker-B7T9.js",import.meta.url),{type:"module"});',
       'const imageUrl = new URL("../images/logo.png?from=js#logo", import.meta.url);',
+      `const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/charts-rVXgnjvt.js","assets/icons-AbCdEf12.js","./assets/from-dot.js","../images/logo.png#dep","/builds/${projectId}/${buildId}/assets/root.js?mode=prod#root","/builds/${projectId}/other-build/assets/leak.js","/builds/${PROJECT_B_ID}/${BUILD_B_ID}/assets/leak.js","https://cdn.example/preload.js","https://preview.askfluid.now/builds/${projectId}/${buildId}/assets/legacy.js","data:text/javascript,alert(1)","#section","ready"])))=>i.map(i=>d[i]);`,
       'const external = "https://cdn.example/external.js";',
       `document.body.dataset.build = "${label}";`,
-      'export { workerUrl, imageUrl, external };',
+      'export { workerUrl, viteWorker, imageUrl, external, chartLoader };',
     ].join('\n')
   );
   await fs.writeFile(path.join(root, 'assets', 'chunk.js'), 'export const chunk = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'minified-static.js'), 'export const minifiedStatic = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'dynamic.js'), 'export function run() {}\n');
+  await fs.writeFile(path.join(root, 'assets', 'charts-rVXgnjvt.js'), 'export function render() {}\n');
   await fs.writeFile(path.join(root, 'assets', 'shared.js'), 'export const value = 1;\n');
+  await fs.writeFile(path.join(root, 'assets', 'icons-AbCdEf12.js'), 'export const icon = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'worker.js'), 'self.postMessage("ready");\n');
+  await fs.writeFile(path.join(root, 'assets', 'worker-B7T9.js'), 'self.postMessage("vite-ready");\n');
   await fs.writeFile(path.join(root, 'assets', 'already.js'), 'export const already = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'absolute.js'), 'export const absolute = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'generated-origin.js'), 'export const origin = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'from-dot.js'), 'export const fromDot = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'root.js'), 'export const root = true;\n');
   await fs.writeFile(
     path.join(root, 'assets', 'app.css'),
     [
@@ -384,6 +396,37 @@ test('generated preview HTML tokenizes same-build assets and preserves URL bound
   assert.equal(response.headers['x-build-artifact-sha256'], sha256(response.bodyBuffer));
 });
 
+test('generated preview propagates capability through tokenized Vite entry to nested chunks', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const encodedToken = encodeURIComponent(token);
+  const index = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID)}?previewToken=${token}`,
+  });
+
+  assert.equal(index.statusCode, 200);
+  assert.match(index.body, new RegExp(`src="\\.\\/assets\\/app\\.js\\?previewToken=${encodedToken}"`));
+
+  const mainModule = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.js')}?previewToken=${token}`,
+  });
+
+  assert.equal(mainModule.statusCode, 200);
+  assert.match(mainModule.body, new RegExp(`import\\("\\.\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"\\)`));
+  assert.match(mainModule.body, new RegExp(`"assets\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(mainModule.body, new RegExp(`"assets\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
+
+  const nestedChunk = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/charts-rVXgnjvt.js')}?previewToken=${token}`,
+  });
+  const tokenlessNestedChunk = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/charts-rVXgnjvt.js'),
+  });
+
+  assert.equal(nestedChunk.statusCode, 200);
+  assert.match(nestedChunk.body, /export function render/);
+  assert.equal(tokenlessNestedChunk.statusCode, 404);
+});
+
 test('generated preview disk JS propagates static, dynamic, CSS, worker, and asset URLs', async () => {
   const token = validToken(PROJECT_A_ID, BUILD_A_ID);
   const encodedToken = encodeURIComponent(token);
@@ -393,13 +436,29 @@ test('generated preview disk JS propagates static, dynamic, CSS, worker, and ass
 
   assert.equal(response.statusCode, 200);
   assert.match(response.body, new RegExp(`import "\\.\\/chunk\\.js\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`import "\\.\\/minified-static\\.js\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`import\\("\\.\\/dynamic\\.js\\?previewToken=${encodedToken}"\\)`));
+  assert.match(response.body, new RegExp(`import\\("\\.\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"\\)`));
   assert.match(response.body, new RegExp(`from "\\.\\/shared\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`from "\\.\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
   assert.match(response.body, new RegExp(`new URL\\("\\.\\/worker\\.js\\?previewToken=${encodedToken}#worker", import\\.meta\\.url\\)`));
+  assert.match(response.body, new RegExp(`new URL\\("worker-B7T9\\.js\\?previewToken=${encodedToken}", import\\.meta\\.url\\)`));
   assert.match(response.body, new RegExp(`new URL\\("\\.\\.\\/images\\/logo\\.png\\?from=js&previewToken=${encodedToken}#logo", import\\.meta\\.url\\)`));
+  assert.match(response.body, new RegExp(`"assets\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`"assets\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`"\\.\\/assets\\/from-dot\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`"\\.\\.\\/images\\/logo\\.png\\?previewToken=${encodedToken}#dep"`));
+  assert.match(response.body, new RegExp(`"\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/root\\.js\\?mode=prod&previewToken=${encodedToken}#root"`));
+  assert.match(response.body, new RegExp(`"\\/builds\\/${PROJECT_A_ID}\\/other-build\\/assets\\/leak\\.js"`));
+  assert.match(response.body, new RegExp(`"\\/builds\\/${PROJECT_B_ID}\\/${BUILD_B_ID}\\/assets\\/leak\\.js"`));
+  assert.match(response.body, new RegExp(`"https:\\/\\/preview\\.askfluid\\.now\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/legacy\\.js"`));
+  assert.match(response.body, /"data:text\/javascript,alert\(1\)"/);
+  assert.match(response.body, /"#section"/);
+  assert.match(response.body, /"ready"/);
   assert.match(response.body, /https:\/\/cdn\.example\/external\.js/);
   assert.doesNotMatch(response.body, /https:\/\/cdn\.example\/external\.js\?previewToken/);
+  assert.doesNotMatch(response.body, /cdn\.example\/preload\.js\?previewToken/);
 });
 
 test('generated preview disk CSS propagates imported CSS, image, and font URLs', async () => {
@@ -426,6 +485,10 @@ test('generated preview Mongo textual artifacts transform after original SHA val
 
   assert.equal(response.statusCode, 200);
   assert.match(response.body, new RegExp(`import "\\.\\/mongo-chunk\\.js\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`"assets\\/mongo-vite-chunk\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`"\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/mongo-root\\.js\\?from=mongo&previewToken=${encodedToken}#root"`));
+  assert.match(response.body, new RegExp(`"\\/builds\\/${PROJECT_A_ID}\\/other-build\\/assets\\/mongo-leak\\.js"`));
+  assert.doesNotMatch(response.body, /cdn\.example\/mongo-preload\.js\?previewToken/);
   assert.match(response.body, new RegExp(`new URL\\("\\.\\/mongo-logo\\.png\\?size=1&previewToken=${encodedToken}#v", import\\.meta\\.url\\)`));
   assert.match(response.body, /https:\/\/cdn\.example\/mongo\.js/);
   assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.body)));
