@@ -733,12 +733,23 @@ function getEffectiveBuildStatus(project) {
   return project.generationStatus || project.generation_status || project.status || 'pending';
 }
 
+function getProjectPublishedBuildId(project) {
+  const buildId = project && project.latestPublishedBuildId;
+
+  if (!buildId) {
+    return null;
+  }
+
+  return String(buildId._id || buildId);
+}
+
 function buildProjectPayload(req, projectDocument) {
   const project =
     typeof projectDocument.toObject === 'function'
       ? projectDocument.toObject({ getters: true, virtuals: true })
       : projectDocument;
   const effectiveStatus = getEffectiveBuildStatus(project);
+  const publishedBuildId = getProjectPublishedBuildId(project);
   const fullHtml = project.fullHtml || project.latestFullHtml || '';
   const build = project.build && typeof project.build === 'object' ? project.build : {};
   const payload = {
@@ -746,6 +757,8 @@ function buildProjectPayload(req, projectDocument) {
     status: effectiveStatus,
     generationStatus: effectiveStatus,
     generation_status: effectiveStatus,
+    buildId: null,
+    previewReady: false,
     project: withAbsoluteProjectBuildUrls(req, project),
   };
 
@@ -755,6 +768,16 @@ function buildProjectPayload(req, projectDocument) {
 
   return {
     ...payload,
+    buildId: publishedBuildId || (build._id ? String(build._id) : null),
+    previewReady: Boolean(
+      fullHtml ||
+      project.previewUrl ||
+      project.buildUrl ||
+      project.distUrl ||
+      build.previewUrl ||
+      build.buildUrl ||
+      build.distUrl
+    ),
     response: project.response || '',
     summary: project.summary || '',
     html: project.html || '',
@@ -776,12 +799,19 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     typeof buildDocument.toObject === 'function'
       ? buildDocument.toObject({ getters: true, virtuals: true })
       : buildDocument;
+  const previewUrl = toAbsoluteBackendUrl(req, build.previewUrl || '');
+  const buildUrl = toAbsoluteBackendUrl(
+    req,
+    build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || ''
+  );
 
   return {
     success: true,
     status: 'done',
     generationStatus: 'done',
     generation_status: 'done',
+    buildId: String(build._id),
+    previewReady: Boolean(build.fullHtml || previewUrl || buildUrl),
     project: withAbsoluteProjectBuildUrls(req, project),
     build: withAbsoluteBuildUrls(req, build),
     html: build.html || '',
@@ -790,8 +820,8 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     fullHtml: build.fullHtml || '',
     latestFullHtml: build.fullHtml || '',
     distUrl: toAbsoluteBackendUrl(req, build.distUrl || ''),
-    previewUrl: toAbsoluteBackendUrl(req, build.previewUrl || ''),
-    buildUrl: toAbsoluteBackendUrl(req, build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || ''),
+    previewUrl,
+    buildUrl,
     deployUrl: toAbsoluteBackendUrl(req, build.deployUrl || ''),
     sourceZipUrl: build.sourceZipUrl || '',
     logs: build.logs || '',
@@ -1419,16 +1449,33 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    const latestDoneBuild = await ProjectBuild.findOne({
-      projectId: project._id,
-      status: 'done',
-    }).sort({
-      createdAt: -1,
-      updatedAt: -1,
-    });
+    if (getEffectiveBuildStatus(project) !== 'done') {
+      return res.json(buildProjectPayload(req, project));
+    }
 
-    if (latestDoneBuild) {
-      return res.json(buildDoneProjectBuildPayload(req, project, latestDoneBuild));
+    const publishedBuildId = getProjectPublishedBuildId(project);
+    let activeDoneBuild = null;
+
+    if (publishedBuildId && mongoose.Types.ObjectId.isValid(publishedBuildId)) {
+      activeDoneBuild = await ProjectBuild.findOne({
+        _id: publishedBuildId,
+        projectId: project._id,
+        status: 'done',
+      });
+    } else if (!publishedBuildId) {
+      // Legacy projects may predate latestPublishedBuildId. Keep their newest
+      // completed preview available without overriding explicit publication.
+      activeDoneBuild = await ProjectBuild.findOne({
+        projectId: project._id,
+        status: 'done',
+      }).sort({
+        createdAt: -1,
+        updatedAt: -1,
+      });
+    }
+
+    if (activeDoneBuild) {
+      return res.json(buildDoneProjectBuildPayload(req, project, activeDoneBuild));
     }
 
     return res.json(buildProjectPayload(req, project));
