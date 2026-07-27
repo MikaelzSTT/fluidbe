@@ -963,6 +963,33 @@ function validateOwnedProjectId(req, res, next) {
   return next();
 }
 
+async function setProjectRuntimeEnabled(req, res, runtimeEnabled) {
+  try {
+    const project = await Project.findOneAndUpdate(
+      {
+        _id: req.projectObjectId,
+        userId: req.userId,
+      },
+      { $set: { runtimeEnabled } },
+      {
+        new: true,
+        runValidators: true,
+      }
+    ).select('runtimeEnabled');
+
+    if (!project) {
+      return res.status(404).json({ message: 'Projeto não encontrado.' });
+    }
+
+    return res.json({
+      ok: true,
+      runtimeEnabled: project.runtimeEnabled === true,
+    });
+  } catch (error) {
+    return sendProjectUpdateError(res, error);
+  }
+}
+
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const projects = await Project.find({ userId: req.userId }).sort({
@@ -1854,6 +1881,14 @@ router.get('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
       message: 'Erro interno do servidor.',
     });
   }
+});
+
+router.post('/:id/runtime/enable', authMiddleware, validateOwnedProjectId, async (req, res) => {
+  return setProjectRuntimeEnabled(req, res, true);
+});
+
+router.post('/:id/runtime/disable', authMiddleware, validateOwnedProjectId, async (req, res) => {
+  return setProjectRuntimeEnabled(req, res, false);
 });
 
 router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {

@@ -433,3 +433,163 @@ test('migrateIndex with --confirm drops only target index and recreates expected
     },
   ]);
 });
+
+test('migrateIndex with --confirm stages Stripe unique partial migration with temporary index', async () => {
+  const { model, state } = createMockModel({
+    collectionName: 'users',
+    indexes: [
+      {
+        key: { _id: 1 },
+        name: '_id_',
+      },
+      {
+        key: { stripeCustomerId: 1 },
+        name: 'stripeCustomerId_1',
+      },
+    ],
+    schemaIndexes: [
+      [{ stripeCustomerId: 1 }, {
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      }],
+    ],
+  });
+
+  const result = await migrateIndex([model], {
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+    confirm: true,
+    logger: createLogger(),
+  });
+
+  assert.equal(result.action, 'migrated');
+  assert.deepEqual(state.createCalls, [
+    {
+      key: { stripeCustomerId: 1 },
+      options: {
+        name: 'stripeCustomerId_1_unique_partial_tmp',
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      },
+    },
+    {
+      key: { stripeCustomerId: 1 },
+      options: {
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(state.dropCalls, [
+    'stripeCustomerId_1',
+    'stripeCustomerId_1_unique_partial_tmp',
+  ]);
+  assert.deepEqual(state.indexes, [
+    {
+      key: { _id: 1 },
+      name: '_id_',
+    },
+    {
+      key: { stripeCustomerId: 1 },
+      name: 'stripeCustomerId_1',
+      unique: true,
+      partialFilterExpression: {
+        stripeCustomerId: { $type: 'string', $gt: '' },
+      },
+    },
+  ]);
+});
+
+test('migrateIndex with --confirm reuses equivalent temporary Stripe index', async () => {
+  const { model, state } = createMockModel({
+    collectionName: 'users',
+    indexes: [
+      {
+        key: { stripeCustomerId: 1 },
+        name: 'stripeCustomerId_1',
+      },
+      {
+        key: { stripeCustomerId: 1 },
+        name: 'stripeCustomerId_1_unique_partial_tmp',
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      },
+    ],
+    schemaIndexes: [
+      [{ stripeCustomerId: 1 }, {
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      }],
+    ],
+  });
+
+  const result = await migrateIndex([model], {
+    collectionName: 'users',
+    indexName: 'stripeCustomerId_1',
+    confirm: true,
+    logger: createLogger(),
+  });
+
+  assert.equal(result.action, 'migrated');
+  assert.deepEqual(state.createCalls, [
+    {
+      key: { stripeCustomerId: 1 },
+      options: {
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(state.dropCalls, [
+    'stripeCustomerId_1',
+    'stripeCustomerId_1_unique_partial_tmp',
+  ]);
+});
+
+test('migrateIndex with --confirm rejects incompatible temporary Stripe index', async () => {
+  const { model, state } = createMockModel({
+    collectionName: 'users',
+    indexes: [
+      {
+        key: { stripeCustomerId: 1 },
+        name: 'stripeCustomerId_1',
+      },
+      {
+        key: { stripeCustomerId: 1 },
+        name: 'stripeCustomerId_1_unique_partial_tmp',
+      },
+    ],
+    schemaIndexes: [
+      [{ stripeCustomerId: 1 }, {
+        unique: true,
+        partialFilterExpression: {
+          stripeCustomerId: { $type: 'string', $gt: '' },
+        },
+      }],
+    ],
+  });
+
+  await assert.rejects(
+    migrateIndex([model], {
+      collectionName: 'users',
+      indexName: 'stripeCustomerId_1',
+      confirm: true,
+      logger: createLogger(),
+    }),
+    /Temporary index users\.stripeCustomerId_1_unique_partial_tmp already exists with incompatible options/
+  );
+  assert.deepEqual(state.createCalls, []);
+  assert.deepEqual(state.dropCalls, []);
+});

@@ -6,15 +6,19 @@ Set these first:
 BASE_URL=http://127.0.0.1:5000
 PROJECT_A=<runtime-enabled-project-id>
 PROJECT_B=<another-runtime-enabled-project-id>
+FLUID_AUTH='Cookie: __Host-fluid_session=<authenticated-fluid-owner-session>'
+# Or, only when legacy bearer auth is enabled:
+# FLUID_AUTH='Authorization: Bearer <authenticated-fluid-owner-token>'
 ```
 
-Enable the runtime explicitly for test projects in MongoDB:
+Enable the runtime explicitly for test projects through the authenticated owner API:
 
-```js
-db.projects.updateMany(
-  { _id: { $in: [ObjectId(PROJECT_A), ObjectId(PROJECT_B)] } },
-  { $set: { runtimeEnabled: true } }
-)
+```sh
+curl -sS -X POST "$BASE_URL/api/projects/$PROJECT_A/runtime/enable" \
+  -H "$FLUID_AUTH"
+
+curl -sS -X POST "$BASE_URL/api/projects/$PROJECT_B/runtime/enable" \
+  -H "$FLUID_AUTH"
 ```
 
 Isolation:

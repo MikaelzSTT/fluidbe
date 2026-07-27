@@ -419,7 +419,7 @@ async function ensureModelIndexes(model, {
         [
           `Index ${collectionName}.${expectedIndex.name} exists with incompatible options.`,
           'No index was dropped or recreated.',
-          `Review and run: node scripts/migrateAdminIndex.js --collection ${collectionName} --index ${expectedIndex.name} --confirm`,
+          `Review and run: node scripts/migrateMongoIndex.js --collection ${collectionName} --index ${expectedIndex.name} --confirm`,
         ].join(' ')
       );
       error.code = 'INCOMPATIBLE_INDEX';
@@ -479,6 +479,91 @@ async function validateDateFieldValues(model, fieldName, { sampleLimit = 5 } = {
   return { collectionName, fieldName, valid: true };
 }
 
+function findIndexByName(indexes, indexName) {
+  return indexes.find((index) => index.name === indexName);
+}
+
+function indexSpecForTemporaryName(expectedIndex, temporaryIndexName) {
+  return {
+    key: expectedIndex.key,
+    name: temporaryIndexName,
+    options: {
+      name: temporaryIndexName,
+      unique: true,
+      partialFilterExpression: expectedIndex.comparable.partialFilterExpression,
+    },
+    comparable: comparableIndexSpec({
+      key: expectedIndex.key,
+      name: temporaryIndexName,
+      unique: true,
+      partialFilterExpression: expectedIndex.comparable.partialFilterExpression,
+    }),
+  };
+}
+
+async function verifyIndexEquivalent(model, expectedIndex, errorMessage) {
+  const indexes = await listIndexes(model);
+  const index = findIndexByName(indexes, expectedIndex.name);
+  const comparison = index && compareIndexSpecs(index, expectedIndex);
+
+  if (!comparison || !comparison.equivalent) {
+    throw new Error(errorMessage);
+  }
+
+  return index;
+}
+
+async function applyTemporaryUniquePartialMigration(model, expectedIndex, migrationPlan, logger) {
+  const temporaryIndex = indexSpecForTemporaryName(expectedIndex, migrationPlan.temporaryIndexName);
+  const existingTemporaryIndex = findIndexByName(await listIndexes(model), temporaryIndex.name);
+
+  if (existingTemporaryIndex) {
+    const temporaryComparison = compareIndexSpecs(existingTemporaryIndex, temporaryIndex);
+
+    if (!temporaryComparison.equivalent) {
+      throw new Error(`Temporary index ${migrationPlan.collectionName}.${temporaryIndex.name} already exists with incompatible options.`);
+    }
+
+    logger.log(`Using existing temporary index ${migrationPlan.collectionName}.${temporaryIndex.name}.`);
+  } else {
+    await model.collection.createIndex(temporaryIndex.key, temporaryIndex.options);
+    logger.log(`Created temporary index ${migrationPlan.collectionName}.${temporaryIndex.name}.`);
+  }
+
+  await verifyIndexEquivalent(
+    model,
+    temporaryIndex,
+    `Temporary index verification failed for ${migrationPlan.collectionName}.${temporaryIndex.name}.`
+  );
+
+  await model.collection.dropIndex(expectedIndex.name);
+  await model.collection.createIndex(expectedIndex.key, expectedIndex.options);
+
+  await verifyIndexEquivalent(
+    model,
+    expectedIndex,
+    `Migration verification failed for ${migrationPlan.collectionName}.${expectedIndex.name}.`
+  );
+
+  await model.collection.dropIndex(temporaryIndex.name);
+}
+
+async function applyCollModMigration(model, expectedIndex, collectionName) {
+  const db = model.collection.db || model.db?.db || model.db;
+
+  if (!db?.command) {
+    throw new Error(`Cannot run collMod for ${collectionName}.${expectedIndex.name}; model does not expose a native db.command method.`);
+  }
+
+  await db.command({
+    collMod: collectionName,
+    index: {
+      keyPattern: expectedIndex.key,
+      expireAfterSeconds: expectedIndex.comparable.expireAfterSeconds,
+    },
+  });
+}
+
 function findExpectedIndex(models, collectionName, indexName) {
   for (const model of models) {
     const modelCollectionName = getCollectionName(model);
@@ -506,7 +591,7 @@ async function migrateIndex(models, { collectionName, indexName, confirm = false
 
   const { model, expectedIndex } = target;
   const existingIndexes = await listIndexes(model);
-  const existingIndex = existingIndexes.find((index) => index.name === indexName);
+  const existingIndex = findIndexByName(existingIndexes, indexName);
 
   if (!existingIndex) {
     logger.log(`Existing index ${collectionName}.${indexName}: not found`);
@@ -536,20 +621,36 @@ async function migrateIndex(models, { collectionName, indexName, confirm = false
     return { action: 'already-equivalent', collectionName, indexName };
   }
 
-  logger.log(`Migration target ${collectionName}.${indexName}:`);
-  logger.log(`Old index:\n${JSON.stringify(comparison.existing, null, 2)}`);
-  logger.log(`New index:\n${JSON.stringify(comparison.expected, null, 2)}`);
+  const migrationPlan = buildIndexMigrationPlan({
+    collectionName,
+    existingIndex,
+    expectedIndex,
+    differences: comparison.differences,
+  });
+  formatIndexMigrationPlan(migrationPlan).forEach((line) => logger.log(line));
 
   if (!confirm) {
-    logger.log('No changes made. Re-run with --confirm to drop and recreate only this index.');
-    return { action: 'dry-run-incompatible', collectionName, indexName, differences: comparison.differences };
+    logger.log('No changes made. Re-run with --confirm to apply this migration plan.');
+    return {
+      action: 'dry-run-incompatible',
+      collectionName,
+      indexName,
+      differences: comparison.differences,
+      migrationPlan,
+    };
   }
 
-  await model.collection.dropIndex(indexName);
-  await model.collection.createIndex(expectedIndex.key, expectedIndex.options);
+  if (migrationPlan.temporaryIndexName) {
+    await applyTemporaryUniquePartialMigration(model, expectedIndex, migrationPlan, logger);
+  } else if (!migrationPlan.requiresDropRecreate) {
+    await applyCollModMigration(model, expectedIndex, collectionName);
+  } else {
+    await model.collection.dropIndex(indexName);
+    await model.collection.createIndex(expectedIndex.key, expectedIndex.options);
+  }
 
   const finalIndexes = await listIndexes(model);
-  const finalIndex = finalIndexes.find((index) => index.name === indexName);
+  const finalIndex = findIndexByName(finalIndexes, indexName);
   const finalComparison = finalIndex && compareIndexSpecs(finalIndex, expectedIndex);
 
   if (!finalComparison || !finalComparison.equivalent) {

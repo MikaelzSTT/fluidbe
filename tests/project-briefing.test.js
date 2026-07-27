@@ -181,6 +181,43 @@ test('POST /api/projects inicia somente com briefing mínimo completo', async ()
   }
 });
 
+test('POST /api/projects ignores client supplied runtimeEnabled', async () => {
+  const originalFind = Project.find;
+  const originalCreate = Project.create;
+  let createdPayload;
+
+  Project.find = () => ({
+    select() { return this; },
+    lean: async () => [],
+  });
+  Project.create = async (payload) => {
+    createdPayload = payload;
+    return { _id: 'project-id', ...payload };
+  };
+
+  try {
+    const req = {
+      userId: '64f000000000000000000001',
+      headers: {},
+      body: {
+        name: 'LedgerFlow',
+        type: 'web-app',
+        prompt: 'Build a SaaS for freelancers to track income and invoices.',
+        runtimeEnabled: true,
+      },
+    };
+    const res = createResponse();
+
+    await getCreateProjectHandler()(req, res);
+
+    assert.equal(res.statusCode, 201);
+    assert.equal(Object.prototype.hasOwnProperty.call(createdPayload, 'runtimeEnabled'), false);
+  } finally {
+    Project.find = originalFind;
+    Project.create = originalCreate;
+  }
+});
+
 test('POST /api/projects usa briefing persistido após espera e ignora conversa casual do payload', async () => {
   const originalBriefingFindOne = BriefingSession.findOne;
   const originalBriefingUpdate = BriefingSession.findOneAndUpdate;

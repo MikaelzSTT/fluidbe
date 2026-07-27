@@ -1,5 +1,31 @@
 const mongoose = require('mongoose');
 const { buildPublishedProjectUrl } = require('../utils/previewOrigin');
+const {
+  generatePublicHostKey,
+  isValidPublicHostKey,
+} = require('../utils/publicHostKey');
+
+function removePublicHostKeyMutation(update) {
+  if (!update || typeof update !== 'object') {
+    return;
+  }
+
+  delete update.publicHostKey;
+
+  for (const operator of ['$set', '$setOnInsert']) {
+    if (update[operator] && typeof update[operator] === 'object') {
+      delete update[operator].publicHostKey;
+      if (Object.keys(update[operator]).length === 0) {
+        delete update[operator];
+      }
+    }
+  }
+}
+
+function removePublicHostKeyFromSerializedProject(doc, ret) {
+  delete ret.publicHostKey;
+  return ret;
+}
 
 const projectSchema = new mongoose.Schema(
   {
@@ -37,6 +63,18 @@ const projectSchema = new mongoose.Schema(
     appNameLocked: {
       type: Boolean,
       default: false,
+    },
+
+    publicHostKey: {
+      type: String,
+      lowercase: true,
+      trim: true,
+      immutable: true,
+      select: false,
+      validate: {
+        validator: (value) => value == null || isValidPublicHostKey(value),
+        message: 'publicHostKey must be a 32-character lowercase hexadecimal string.',
+      },
     },
 
     slug: {
@@ -335,8 +373,8 @@ const projectSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
-    toJSON: { virtuals: true },
-    toObject: { virtuals: true },
+    toJSON: { virtuals: true, transform: removePublicHostKeyFromSerializedProject },
+    toObject: { virtuals: true, transform: removePublicHostKeyFromSerializedProject },
   }
 );
 
@@ -346,12 +384,29 @@ projectSchema.index({ userId: 1, isPublished: 1 });
 projectSchema.index({ updatedAt: -1, createdAt: -1, _id: -1 });
 projectSchema.index({ briefingSessionId: 1 }, { sparse: true });
 projectSchema.index(
+  { publicHostKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { publicHostKey: { $type: 'string', $gt: '' } },
+  }
+);
+projectSchema.index(
   { userId: 1, creationIdempotencyKey: 1 },
   {
     unique: true,
     partialFilterExpression: { creationIdempotencyKey: { $type: 'string' } },
   }
 );
+
+projectSchema.pre('validate', function assignPublicHostKey() {
+  if (this.isNew) {
+    this.publicHostKey = generatePublicHostKey();
+  }
+});
+
+projectSchema.pre(['updateOne', 'updateMany', 'replaceOne', 'findOneAndUpdate', 'findByIdAndUpdate'], function blockPublicHostKeyUpdate() {
+  removePublicHostKeyMutation(this.getUpdate());
+});
 
 projectSchema.virtual('publicUrl').get(function getPublicUrl() {
   return this.slug ? buildPublishedProjectUrl(this.slug) : '';

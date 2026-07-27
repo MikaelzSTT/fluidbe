@@ -29,6 +29,11 @@ const {
   verifyBuildPreviewToken,
 } = require('./utils/buildPreviewAccess');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
+const {
+  GENERATED_APP_RESOLUTION_STATUS,
+  GeneratedAppProjectLookupError,
+  resolveGeneratedAppRequest,
+} = require('./utils/generatedAppRequest');
 const { payloadTooLargeHandler } = require('./utils/payloadErrors');
 const { timingSafeEqualString } = require('./utils/timingSafe');
 const {
@@ -514,6 +519,61 @@ function applyPreviewHostHeaders(req, res) {
   res.removeHeader('Access-Control-Allow-Credentials');
 }
 
+function isPreviewIsolationRequest(req) {
+  return isPreviewHost(req) || req.generatedAppContext?.type === 'preview';
+}
+
+function sendGeneratedAppNotFound(req, res) {
+  applyPreviewHostHeaders(req, res);
+  return res.sendStatus(404);
+}
+
+async function generatedAppHostOnly(req, res, next) {
+  let resolution;
+
+  try {
+    resolution = await resolveGeneratedAppRequest(req);
+  } catch (error) {
+    if (error instanceof GeneratedAppProjectLookupError) {
+      console.error('Generated application host lookup failed.', {
+        code: error.code,
+      });
+      return sendGeneratedAppNotFound(req, res);
+    }
+
+    return next(error);
+  }
+
+  if (resolution.status === GENERATED_APP_RESOLUTION_STATUS.NOT_GENERATED) {
+    return next();
+  }
+
+  if (resolution.status !== GENERATED_APP_RESOLUTION_STATUS.RESOLVED) {
+    return sendGeneratedAppNotFound(req, res);
+  }
+
+  const context = resolution.context;
+
+  if (context.type !== 'preview') {
+    return sendGeneratedAppNotFound(req, res);
+  }
+
+  const parsedPath = parseBuildRequestPath(req.originalUrl);
+
+  if (
+    !['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+    || !parsedPath
+    || parsedPath.projectId !== context.projectId
+  ) {
+    return sendGeneratedAppNotFound(req, res);
+  }
+
+  req.generatedAppContext = context;
+  req.generatedAppBuildPath = parsedPath;
+  applyPreviewHostHeaders(req, res);
+  return next();
+}
+
 function previewHostOnly(req, res, next) {
   if (!isPreviewHost(req)) {
     return next();
@@ -535,7 +595,7 @@ function previewHostOnly(req, res, next) {
 }
 
 function markLegacyPreviewRoute(req, res) {
-  if (isPreviewHost(req)) {
+  if (isPreviewIsolationRequest(req)) {
     return;
   }
 
@@ -550,7 +610,7 @@ function markLegacyPreviewRoute(req, res) {
 }
 
 function securityHeaders(req, res, next) {
-  if (isPreviewHost(req)) {
+  if (isPreviewIsolationRequest(req)) {
     applyPreviewHostHeaders(req, res);
     return next();
   }
@@ -814,16 +874,16 @@ function applyBuildArtifactCors(req, res, next) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
   } else if (
-    isPreviewHost(req) &&
+    isPreviewIsolationRequest(req) &&
     req.buildAccess &&
     req.buildAccess.parsedPath.artifactPath !== 'index.html'
   ) {
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-  } else if (isPreviewHost(req)) {
+  } else if (isPreviewIsolationRequest(req)) {
     res.setHeader('Cache-Control', 'no-cache');
   }
 
-  if (isPreviewHost(req)) {
+  if (isPreviewIsolationRequest(req)) {
     applyPreviewHostHeaders(req, res);
   }
 
@@ -933,9 +993,33 @@ function buildUrlMatchQuery(indexBuildUrl) {
   };
 }
 
+function authorizePrivateBuildPreview(req, res, parsedPath, secureCookie = false) {
+  const previewCookieName = 'fluid_build_preview';
+  const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
+  const cookieToken = getCookie(req, previewCookieName);
+  const previewToken = queryToken || cookieToken;
+
+  if (!verifyBuildPreviewToken(previewToken, parsedPath.projectId, parsedPath.buildKey)) {
+    return '';
+  }
+
+  if (queryToken) {
+    res.cookie(previewCookieName, queryToken, {
+      httpOnly: true,
+      secure: secureCookie || process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: `/builds/${parsedPath.projectId}/${parsedPath.buildKey}`,
+      maxAge: BUILD_PREVIEW_TTL_SECONDS * 1000,
+    });
+  }
+
+  return previewToken;
+}
+
 async function authorizeBuildAccess(req, res, next) {
   try {
-    const parsedPath = parseBuildRequestPath(req.originalUrl);
+    const parsedPath =
+      req.generatedAppBuildPath || parseBuildRequestPath(req.originalUrl);
 
     if (!parsedPath) {
       return res.sendStatus(404);
@@ -953,6 +1037,30 @@ async function authorizeBuildAccess(req, res, next) {
       return res.sendStatus(404);
     }
 
+    const buildProjectId = build.projectId?._id || build.projectId;
+
+    if (!buildProjectId || String(buildProjectId) !== parsedPath.projectId) {
+      return res.sendStatus(404);
+    }
+
+    const generatedPreviewRequest = req.generatedAppContext?.type === 'preview';
+
+    if (generatedPreviewRequest) {
+      const previewToken = authorizePrivateBuildPreview(req, res, parsedPath, true);
+
+      if (!previewToken) {
+        return res.sendStatus(404);
+      }
+
+      req.buildAccess = {
+        parsedPath,
+        buildId: String(build._id),
+        isPublished: false,
+        previewToken,
+      };
+      return next();
+    }
+
     const project = await Project.findById(parsedPath.projectId)
       .select('userId isPublished latestPublishedBuildId buildUrl deployUrl previewUrl distUrl')
       .lean();
@@ -964,6 +1072,7 @@ async function authorizeBuildAccess(req, res, next) {
     if (isProjectBuildExplicitlyPublished(project, build)) {
       req.buildAccess = {
         parsedPath,
+        buildId: String(build._id),
         isPublished: true,
         previewToken: '',
       };
@@ -971,23 +1080,12 @@ async function authorizeBuildAccess(req, res, next) {
     }
 
     const previewHostRequest = isPreviewHost(req);
-    const previewCookieName = 'fluid_build_preview';
-    const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
-    const cookieToken = getCookie(req, previewCookieName);
-    const previewToken = queryToken || cookieToken;
+    const previewToken = authorizePrivateBuildPreview(req, res, parsedPath);
 
-    if (verifyBuildPreviewToken(previewToken, parsedPath.projectId, parsedPath.buildKey)) {
-      if (queryToken) {
-        res.cookie(previewCookieName, queryToken, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          path: `/builds/${parsedPath.projectId}/${parsedPath.buildKey}`,
-          maxAge: BUILD_PREVIEW_TTL_SECONDS * 1000,
-        });
-      }
+    if (previewToken) {
       req.buildAccess = {
         parsedPath,
+        buildId: String(build._id),
         isPublished: false,
         previewToken,
       };
@@ -1006,6 +1104,7 @@ async function authorizeBuildAccess(req, res, next) {
     if (isAdmin || (userId && String(project.userId) === String(userId))) {
       req.buildAccess = {
         parsedPath,
+        buildId: String(build._id),
         isPublished: false,
         previewToken: createBuildPreviewToken(parsedPath.projectId, parsedPath.buildKey),
       };
@@ -1018,7 +1117,7 @@ async function authorizeBuildAccess(req, res, next) {
   }
 }
 
-async function findMongoBuildArtifact(requestPath) {
+async function findMongoBuildArtifact(requestPath, expectedBuildId = null) {
   const parsedPath = parseBuildRequestPath(requestPath);
 
   if (!parsedPath) {
@@ -1026,6 +1125,7 @@ async function findMongoBuildArtifact(requestPath) {
   }
 
   const builds = await ProjectBuild.find({
+    ...(expectedBuildId ? { _id: expectedBuildId } : {}),
     projectId: parsedPath.projectId,
     ...buildUrlMatchQuery(parsedPath.indexBuildUrl),
   }).sort({
@@ -1082,28 +1182,37 @@ async function findMongoBuildArtifact(requestPath) {
 }
 
 async function loadPublishedHtml(project) {
-  const latestDoneBuild = await ProjectBuild.findOne({
+  const latestPublishedBuildId =
+    project?.latestPublishedBuildId?._id || project?.latestPublishedBuildId;
+
+  if (!mongoose.isObjectIdOrHexString(latestPublishedBuildId)) {
+    return '';
+  }
+
+  const build = await ProjectBuild.findOne({
+    _id: latestPublishedBuildId,
     projectId: project._id,
     status: 'done',
-  }).sort({
-    createdAt: -1,
-    updatedAt: -1,
   });
-  const build = latestDoneBuild || {};
-  const inlineHtml =
-    build.fullHtml ||
-    build.html ||
-    project.fullHtml ||
-    project.latestFullHtml ||
-    project.html ||
-    '';
-  const buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || project.buildUrl || '';
+
+  const buildProjectId = build?.projectId?._id || build?.projectId;
+
+  if (
+    !isProjectBuildExplicitlyPublished(project, build) ||
+    !buildProjectId ||
+    String(buildProjectId) !== String(project._id)
+  ) {
+    return '';
+  }
+
+  const inlineHtml = build.fullHtml || build.html || '';
+  const buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '';
 
   if (inlineHtml) {
     return rewriteBuildAssetPaths(inlineHtml, buildUrl);
   }
 
-  const mongoArtifact = await findMongoBuildArtifact(buildUrl);
+  const mongoArtifact = await findMongoBuildArtifact(buildUrl, build._id);
 
   if (mongoArtifact) {
     const artifactHtml = Buffer.isBuffer(mongoArtifact.body)
@@ -1133,6 +1242,7 @@ async function loadPublishedHtml(project) {
 
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
 app.set('trust proxy', 1);
+app.use(generatedAppHostOnly);
 app.use(previewHostOnly);
 app.use(securityHeaders);
 app.use(cors(corsOptions));
@@ -1156,7 +1266,10 @@ app.use(
 );
 app.get(/^\/builds\/.+$/, async (req, res, next) => {
   try {
-    const artifact = await findMongoBuildArtifact(req.path);
+    const artifact = await findMongoBuildArtifact(
+      req.path,
+      req.buildAccess?.buildId || null
+    );
 
     if (!artifact) {
       return next();
@@ -1328,6 +1441,7 @@ module.exports = {
   previewIsolationHelpers: {
     buildPreviewContentSecurityPolicy,
     corsOptions,
+    generatedAppHostOnly,
     isPreviewAllowedRoute,
     previewHostOnly,
   },

@@ -21,6 +21,7 @@ const { withAbsoluteBuildUrls } = require('../utils/projectPublication');
 
 const projectId = '64f000000000000000000101';
 const buildId = '64f000000000000000000102';
+const newerBuildId = '64f000000000000000000104';
 const buildPath = `/builds/${projectId}/${buildId}/index.html`;
 const publicBuildRoot = path.join(__dirname, '..', 'public', 'builds', projectId, buildId);
 const { buildPreviewContentSecurityPolicy } = previewIsolationHelpers;
@@ -137,14 +138,27 @@ function stubPublishedBuild() {
   };
 }
 
-function stubPublishedProjectPage() {
+function stubPublishedProjectPage({
+  latestPublishedBuildId = buildId,
+  builds = [
+    {
+      _id: buildId,
+      projectId,
+      status: 'done',
+      buildUrl: buildPath,
+      fullHtml: '<!doctype html><html><head><title>Old</title></head><body><main>published ok</main><script src="./assets/app.js"></script></body></html>',
+    },
+  ],
+} = {}) {
   const originalProjectFindOne = Project.findOne;
   const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const buildQueries = [];
 
   Project.findOne = async () => ({
     _id: projectId,
     slug: 'clean-app',
     isPublished: true,
+    latestPublishedBuildId,
     appName: 'Clean App',
     seo: {
       title: 'Clean App',
@@ -152,18 +166,22 @@ function stubPublishedProjectPage() {
     },
   });
 
-  ProjectBuild.findOne = () => ({
-    sort: async () => ({
-      _id: buildId,
-      projectId,
-      status: 'done',
-      fullHtml: '<!doctype html><html><head><title>Old</title></head><body><main>published ok</main></body></html>',
-    }),
-  });
+  ProjectBuild.findOne = async (query) => {
+    buildQueries.push(query);
 
-  return () => {
-    Project.findOne = originalProjectFindOne;
-    ProjectBuild.findOne = originalProjectBuildFindOne;
+    return builds.find((build) => (
+      (!query._id || String(build._id) === String(query._id)) &&
+      (!query.projectId || String(build.projectId) === String(query.projectId)) &&
+      (!query.status || build.status === query.status)
+    )) || null;
+  };
+
+  return {
+    buildQueries,
+    restore() {
+      Project.findOne = originalProjectFindOne;
+      ProjectBuild.findOne = originalProjectBuildFindOne;
+    },
   };
 }
 
@@ -401,8 +419,78 @@ test('preview host serves static build files without setting cookies', async () 
   }
 });
 
-test('preview host serves published project pages', async () => {
-  const restore = stubPublishedProjectPage();
+test('published project page serves latestPublishedBuildId instead of a newer done build', async () => {
+  const publishedBuild = {
+    _id: buildId,
+    projectId,
+    status: 'done',
+    fullHtml: '<!doctype html><html><head></head><body><main>explicitly published build</main></body></html>',
+  };
+  const newerDoneBuild = {
+    _id: newerBuildId,
+    projectId,
+    status: 'done',
+    fullHtml: '<!doctype html><html><head></head><body><main>newer unpublished build</main></body></html>',
+  };
+  const stub = stubPublishedProjectPage({
+    latestPublishedBuildId: buildId,
+    builds: [newerDoneBuild, publishedBuild],
+  });
+  const server = await listen();
+
+  try {
+    const published = await request(server, { path: '/p/clean-app' });
+
+    assert.equal(published.statusCode, 200);
+    assert.match(published.body, /explicitly published build/);
+    assert.doesNotMatch(published.body, /newer unpublished build/);
+    assert.equal(stub.buildQueries.length, 1);
+    assert.equal(String(stub.buildQueries[0]._id), buildId);
+    assert.equal(String(stub.buildQueries[0].projectId), projectId);
+    assert.equal(stub.buildQueries[0].status, 'done');
+  } finally {
+    stub.restore();
+    await close(server);
+  }
+});
+
+test('published project page fails closed when latestPublishedBuildId is not a valid done build', async () => {
+  const stub = stubPublishedProjectPage({
+    latestPublishedBuildId: buildId,
+    builds: [
+      {
+        _id: newerBuildId,
+        projectId,
+        status: 'done',
+        fullHtml: '<!doctype html><html><body><main>fallback done build</main></body></html>',
+      },
+      {
+        _id: buildId,
+        projectId,
+        status: 'draft',
+        fullHtml: '<!doctype html><html><body><main>invalid published build</main></body></html>',
+      },
+    ],
+  });
+  const server = await listen();
+
+  try {
+    const published = await request(server, { path: '/p/clean-app' });
+
+    assert.equal(published.statusCode, 404);
+    assert.doesNotMatch(published.body, /fallback done build/);
+    assert.doesNotMatch(published.body, /invalid published build/);
+    assert.equal(stub.buildQueries.length, 1);
+    assert.equal(String(stub.buildQueries[0]._id), buildId);
+    assert.equal(stub.buildQueries[0].status, 'done');
+  } finally {
+    stub.restore();
+    await close(server);
+  }
+});
+
+test('preview host serves a valid published project with metadata and build asset paths', async () => {
+  const stub = stubPublishedProjectPage();
   const server = await listen();
 
   try {
@@ -410,11 +498,17 @@ test('preview host serves published project pages', async () => {
 
     assert.equal(published.statusCode, 200);
     assert.match(published.body, /published ok/);
+    assert.match(published.body, /<title>Clean App<\/title>/);
+    assert.match(published.body, /<meta name="description" content="Published preview page">/);
+    assert.match(published.body, /<meta property="og:title" content="Clean App">/);
+    assert.match(published.body, /<meta property="og:description" content="Published preview page">/);
+    assert.match(published.body, /<meta property="og:url" content="https:\/\/preview\.askfluid\.now\/p\/clean-app">/);
+    assert.match(published.body, new RegExp(`${buildPath.replace('index.html', '')}assets/app\\.js`));
     assert.match(published.headers['content-security-policy'], /default-src 'none'/);
     assert.equal(published.headers['referrer-policy'], 'no-referrer');
     assert.equal(published.headers['access-control-allow-credentials'], undefined);
   } finally {
-    restore();
+    stub.restore();
     await close(server);
   }
 });

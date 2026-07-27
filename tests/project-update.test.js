@@ -3,15 +3,23 @@ const test = require('node:test');
 const mongoose = require('mongoose');
 
 const Project = require('../models/Project');
+const RuntimeDocument = require('../models/RuntimeDocument');
 const projectRoutes = require('../routes/projectRoutes');
 
-function getProjectPutHandler() {
-  const layer = projectRoutes.stack.find((item) => (
-    item.route?.path === '/:id' &&
-    item.route?.methods?.put
+function getRouteLayer(pathname, method) {
+  return projectRoutes.stack.find((item) => (
+    item.route?.path === pathname &&
+    item.route?.methods?.[method]
   ));
+}
 
+function getRouteHandler(pathname, method) {
+  const layer = getRouteLayer(pathname, method);
   return layer.route.stack[layer.route.stack.length - 1].handle;
+}
+
+function getProjectPutHandler() {
+  return getRouteHandler('/:id', 'put');
 }
 
 function createResponse() {
@@ -27,6 +35,39 @@ function createResponse() {
       return this;
     },
   };
+}
+
+function createRuntimeLifecycleQuery(document) {
+  return {
+    select() {
+      return Promise.resolve(document);
+    },
+  };
+}
+
+async function runRuntimeLifecycle(pathname, {
+  projectId = '64f000000000000000000001',
+  userId = '64f000000000000000000002',
+  findOneAndUpdate,
+} = {}) {
+  const originalFindOneAndUpdate = Project.findOneAndUpdate;
+  const handler = getRouteHandler(pathname, 'post');
+  const req = {
+    params: { id: projectId },
+    projectObjectId: new mongoose.Types.ObjectId(projectId),
+    userId,
+    body: {},
+  };
+  const res = createResponse();
+
+  Project.findOneAndUpdate = findOneAndUpdate;
+  try {
+    await handler(req, res);
+  } finally {
+    Project.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+
+  return res;
 }
 
 async function runPut(body, findOneAndUpdate) {
@@ -161,6 +202,7 @@ test('project PUT ignores protected fields', async () => {
     prompt: 'Allowed',
     owner: 'attacker',
     role: 'admin',
+    runtimeEnabled: true,
     publishedBuildId: '64f000000000000000000099',
     latestPublishedBuildId: '64f000000000000000000099',
     _id: '64f000000000000000000098',
@@ -172,6 +214,210 @@ test('project PUT ignores protected fields', async () => {
 
   assert.equal(res.statusCode, 200);
   assert.deepEqual(update, { $set: { prompt: 'Allowed' } });
+});
+
+test('project runtime enable scopes update to owner and enables disabled project', async () => {
+  let captured;
+  const res = await runRuntimeLifecycle('/:id/runtime/enable', {
+    findOneAndUpdate: (query, update, options) => {
+      captured = { query, update, options };
+      return createRuntimeLifecycleQuery({
+        _id: query._id,
+        runtimeEnabled: true,
+      });
+    },
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(captured.query, {
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000002',
+  });
+  assert.deepEqual(captured.update, { $set: { runtimeEnabled: true } });
+  assert.equal(captured.options.new, true);
+  assert.equal(captured.options.runValidators, true);
+  assert.deepEqual(res.body, { ok: true, runtimeEnabled: true });
+});
+
+test('project runtime enable is idempotent when already enabled', async () => {
+  let updateCount = 0;
+  const res = await runRuntimeLifecycle('/:id/runtime/enable', {
+    findOneAndUpdate: () => {
+      updateCount += 1;
+      return createRuntimeLifecycleQuery({ runtimeEnabled: true });
+    },
+  });
+
+  assert.equal(updateCount, 1);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, runtimeEnabled: true });
+});
+
+test('project runtime disable scopes update to owner and disables enabled project', async () => {
+  let captured;
+  const res = await runRuntimeLifecycle('/:id/runtime/disable', {
+    findOneAndUpdate: (query, update, options) => {
+      captured = { query, update, options };
+      return createRuntimeLifecycleQuery({
+        _id: query._id,
+        runtimeEnabled: false,
+      });
+    },
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(captured.query, {
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000002',
+  });
+  assert.deepEqual(captured.update, { $set: { runtimeEnabled: false } });
+  assert.equal(captured.options.new, true);
+  assert.equal(captured.options.runValidators, true);
+  assert.deepEqual(res.body, { ok: true, runtimeEnabled: false });
+});
+
+test('project runtime disable is idempotent when already disabled', async () => {
+  let updateCount = 0;
+  const res = await runRuntimeLifecycle('/:id/runtime/disable', {
+    findOneAndUpdate: () => {
+      updateCount += 1;
+      return createRuntimeLifecycleQuery({ runtimeEnabled: false });
+    },
+  });
+
+  assert.equal(updateCount, 1);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, runtimeEnabled: false });
+});
+
+test('project runtime enable denies projects owned by another user', async () => {
+  const otherUserProject = {
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000099',
+    runtimeEnabled: false,
+  };
+  let capturedQuery;
+
+  const res = await runRuntimeLifecycle('/:id/runtime/enable', {
+    findOneAndUpdate: (query) => {
+      capturedQuery = query;
+      if (
+        String(query._id) === String(otherUserProject._id) &&
+        String(query.userId) === String(otherUserProject.userId)
+      ) {
+        otherUserProject.runtimeEnabled = true;
+        return createRuntimeLifecycleQuery(otherUserProject);
+      }
+      return createRuntimeLifecycleQuery(null);
+    },
+  });
+
+  assert.deepEqual(capturedQuery, {
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000002',
+  });
+  assert.equal(res.statusCode, 404);
+  assert.deepEqual(res.body, { message: 'Projeto não encontrado.' });
+  assert.equal(otherUserProject.runtimeEnabled, false);
+});
+
+test('project runtime disable denies projects owned by another user', async () => {
+  const otherUserProject = {
+    _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+    userId: '64f000000000000000000099',
+    runtimeEnabled: true,
+  };
+
+  const res = await runRuntimeLifecycle('/:id/runtime/disable', {
+    findOneAndUpdate: (query) => {
+      if (
+        String(query._id) === String(otherUserProject._id) &&
+        String(query.userId) === String(otherUserProject.userId)
+      ) {
+        otherUserProject.runtimeEnabled = false;
+        return createRuntimeLifecycleQuery(otherUserProject);
+      }
+      return createRuntimeLifecycleQuery(null);
+    },
+  });
+
+  assert.equal(res.statusCode, 404);
+  assert.deepEqual(res.body, { message: 'Projeto não encontrado.' });
+  assert.equal(otherUserProject.runtimeEnabled, true);
+});
+
+test('project runtime lifecycle endpoints reject unauthenticated requests', async () => {
+  for (const pathname of ['/:id/runtime/enable', '/:id/runtime/disable']) {
+    const layer = getRouteLayer(pathname, 'post');
+    const auth = layer.route.stack[0].handle;
+    const res = createResponse();
+    let nextCalled = false;
+
+    await auth({ headers: {}, method: 'POST', originalUrl: `/api/projects/${pathname}` }, res, () => {
+      nextCalled = true;
+    });
+
+    assert.equal(nextCalled, false);
+    assert.equal(res.statusCode, 401);
+    assert.deepEqual(res.body, { message: 'Token não enviado.' });
+  }
+});
+
+test('project runtime lifecycle endpoints reject malformed project ids before update', () => {
+  for (const pathname of ['/:id/runtime/enable', '/:id/runtime/disable']) {
+    const layer = getRouteLayer(pathname, 'post');
+    const validation = layer.route.stack[1].handle;
+    const res = createResponse();
+    let nextCalled = false;
+
+    validation({ params: { id: 'not-an-object-id' } }, res, () => {
+      nextCalled = true;
+    });
+
+    assert.equal(nextCalled, false);
+    assert.equal(res.statusCode, 404);
+    assert.deepEqual(res.body, { message: 'Projeto não encontrado.' });
+  }
+});
+
+test('project runtime lifecycle returns existing 500 response on database failure', async () => {
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const res = await runRuntimeLifecycle('/:id/runtime/enable', {
+      findOneAndUpdate: () => {
+        throw new Error('database unavailable');
+      },
+    });
+
+    assert.equal(res.statusCode, 500);
+    assert.deepEqual(res.body, { message: 'Erro interno do servidor.' });
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test('project runtime disable does not delete RuntimeDocument records', async () => {
+  const originalDeleteMany = RuntimeDocument.deleteMany;
+  let deleteManyCalled = false;
+
+  RuntimeDocument.deleteMany = async () => {
+    deleteManyCalled = true;
+    throw new Error('runtime data must not be deleted by disable');
+  };
+
+  try {
+    const res = await runRuntimeLifecycle('/:id/runtime/disable', {
+      findOneAndUpdate: () => createRuntimeLifecycleQuery({ runtimeEnabled: false }),
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body, { ok: true, runtimeEnabled: false });
+    assert.equal(deleteManyCalled, false);
+  } finally {
+    RuntimeDocument.deleteMany = originalDeleteMany;
+  }
 });
 
 test('project PUT returns 404 when project does not exist', async () => {

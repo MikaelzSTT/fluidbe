@@ -4,6 +4,10 @@ const BriefingSession = require('../models/BriefingSession');
 const Session = require('../models/Session');
 const StripeWebhookEvent = require('../models/StripeWebhookEvent');
 const User = require('../models/User');
+const Project = require('../models/Project');
+const {
+  inspectProjectPublicHostKeys,
+} = require('./projectPublicHostKeyBackfill');
 
 const STRIPE_UNIQUE_PARTIAL_FIELDS = Object.freeze([
   'stripeCustomerId',
@@ -123,6 +127,7 @@ async function validateMongoIndexReadiness({
   userModel = User,
   stripeFields = STRIPE_UNIQUE_PARTIAL_FIELDS,
   ttlChecks = TTL_DATE_FIELD_CHECKS,
+  projectModel = Project,
 } = {}) {
   const duplicateFields = [];
 
@@ -151,18 +156,33 @@ async function validateMongoIndexReadiness({
   const duplicateValueCount = duplicateFields.reduce((sum, item) => sum + item.duplicateValueCount, 0);
   const duplicateDocumentCount = duplicateFields.reduce((sum, item) => sum + item.duplicateDocumentCount, 0);
   const invalidTtlDocumentCount = invalidTtlFields.reduce((sum, item) => sum + item.invalidCount, 0);
+  const projectPublicHostKey = projectModel
+    ? await inspectProjectPublicHostKeys({ projectModel })
+    : null;
+  const projectPublicHostKeyProblemCount = projectPublicHostKey
+    ? projectPublicHostKey.missingUnset
+      + projectPublicHostKey.invalidExisting
+      + projectPublicHostKey.duplicateValueCount
+    : 0;
 
   return {
-    clean: duplicateFields.length === 0 && invalidTtlFields.length === 0,
+    clean: duplicateFields.length === 0
+      && invalidTtlFields.length === 0
+      && projectPublicHostKeyProblemCount === 0,
     stripeFields: [...stripeFields],
     duplicateFields,
     invalidTtlFields,
+    projectPublicHostKey,
     summary: {
       duplicateFieldCount: duplicateFields.length,
       duplicateValueCount,
       duplicateDocumentCount,
       invalidTtlFieldCount: invalidTtlFields.length,
       invalidTtlDocumentCount,
+      projectPublicHostKeyMissingCount: projectPublicHostKey?.missingUnset || 0,
+      projectPublicHostKeyInvalidCount: projectPublicHostKey?.invalidExisting || 0,
+      projectPublicHostKeyDuplicateValueCount: projectPublicHostKey?.duplicateValueCount || 0,
+      projectPublicHostKeyDuplicateDocumentCount: projectPublicHostKey?.duplicateDocumentCount || 0,
     },
   };
 }
@@ -171,9 +191,23 @@ function formatReadinessReport(result) {
   const lines = [
     `Stripe unique partial fields: ${result.stripeFields.join(', ')}`,
   ];
+  const projectPublicHostKey = result.projectPublicHostKey;
+
+  if (projectPublicHostKey) {
+    lines.push(
+      [
+        'Project publicHostKey readiness:',
+        `total=${projectPublicHostKey.totalProjectsInspected}`,
+        `valid=${projectPublicHostKey.alreadyValid}`,
+        `missing=${projectPublicHostKey.missingUnset}`,
+        `invalid=${projectPublicHostKey.invalidExisting}`,
+        `duplicateValues=${projectPublicHostKey.duplicateValueCount}`,
+      ].join(' ')
+    );
+  }
 
   if (result.clean) {
-    lines.push('Mongo index readiness validation passed: no duplicate Stripe values and no incompatible TTL date values.');
+    lines.push('Mongo index readiness validation passed: no duplicate Stripe values, no incompatible TTL date values, and Project.publicHostKey is ready.');
     return lines;
   }
 
@@ -188,6 +222,24 @@ function formatReadinessReport(result) {
 
   for (const field of result.invalidTtlFields) {
     lines.push(`${field.collectionName}.${field.fieldName}: ${field.invalidCount} incompatible value(s) by BSON type ${JSON.stringify(field.invalidTypeCounts)}.`);
+  }
+
+  if (projectPublicHostKey?.missingUnset > 0) {
+    lines.push(`projects.publicHostKey: ${projectPublicHostKey.missingUnset} missing/unset legacy project(s). Run node scripts/backfillProjectPublicHostKeys.js --apply before host routing or index application.`);
+  }
+
+  if (projectPublicHostKey?.invalidExisting > 0) {
+    lines.push(`projects.publicHostKey: ${projectPublicHostKey.invalidExisting} malformed/non-string existing value(s). Resolve manually; readiness will not rewrite project identities.`);
+    projectPublicHostKey.invalidValues.slice(0, 10).forEach((invalid) => {
+      lines.push(`  project=${invalid.projectId} reason=${invalid.reason} type=${invalid.valueType}`);
+    });
+  }
+
+  if (projectPublicHostKey?.duplicateValueCount > 0) {
+    lines.push(`projects.publicHostKey: ${projectPublicHostKey.duplicateValueCount} duplicate value(s), ${projectPublicHostKey.duplicateDocumentCount} document references.`);
+    projectPublicHostKey.duplicateKeys.slice(0, 10).forEach((duplicate) => {
+      lines.push(`  key=${maskValue(duplicate.publicHostKey)} count=${duplicate.count}`);
+    });
   }
 
   return lines;

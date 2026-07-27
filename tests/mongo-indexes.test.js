@@ -110,6 +110,17 @@ function createAggregateModel(collectionName, handler) {
   };
 }
 
+function createPublicHostKeyModel(docs = []) {
+  return {
+    collection: {
+      collectionName: 'projects',
+      find: () => ({
+        toArray: async () => docs.map((doc) => JSON.parse(JSON.stringify(doc))),
+      }),
+    },
+  };
+}
+
 test('critical Mongo indexes are declared for primary query paths', () => {
   assertSchemaIndex(Project, { userId: 1, createdAt: -1, _id: -1 });
   assertSchemaIndex(Project, { userId: 1, isPublished: 1 });
@@ -142,6 +153,13 @@ test('TTL indexes are declared only on expiry/transient date fields', () => {
 });
 
 test('unique indexes are declared for identity and billing lookup fields', () => {
+  assertSchemaIndex(Project, { publicHostKey: 1 }, {
+    unique: true,
+    partialFilterExpression: {
+      publicHostKey: { $type: 'string', $gt: '' },
+    },
+  });
+
   assertSchemaIndex(User, { email: 1 }, { unique: true });
   assertSchemaIndex(User, { googleId: 1 }, { unique: true, sparse: true });
   assertSchemaIndex(User, { githubId: 1 }, { unique: true, sparse: true });
@@ -230,6 +248,7 @@ test('Stripe readiness detects duplicate non-empty values with masked output', a
     userModel,
     stripeFields: ['stripeCustomerId', 'stripeSubscriptionId'],
     ttlChecks: [{ collectionName: 'sessions', model: ttlModel, fieldName: 'expiresAt' }],
+    projectModel: createPublicHostKeyModel([]),
   });
 
   assert.equal(result.clean, false);
@@ -250,6 +269,7 @@ test('Stripe readiness passes when database is clean', async () => {
     ttlChecks: [
       { collectionName: 'sessions', model: cleanModel, fieldName: 'expiresAt' },
     ],
+    projectModel: createPublicHostKeyModel([]),
   });
 
   assert.equal(result.clean, true);
@@ -259,6 +279,10 @@ test('Stripe readiness passes when database is clean', async () => {
     duplicateDocumentCount: 0,
     invalidTtlFieldCount: 0,
     invalidTtlDocumentCount: 0,
+    projectPublicHostKeyMissingCount: 0,
+    projectPublicHostKeyInvalidCount: 0,
+    projectPublicHostKeyDuplicateValueCount: 0,
+    projectPublicHostKeyDuplicateDocumentCount: 0,
   });
 });
 
@@ -288,6 +312,7 @@ test('TTL readiness detects missing and non-Date values', async () => {
     userModel,
     stripeFields: ['stripeCustomerId'],
     ttlChecks: [{ collectionName: 'sessions', model: ttlModel, fieldName: 'expiresAt' }],
+    projectModel: createPublicHostKeyModel([]),
   });
 
   assert.equal(result.clean, false);
@@ -304,6 +329,47 @@ test('TTL readiness detects missing and non-Date values', async () => {
       },
     },
   ]);
+});
+
+test('Project publicHostKey readiness passes for valid canonical keys', async () => {
+  const cleanModel = createAggregateModel('users', () => []);
+  const result = await validateMongoIndexReadiness({
+    userModel: cleanModel,
+    stripeFields: [],
+    ttlChecks: [],
+    projectModel: createPublicHostKeyModel([
+      { _id: 'project-a', publicHostKey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+      { _id: 'project-b', publicHostKey: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+    ]),
+  });
+
+  assert.equal(result.clean, true);
+  assert.equal(result.projectPublicHostKey.readyForUniqueIndex, true);
+  assert.equal(result.projectPublicHostKey.readyForHostRouting, true);
+});
+
+test('Project publicHostKey readiness detects missing, malformed, non-string, and duplicate values', async () => {
+  const cleanModel = createAggregateModel('users', () => []);
+  const result = await validateMongoIndexReadiness({
+    userModel: cleanModel,
+    stripeFields: [],
+    ttlChecks: [],
+    projectModel: createPublicHostKeyModel([
+      { _id: 'project-a' },
+      { _id: 'project-b', publicHostKey: 'not-valid' },
+      { _id: 'project-c', publicHostKey: 123 },
+      { _id: 'project-d', publicHostKey: 'cccccccccccccccccccccccccccccccc' },
+      { _id: 'project-e', publicHostKey: 'cccccccccccccccccccccccccccccccc' },
+    ]),
+  });
+
+  assert.equal(result.clean, false);
+  assert.equal(result.summary.projectPublicHostKeyMissingCount, 1);
+  assert.equal(result.summary.projectPublicHostKeyInvalidCount, 2);
+  assert.equal(result.summary.projectPublicHostKeyDuplicateValueCount, 1);
+  assert.equal(result.summary.projectPublicHostKeyDuplicateDocumentCount, 2);
+  assert.equal(result.projectPublicHostKey.readyForUniqueIndex, false);
+  assert.equal(result.projectPublicHostKey.readyForHostRouting, false);
 });
 
 test('index sync apply creates only expected missing indexes', async () => {
