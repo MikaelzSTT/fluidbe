@@ -17,6 +17,7 @@ const {
   BUILD_PREVIEW_TTL_SECONDS,
   createBuildPreviewToken,
 } = require('../utils/buildPreviewAccess');
+const { assertJavaScriptParses } = require('../utils/buildAssetCapabilities');
 
 const PROJECT_A_ID = '64f000000000000000000301';
 const PROJECT_B_ID = '64f000000000000000000302';
@@ -235,7 +236,15 @@ async function writeBuild(projectId, buildId, label) {
   await fs.writeFile(path.join(root, 'assets', 'chunk.js'), 'export const chunk = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'minified-static.js'), 'export const minifiedStatic = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'dynamic.js'), 'export function run() {}\n');
-  await fs.writeFile(path.join(root, 'assets', 'charts-rVXgnjvt.js'), 'export function render() {}\n');
+  await fs.writeFile(
+    path.join(root, 'assets', 'charts-rVXgnjvt.js'),
+    [
+      'import{icon as i}from"./icons-AbCdEf12.js";',
+      'const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/icons-AbCdEf12.js","assets/not-fetched.js","ready"])))=>i.map(i=>d[i]);',
+      'const ordinary="assets/charts-rVXgnjvt.js",escaped="assets\\/escaped.js",template=`assets/template.js`,regex=/assets\\/regex\\.js/,adjacent=i?"assets/ternary.js":"./literal.js";',
+      'export function render(){return [i,ordinary,escaped,template,regex.source,adjacent,__vite__mapDeps([0])].join("|")}',
+    ].join('\n')
+  );
   await fs.writeFile(path.join(root, 'assets', 'shared.js'), 'export const value = 1;\n');
   await fs.writeFile(path.join(root, 'assets', 'icons-AbCdEf12.js'), 'export const icon = true;\n');
   await fs.writeFile(path.join(root, 'assets', 'worker.js'), 'self.postMessage("ready");\n');
@@ -424,6 +433,15 @@ test('generated preview propagates capability through tokenized Vite entry to ne
 
   assert.equal(nestedChunk.statusCode, 200);
   assert.match(nestedChunk.body, /export function render/);
+  assert.doesNotThrow(() => assertJavaScriptParses(nestedChunk.body, 'assets/charts-rVXgnjvt.js'));
+  assert.match(nestedChunk.body, new RegExp(`from"\\.\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(nestedChunk.body, new RegExp(`"assets\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(nestedChunk.body, /"ready"/);
+  assert.doesNotMatch(nestedChunk.body, /ready\?previewToken/);
+  assert.match(nestedChunk.body, /ordinary="assets\/charts-rVXgnjvt\.js"/);
+  assert.match(nestedChunk.body, /template=`assets\/template\.js`/);
+  assert.match(nestedChunk.body, /regex=\/assets\\\/regex\\\.js\//);
+  assert.match(nestedChunk.body, /adjacent=i\?"assets\/ternary\.js":"\.\/literal\.js"/);
   assert.equal(tokenlessNestedChunk.statusCode, 404);
 });
 
@@ -436,14 +454,14 @@ test('generated preview disk JS propagates static, dynamic, CSS, worker, and ass
 
   assert.equal(response.statusCode, 200);
   assert.match(response.body, new RegExp(`import "\\.\\/chunk\\.js\\?previewToken=${encodedToken}";`));
-  assert.match(response.body, new RegExp(`import "\\.\\/minified-static\\.js\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`import"\\.\\/minified-static\\.js\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`import\\("\\.\\/dynamic\\.js\\?previewToken=${encodedToken}"\\)`));
   assert.match(response.body, new RegExp(`import\\("\\.\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"\\)`));
   assert.match(response.body, new RegExp(`from "\\.\\/shared\\.js\\?previewToken=${encodedToken}"`));
-  assert.match(response.body, new RegExp(`from "\\.\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`from"\\.\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
   assert.match(response.body, new RegExp(`new URL\\("\\.\\/worker\\.js\\?previewToken=${encodedToken}#worker", import\\.meta\\.url\\)`));
-  assert.match(response.body, new RegExp(`new URL\\("worker-B7T9\\.js\\?previewToken=${encodedToken}", import\\.meta\\.url\\)`));
+  assert.match(response.body, new RegExp(`new URL\\("worker-B7T9\\.js\\?previewToken=${encodedToken}",import\\.meta\\.url\\)`));
   assert.match(response.body, new RegExp(`new URL\\("\\.\\.\\/images\\/logo\\.png\\?from=js&previewToken=${encodedToken}#logo", import\\.meta\\.url\\)`));
   assert.match(response.body, new RegExp(`"assets\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"`));
   assert.match(response.body, new RegExp(`"assets\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));

@@ -29,7 +29,9 @@ const {
   verifyBuildPreviewToken,
 } = require('./utils/buildPreviewAccess');
 const {
+  assertJavaScriptParses,
   injectBuildPreviewTokenIntoCodeAssets,
+  injectBuildPreviewTokenIntoCssAssets,
   injectBuildPreviewTokenIntoHtmlAssets,
 } = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
@@ -344,13 +346,18 @@ function isCodeBuildArtifact(contentType, artifactPath) {
   const extension = path.extname(String(artifactPath || '')).toLowerCase();
 
   return (
-    normalizedContentType === 'text/css'
-    || normalizedContentType === 'application/javascript'
+    normalizedContentType === 'application/javascript'
     || normalizedContentType === 'text/javascript'
     || normalizedContentType === 'application/x-javascript'
-    || extension === '.css'
     || extension === '.js'
     || extension === '.mjs'
+  );
+}
+
+function isCssBuildArtifact(contentType, artifactPath) {
+  return (
+    getNormalizedContentType(contentType) === 'text/css'
+    || path.extname(String(artifactPath || '')).toLowerCase() === '.css'
   );
 }
 
@@ -380,6 +387,13 @@ function propagateGeneratedPreviewCapability(req, artifactPath, contentType, bod
       access.previewToken,
       options
     );
+  } else if (isCssBuildArtifact(contentType, artifactPath)) {
+    transformedText = injectBuildPreviewTokenIntoCssAssets(
+      originalText,
+      parsedPath,
+      access.previewToken,
+      options
+    );
   } else if (isCodeBuildArtifact(contentType, artifactPath)) {
     transformedText = injectBuildPreviewTokenIntoCodeAssets(
       originalText,
@@ -393,6 +407,10 @@ function propagateGeneratedPreviewCapability(req, artifactPath, contentType, bod
 
   if (transformedText === originalText) {
     return { body: originalBody, originalBody, transformed: false };
+  }
+
+  if (isCodeBuildArtifact(contentType, artifactPath)) {
+    assertJavaScriptParses(transformedText, artifactPath);
   }
 
   return {
