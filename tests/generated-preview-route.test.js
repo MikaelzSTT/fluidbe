@@ -1,4 +1,5 @@
 const assert = require('assert/strict');
+const crypto = require('crypto');
 const fs = require('fs/promises');
 const http = require('http');
 const path = require('path');
@@ -25,6 +26,17 @@ const BUILD_A_ID = '64f000000000000000000311';
 const BUILD_A_NEWER_ID = '64f000000000000000000312';
 const BUILD_B_ID = '64f000000000000000000321';
 const PUBLIC_BUILDS_DIR = path.join(__dirname, '..', 'public', 'builds');
+
+function sha256(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+const MONGO_ENTRY_BODY = Buffer.from([
+  'import "./mongo-chunk.js";',
+  'const logo = new URL("./mongo-logo.png?size=1#v", import.meta.url);',
+  'const cdn = "https://cdn.example/mongo.js";',
+  'export { logo, cdn };',
+].join('\n'));
 
 const projectA = {
   _id: PROJECT_A_ID,
@@ -53,6 +65,12 @@ const builds = [
         relativePath: 'mongo-only.txt',
         contentType: 'text/plain; charset=utf-8',
         content: Buffer.from('project-a-mongo-fallback').toString('base64'),
+      },
+      {
+        relativePath: 'mongo-entry.js',
+        contentType: 'application/javascript; charset=utf-8',
+        content: MONGO_ENTRY_BODY.toString('base64'),
+        sha256: sha256(MONGO_ENTRY_BODY),
       },
     ],
   },
@@ -110,10 +128,12 @@ function request(options = {}) {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const bodyBuffer = Buffer.concat(chunks);
           resolve({
             statusCode: res.statusCode,
             headers: res.headers,
-            body: Buffer.concat(chunks).toString('utf8'),
+            body: bodyBuffer.toString('utf8'),
+            bodyBuffer,
           });
         });
       }
@@ -171,14 +191,67 @@ function generatedPreviewHost(publicHostKey) {
 async function writeBuild(projectId, buildId, label) {
   const root = path.join(PUBLIC_BUILDS_DIR, projectId, buildId);
   await fs.mkdir(path.join(root, 'assets'), { recursive: true });
+  await fs.mkdir(path.join(root, 'images'), { recursive: true });
   await fs.writeFile(
     path.join(root, 'index.html'),
-    `<!doctype html><main>${label}</main><script src="./assets/app.js"></script>`
+    [
+      '<!doctype html><html><head>',
+      `<link rel="stylesheet" href="./assets/app.css?theme=dark#sheet">`,
+      `<link rel="modulepreload" href="/builds/${projectId}/${buildId}/assets/chunk.js">`,
+      `<script type="module" src="./assets/app.js"></script>`,
+      `<script type="module" src="./assets/already.js?previewToken=existing#ready"></script>`,
+      `<script type="module" src="/builds/${projectId}/${buildId}/assets/absolute.js?mode=prod#abs"></script>`,
+      `<script type="module" src="https://pv-${PROJECT_A_KEY}.fluidapps.dev/builds/${projectId}/${buildId}/assets/generated-origin.js?x=1#origin"></script>`,
+      `<script type="module" src="/builds/${projectId}/other-build/assets/leak.js"></script>`,
+      `<script type="module" src="/builds/${PROJECT_B_ID}/${BUILD_B_ID}/assets/leak.js"></script>`,
+      '<script type="module" src="https://cdn.example/app.js"></script>',
+      '<script type="module" src="data:text/javascript,console.log(1)"></script>',
+      '</head><body>',
+      `<main>${label}</main>`,
+      `<img src="./images/logo.png?size=small#hero">`,
+      '</body></html>',
+    ].join('')
   );
   await fs.writeFile(
     path.join(root, 'assets', 'app.js'),
-    `document.body.dataset.build = "${label}";`
+    [
+      'import "./chunk.js";',
+      'import "./imported.css";',
+      'import("./dynamic.js").then((mod) => mod.run());',
+      'export { value } from "./shared.js";',
+      'const workerUrl = new URL("./worker.js#worker", import.meta.url);',
+      'const imageUrl = new URL("../images/logo.png?from=js#logo", import.meta.url);',
+      'const external = "https://cdn.example/external.js";',
+      `document.body.dataset.build = "${label}";`,
+      'export { workerUrl, imageUrl, external };',
+    ].join('\n')
   );
+  await fs.writeFile(path.join(root, 'assets', 'chunk.js'), 'export const chunk = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'dynamic.js'), 'export function run() {}\n');
+  await fs.writeFile(path.join(root, 'assets', 'shared.js'), 'export const value = 1;\n');
+  await fs.writeFile(path.join(root, 'assets', 'worker.js'), 'self.postMessage("ready");\n');
+  await fs.writeFile(path.join(root, 'assets', 'already.js'), 'export const already = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'absolute.js'), 'export const absolute = true;\n');
+  await fs.writeFile(path.join(root, 'assets', 'generated-origin.js'), 'export const origin = true;\n');
+  await fs.writeFile(
+    path.join(root, 'assets', 'app.css'),
+    [
+      '@import "./imported.css";',
+      '.hero{background:url("../images/logo.png?variant=hero#img")}',
+      '@font-face{font-family:"Test";src:url("./font.woff2#font") format("woff2")}',
+      '.external{background:url("https://cdn.example/bg.png")}',
+    ].join('\n')
+  );
+  await fs.writeFile(
+    path.join(root, 'assets', 'imported.css'),
+    '.imported{background:url("../images/logo.png?from=imported")}\n'
+  );
+  await fs.writeFile(path.join(root, 'assets', 'font.woff2'), Buffer.from('font-bytes'));
+  await fs.writeFile(path.join(root, 'images', 'logo.png'), Buffer.from([
+    0x89, 0x50, 0x4e, 0x47,
+    0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00,
+  ]));
 }
 
 test.before(async () => {
@@ -258,6 +331,125 @@ test('Project A preview host serves Project A build with its exact capability', 
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.equal(response.headers['access-control-allow-credentials'], undefined);
   assert.equal(projectFindByIdCalls, 0);
+});
+
+test('generated preview HTML tokenizes same-build assets and preserves URL boundaries', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const encodedToken = encodeURIComponent(token);
+  const response = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID)}?previewToken=${token}`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(
+    response.body,
+    new RegExp(`href="\\.\\/assets\\/app\\.css\\?theme=dark&previewToken=${encodedToken}#sheet"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`href="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/chunk\\.js\\?previewToken=${encodedToken}"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\.\\/assets\\/app\\.js\\?previewToken=${encodedToken}"`)
+  );
+  assert.match(
+    response.body,
+    /src="\.\/assets\/already\.js\?previewToken=existing#ready"/
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/absolute\\.js\\?mode=prod&previewToken=${encodedToken}#abs"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="https:\\/\\/pv-${PROJECT_A_KEY}\\.fluidapps\\.dev\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/generated-origin\\.js\\?x=1&previewToken=${encodedToken}#origin"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\.\\/images\\/logo\\.png\\?size=small&previewToken=${encodedToken}#hero"`)
+  );
+  assert.match(response.body, /src="https:\/\/cdn\.example\/app\.js"/);
+  assert.match(response.body, /src="data:text\/javascript,console\.log\(1\)"/);
+  assert.match(
+    response.body,
+    new RegExp(`src="\\/builds\\/${PROJECT_A_ID}\\/other-build\\/assets\\/leak\\.js"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\/builds\\/${PROJECT_B_ID}\\/${BUILD_B_ID}\\/assets\\/leak\\.js"`)
+  );
+  assert.equal((response.body.match(/previewToken=existing/g) || []).length, 1);
+  assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.body)));
+  assert.equal(response.headers['x-build-artifact-sha256'], sha256(response.bodyBuffer));
+});
+
+test('generated preview disk JS propagates static, dynamic, CSS, worker, and asset URLs', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const encodedToken = encodeURIComponent(token);
+  const response = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.js')}?previewToken=${token}`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, new RegExp(`import "\\.\\/chunk\\.js\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`import\\("\\.\\/dynamic\\.js\\?previewToken=${encodedToken}"\\)`));
+  assert.match(response.body, new RegExp(`from "\\.\\/shared\\.js\\?previewToken=${encodedToken}"`));
+  assert.match(response.body, new RegExp(`new URL\\("\\.\\/worker\\.js\\?previewToken=${encodedToken}#worker", import\\.meta\\.url\\)`));
+  assert.match(response.body, new RegExp(`new URL\\("\\.\\.\\/images\\/logo\\.png\\?from=js&previewToken=${encodedToken}#logo", import\\.meta\\.url\\)`));
+  assert.match(response.body, /https:\/\/cdn\.example\/external\.js/);
+  assert.doesNotMatch(response.body, /https:\/\/cdn\.example\/external\.js\?previewToken/);
+});
+
+test('generated preview disk CSS propagates imported CSS, image, and font URLs', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const encodedToken = encodeURIComponent(token);
+  const response = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.css')}?previewToken=${token}`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, new RegExp(`@import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`url\\("\\.\\.\\/images\\/logo\\.png\\?variant=hero&previewToken=${encodedToken}#img"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\.\\/font\\.woff2\\?previewToken=${encodedToken}#font"\\)`));
+  assert.match(response.body, /url\("https:\/\/cdn\.example\/bg\.png"\)/);
+  assert.doesNotMatch(response.body, /cdn\.example\/bg\.png\?previewToken/);
+});
+
+test('generated preview Mongo textual artifacts transform after original SHA validation', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const encodedToken = encodeURIComponent(token);
+  const response = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'mongo-entry.js')}?previewToken=${token}`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, new RegExp(`import "\\.\\/mongo-chunk\\.js\\?previewToken=${encodedToken}";`));
+  assert.match(response.body, new RegExp(`new URL\\("\\.\\/mongo-logo\\.png\\?size=1&previewToken=${encodedToken}#v", import\\.meta\\.url\\)`));
+  assert.match(response.body, /https:\/\/cdn\.example\/mongo\.js/);
+  assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.body)));
+  assert.equal(response.headers['x-build-artifact-sha256'], sha256(response.bodyBuffer));
+  assert.equal(response.headers['x-build-artifact-expected-sha256'], sha256(MONGO_ENTRY_BODY));
+  assert.equal(response.headers['x-build-artifact-original-sha256'], sha256(MONGO_ENTRY_BODY));
+  assert.equal(response.headers['x-build-artifact-original-sha256-match'], 'true');
+  assert.equal(response.headers['x-build-artifact-sha256-match'], undefined);
+});
+
+test('generated preview binary artifacts are unchanged', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const original = await fs.readFile(
+    path.join(PUBLIC_BUILDS_DIR, PROJECT_A_ID, BUILD_A_ID, 'images', 'logo.png')
+  );
+  const response = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png')}?previewToken=${token}`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.bodyBuffer, original);
+  assert.equal(response.headers['content-type'], 'image/png');
+  assert.equal(response.headers['content-length'], String(original.length));
+  assert.equal(response.headers['x-build-artifact-sha256'], sha256(original));
 });
 
 test('Project A host denies Project B path even with a valid Project B capability', async () => {
@@ -481,8 +673,9 @@ test('missing generated domain disables generated preview serving', async () => 
 });
 
 test('legacy preview host and normal build publication access remain unchanged', async () => {
+  const legacyToken = validToken(PROJECT_B_ID, BUILD_B_ID);
   const legacyPreview = await request({
-    path: `${buildPath(PROJECT_B_ID, BUILD_B_ID)}?previewToken=${validToken(PROJECT_B_ID, BUILD_B_ID)}`,
+    path: `${buildPath(PROJECT_B_ID, BUILD_B_ID)}?previewToken=${legacyToken}`,
     headers: {
       Host: 'preview.askfluid.now',
     },
@@ -496,6 +689,7 @@ test('legacy preview host and normal build publication access remain unchanged',
 
   assert.equal(legacyPreview.statusCode, 200);
   assert.match(legacyPreview.body, /project-b/);
+  assert.doesNotMatch(legacyPreview.body, new RegExp(`previewToken=${encodeURIComponent(legacyToken)}`));
   assert.equal(publishedBuild.statusCode, 200);
   assert.match(publishedBuild.body, /project-a-requested/);
   assert.equal(publishedBuild.headers.deprecation, 'true');

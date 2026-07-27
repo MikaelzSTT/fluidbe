@@ -6,7 +6,30 @@ function appendQueryParam(value, name, paramValue) {
   return `${beforeHash}${separator}${encodeURIComponent(name)}=${encodeURIComponent(paramValue)}${hash}`;
 }
 
-function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken) {
+function getCurrentBuildAssetPath(parsedPath) {
+  const artifactPath = String(parsedPath?.artifactPath || 'index.html')
+    .replace(/^\/+/, '');
+
+  return `/builds/${parsedPath.projectId}/${parsedPath.buildKey}/${artifactPath || 'index.html'}`;
+}
+
+function getAllowedAssetOrigins(options = {}) {
+  const origins = new Set(['http://localhost']);
+
+  if (typeof options.baseOrigin === 'string' && options.baseOrigin) {
+    origins.add(options.baseOrigin);
+  }
+
+  for (const origin of options.allowedOrigins || []) {
+    if (typeof origin === 'string' && origin) {
+      origins.add(origin);
+    }
+  }
+
+  return origins;
+}
+
+function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken, options = {}) {
   if (typeof rawValue !== 'string' || !rawValue || !previewToken) {
     return rawValue;
   }
@@ -22,10 +45,14 @@ function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken) {
   }
 
   let resolvedUrl;
-  const basePath = `/builds/${parsedPath.projectId}/${parsedPath.buildKey}/index.html`;
+  const basePath = getCurrentBuildAssetPath(parsedPath);
+  const allowedOrigins = getAllowedAssetOrigins(options);
+  const baseOrigin = typeof options.baseOrigin === 'string' && options.baseOrigin
+    ? options.baseOrigin
+    : 'http://localhost';
 
   try {
-    resolvedUrl = new URL(trimmedValue, `http://localhost${basePath}`);
+    resolvedUrl = new URL(trimmedValue, `${baseOrigin}${basePath}`);
   } catch (error) {
     return rawValue;
   }
@@ -33,7 +60,7 @@ function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken) {
   const buildBasePath = `/builds/${parsedPath.projectId}/${parsedPath.buildKey}/`;
 
   if (
-    resolvedUrl.origin !== 'http://localhost' ||
+    !allowedOrigins.has(resolvedUrl.origin) ||
     !resolvedUrl.pathname.startsWith(buildBasePath) ||
     resolvedUrl.pathname === basePath ||
     resolvedUrl.searchParams.has('previewToken')
@@ -44,12 +71,12 @@ function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken) {
   return appendQueryParam(rawValue, 'previewToken', previewToken);
 }
 
-function injectBuildPreviewTokenIntoHtmlAssets(html, parsedPath, previewToken) {
+function injectBuildPreviewTokenIntoHtmlAssets(html, parsedPath, previewToken, options = {}) {
   if (typeof html !== 'string' || !html || !parsedPath || !previewToken) {
     return html || '';
   }
 
-  const rewriteAssetUrl = (value) => withBuildPreviewTokenOnAssetUrl(value, parsedPath, previewToken);
+  const rewriteAssetUrl = (value) => withBuildPreviewTokenOnAssetUrl(value, parsedPath, previewToken, options);
 
   return html
     .replace(
@@ -68,12 +95,12 @@ function injectBuildPreviewTokenIntoHtmlAssets(html, parsedPath, previewToken) {
     );
 }
 
-function injectBuildPreviewTokenIntoCodeAssets(code, parsedPath, previewToken) {
+function injectBuildPreviewTokenIntoCodeAssets(code, parsedPath, previewToken, options = {}) {
   if (typeof code !== 'string' || !code || !parsedPath || !previewToken) {
     return code || '';
   }
 
-  const rewriteAssetUrl = (value) => withBuildPreviewTokenOnAssetUrl(value, parsedPath, previewToken);
+  const rewriteAssetUrl = (value) => withBuildPreviewTokenOnAssetUrl(value, parsedPath, previewToken, options);
 
   return code
     .replace(

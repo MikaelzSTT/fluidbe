@@ -67,22 +67,35 @@ After a valid query capability, `fluid_build_preview` is set as `HttpOnly`,
 to that exact build. Existing `preview.askfluid.now` and normal `/builds`
 authorization behavior remain unchanged.
 
-## Cross-site iframe limitation
+## Preview capability propagation
 
 An iframe on `askfluid.now` loading `fluidapps.dev` is cross-site. Browsers do
 not reliably store or send a `SameSite=Lax` preview cookie for iframe
 subresources, and third-party-cookie blocking can prevent it independently of
-SameSite. The current server does not apply the existing
-`buildAssetCapabilities` rewriting helpers to served preview HTML, JavaScript,
-or CSS, so Vite asset and chunk requests currently depend on the cookie unless
-their URLs already carry `previewToken`.
+SameSite.
 
-Direct or top-level generated previews work with the host-only cookie. The
-Builder iframe must not switch until a follow-up makes same-build asset
-authorization independent of third-party cookies, preferably by narrowly
-wiring the existing capability propagation helpers into generated-preview
-HTML and textual code responses. Do not broaden the cookie to
-`.fluidapps.dev` or treat owner sessions as a fallback.
+After generated-host resolution and exact project/build preview capability
+authorization, `pv-*` responses propagate the current `previewToken` into
+same-project, same-build textual dependency references. The existing
+`buildAssetCapabilities` helpers rewrite HTML `src`/`href` and CSS `url(...)`,
+plus JavaScript/CSS static imports, dynamic imports, and `new URL(...,
+import.meta.url)` references. Rewriting is limited to the current generated
+origin, relative URLs, and root-relative `/builds/<project>/<build>/...` URLs.
+External, cross-origin, cross-project, cross-build, and non-fetch schemes are
+left unchanged.
+
+The host-only `fluid_build_preview` cookie remains defense in depth for direct
+or top-level generated previews, but same-build textual/static dependencies no
+longer rely on third-party cookie availability when their parent textual asset
+has been served through `pv-*` with a valid query capability. Do not broaden the
+cookie to `.fluidapps.dev` or treat owner sessions as a fallback. Existing
+`preview.askfluid.now` behavior is intentionally unchanged.
+
+Transformed textual responses are hashed and length-stamped after transport
+rewriting. When a Mongo artifact has a stored expected SHA-256, that expected
+hash is compared with the original stored bytes before transformation and
+reported through `X-Build-Artifact-Original-SHA256*` headers; the
+`X-Build-Artifact-SHA256` header always describes the actual served bytes.
 
 ## Security invariants
 

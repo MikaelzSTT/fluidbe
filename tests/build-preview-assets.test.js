@@ -57,6 +57,40 @@ test('asset capability rewrite is idempotent and ignores non-fetch URLs', () => 
   );
 });
 
+test('asset capability rewrite supports artifact-relative and same-origin generated URLs', () => {
+  const assetParsedPath = {
+    ...parsedPath,
+    artifactPath: 'assets/app.js',
+  };
+  const options = {
+    baseOrigin: 'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev',
+    allowedOrigins: ['https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev'],
+  };
+
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('../images/logo.png?size=1#hero', assetParsedPath, 'new-token', options),
+    '../images/logo.png?size=1&previewToken=new-token#hero'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl(
+      'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev/builds/64f000000000000000000001/64f000000000000000000002/assets/app.css#sheet',
+      assetParsedPath,
+      'new-token',
+      options
+    ),
+    'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev/builds/64f000000000000000000001/64f000000000000000000002/assets/app.css?previewToken=new-token#sheet'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl(
+      'https://preview.askfluid.now/builds/64f000000000000000000001/64f000000000000000000002/assets/app.css',
+      assetParsedPath,
+      'new-token',
+      options
+    ),
+    'https://preview.askfluid.now/builds/64f000000000000000000001/64f000000000000000000002/assets/app.css'
+  );
+});
+
 test('private build code assets propagate capability to Vite dynamic assets', () => {
   const code = [
     'import "./chunk.js";',

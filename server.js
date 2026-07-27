@@ -28,6 +28,10 @@ const {
   createBuildPreviewToken,
   verifyBuildPreviewToken,
 } = require('./utils/buildPreviewAccess');
+const {
+  injectBuildPreviewTokenIntoCodeAssets,
+  injectBuildPreviewTokenIntoHtmlAssets,
+} = require('./utils/buildAssetCapabilities');
 const { isProjectBuildExplicitlyPublished } = require('./utils/buildPublicationAccess');
 const {
   GENERATED_APP_RESOLUTION_STATUS,
@@ -281,8 +285,10 @@ function sha256Buffer(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
-function setBuildArtifactIntegrityHeaders(res, body, expectedSha256 = '') {
+function setBuildArtifactIntegrityHeaders(res, body, expectedSha256 = '', options = {}) {
   const servedSha256 = sha256Buffer(body);
+  const originalBody = Buffer.isBuffer(options.originalBody) ? options.originalBody : body;
+  const transformed = options.transformed === true;
 
   res.setHeader('Content-Length', String(body.length));
   res.removeHeader('Content-Encoding');
@@ -290,25 +296,137 @@ function setBuildArtifactIntegrityHeaders(res, body, expectedSha256 = '') {
 
   if (expectedSha256) {
     res.setHeader('X-Build-Artifact-Expected-SHA256', expectedSha256);
-    res.setHeader('X-Build-Artifact-SHA256-Match', String(servedSha256 === expectedSha256));
+
+    if (transformed) {
+      const originalSha256 = sha256Buffer(originalBody);
+      res.setHeader('X-Build-Artifact-Original-SHA256', originalSha256);
+      res.setHeader('X-Build-Artifact-Original-SHA256-Match', String(originalSha256 === expectedSha256));
+      res.removeHeader('X-Build-Artifact-SHA256-Match');
+    } else {
+      res.setHeader('X-Build-Artifact-SHA256-Match', String(servedSha256 === expectedSha256));
+    }
   }
 
   return servedSha256;
 }
 
+function normalizeBuildArtifactBody(body) {
+  if (Buffer.isBuffer(body)) {
+    return body;
+  }
+
+  return Buffer.from(String(body || ''), 'utf8');
+}
+
+function isGeneratedPreviewBuildAccess(req) {
+  return (
+    req.generatedAppContext?.type === 'preview'
+    && req.buildAccess
+    && req.buildAccess.isPublished !== true
+    && req.buildAccess.previewToken
+    && req.buildAccess.parsedPath
+  );
+}
+
+function getNormalizedContentType(contentType) {
+  return String(contentType || '').split(';')[0].trim().toLowerCase();
+}
+
+function isHtmlBuildArtifact(contentType, artifactPath) {
+  return (
+    getNormalizedContentType(contentType) === 'text/html'
+    || path.extname(String(artifactPath || '')).toLowerCase() === '.html'
+  );
+}
+
+function isCodeBuildArtifact(contentType, artifactPath) {
+  const normalizedContentType = getNormalizedContentType(contentType);
+  const extension = path.extname(String(artifactPath || '')).toLowerCase();
+
+  return (
+    normalizedContentType === 'text/css'
+    || normalizedContentType === 'application/javascript'
+    || normalizedContentType === 'text/javascript'
+    || normalizedContentType === 'application/x-javascript'
+    || extension === '.css'
+    || extension === '.js'
+    || extension === '.mjs'
+  );
+}
+
+function propagateGeneratedPreviewCapability(req, artifactPath, contentType, body) {
+  const originalBody = normalizeBuildArtifactBody(body);
+
+  if (!isGeneratedPreviewBuildAccess(req)) {
+    return { body: originalBody, originalBody, transformed: false };
+  }
+
+  const access = req.buildAccess;
+  const parsedPath = {
+    ...access.parsedPath,
+    artifactPath: access.parsedPath.artifactPath || artifactPath,
+  };
+  const options = {
+    baseOrigin: `https://${req.generatedAppContext.hostname}`,
+    allowedOrigins: [`https://${req.generatedAppContext.hostname}`],
+  };
+  const originalText = originalBody.toString('utf8');
+  let transformedText = originalText;
+
+  if (isHtmlBuildArtifact(contentType, artifactPath)) {
+    transformedText = injectBuildPreviewTokenIntoHtmlAssets(
+      originalText,
+      parsedPath,
+      access.previewToken,
+      options
+    );
+  } else if (isCodeBuildArtifact(contentType, artifactPath)) {
+    transformedText = injectBuildPreviewTokenIntoCodeAssets(
+      originalText,
+      parsedPath,
+      access.previewToken,
+      options
+    );
+  } else {
+    return { body: originalBody, originalBody, transformed: false };
+  }
+
+  if (transformedText === originalText) {
+    return { body: originalBody, originalBody, transformed: false };
+  }
+
+  return {
+    body: Buffer.from(transformedText, 'utf8'),
+    originalBody,
+    transformed: true,
+  };
+}
+
 function sendBuildArtifactBuffer(req, res, artifactPath, contentType, body, expectedSha256 = '') {
-  const servedSha256 = setBuildArtifactIntegrityHeaders(res, body, expectedSha256);
+  const transport = propagateGeneratedPreviewCapability(req, artifactPath, contentType, body);
+  const servedSha256 = setBuildArtifactIntegrityHeaders(
+    res,
+    transport.body,
+    expectedSha256,
+    {
+      originalBody: transport.originalBody,
+      transformed: transport.transformed,
+    }
+  );
 
   console.info('[build-artifact-serve]', {
     artifactPath,
-    byteLength: body.length,
+    byteLength: transport.body.length,
     contentType,
     expectedSha256: expectedSha256 || null,
     servedSha256,
-    sha256Match: expectedSha256 ? servedSha256 === expectedSha256 : null,
+    sha256Match: expectedSha256
+      ? sha256Buffer(transport.originalBody) === expectedSha256
+      : null,
+    transformed: transport.transformed,
   });
 
-  return res.status(200).set('Content-Type', contentType).send(body);
+  return res.status(200).set('Content-Type', contentType).send(transport.body);
 }
 
 function isEmbeddableBuildRoute(req) {
