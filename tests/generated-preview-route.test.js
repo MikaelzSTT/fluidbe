@@ -260,7 +260,12 @@ async function writeBuild(projectId, buildId, label) {
       '@import "./imported.css";',
       '.hero{background:url("../images/logo.png?variant=hero#img")}',
       '@font-face{font-family:"Test";src:url("./font.woff2#font") format("woff2")}',
+      '@font-face{font-family:"TestWoff";src:url("./font.woff") format("woff")}',
+      `.same-build{src:url("/builds/${projectId}/${buildId}/assets/root-font.woff2?mode=prod#font")}`,
+      `.other-build{src:url("/builds/${projectId}/other-build/assets/leak.woff2")}`,
+      `.other-project{src:url("/builds/${PROJECT_B_ID}/${BUILD_B_ID}/assets/leak.woff")}`,
       '.external{background:url("https://cdn.example/bg.png")}',
+      '.data{background:url(data:image/svg+xml,%3Csvg%3E%3C/svg%3E)}',
     ].join('\n')
   );
   await fs.writeFile(
@@ -268,6 +273,8 @@ async function writeBuild(projectId, buildId, label) {
     '.imported{background:url("../images/logo.png?from=imported")}\n'
   );
   await fs.writeFile(path.join(root, 'assets', 'font.woff2'), Buffer.from('font-bytes'));
+  await fs.writeFile(path.join(root, 'assets', 'font.woff'), Buffer.from('font-woff-bytes'));
+  await fs.writeFile(path.join(root, 'assets', 'root-font.woff2'), Buffer.from('root-font-bytes'));
   await fs.writeFile(path.join(root, 'images', 'logo.png'), Buffer.from([
     0x89, 0x50, 0x4e, 0x47,
     0x0d, 0x0a, 0x1a, 0x0a,
@@ -490,8 +497,53 @@ test('generated preview disk CSS propagates imported CSS, image, and font URLs',
   assert.match(response.body, new RegExp(`@import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`url\\("\\.\\.\\/images\\/logo\\.png\\?variant=hero&previewToken=${encodedToken}#img"\\)`));
   assert.match(response.body, new RegExp(`url\\("\\.\\/font\\.woff2\\?previewToken=${encodedToken}#font"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\.\\/font\\.woff\\?previewToken=${encodedToken}"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/root-font\\.woff2\\?mode=prod&previewToken=${encodedToken}#font"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_A_ID}\\/other-build\\/assets\\/leak\\.woff2"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_B_ID}\\/${BUILD_B_ID}\\/assets\\/leak\\.woff"\\)`));
   assert.match(response.body, /url\("https:\/\/cdn\.example\/bg\.png"\)/);
+  assert.match(response.body, /url\(data:image\/svg\+xml,%3Csvg%3E%3C\/svg%3E\)/);
   assert.doesNotMatch(response.body, /cdn\.example\/bg\.png\?previewToken/);
+  assert.doesNotMatch(response.body, /other-build\/assets\/leak\.woff2\?previewToken/);
+  assert.doesNotMatch(response.body, /000000000302\/64f000000000000000000321\/assets\/leak\.woff\?previewToken/);
+});
+
+test('generated preview serves same-build fonts only with preview capability', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const fontWoff2 = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/font.woff2')}?previewToken=${token}`,
+  });
+  const fontWoff = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/font.woff')}?previewToken=${token}`,
+  });
+  const rootFont = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/root-font.woff2')}?previewToken=${token}`,
+  });
+  const tokenlessFont = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/font.woff2'),
+  });
+  const missingFont = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/missing.woff2')}?previewToken=${token}`,
+  });
+  const rootAssetsRoute = await request({
+    path: `/assets/font.woff2?previewToken=${token}`,
+  });
+  const crossProjectFont = await request({
+    path: `${buildPath(PROJECT_B_ID, BUILD_B_ID, 'assets/font.woff2')}?previewToken=${token}`,
+  });
+
+  assert.equal(fontWoff2.statusCode, 200);
+  assert.deepEqual(fontWoff2.bodyBuffer, Buffer.from('font-bytes'));
+  assert.equal(fontWoff2.headers['content-type'], 'font/woff2');
+  assert.equal(fontWoff.statusCode, 200);
+  assert.deepEqual(fontWoff.bodyBuffer, Buffer.from('font-woff-bytes'));
+  assert.equal(fontWoff.headers['content-type'], 'font/woff');
+  assert.equal(rootFont.statusCode, 200);
+  assert.deepEqual(rootFont.bodyBuffer, Buffer.from('root-font-bytes'));
+  assert.equal(tokenlessFont.statusCode, 404);
+  assert.equal(missingFont.statusCode, 404);
+  assert.equal(rootAssetsRoute.statusCode, 404);
+  assert.equal(crossProjectFont.statusCode, 404);
 });
 
 test('generated preview Mongo textual artifacts transform after original SHA validation', async () => {
@@ -761,6 +813,27 @@ test('legacy preview host and normal build publication access remain unchanged',
       Host: 'preview.askfluid.now',
     },
   });
+  const legacyCookie = legacyPreview.headers['set-cookie'][0].split(';')[0];
+  const legacyCss = await request({
+    path: buildPath(PROJECT_B_ID, BUILD_B_ID, 'assets/app.css'),
+    headers: {
+      Host: 'preview.askfluid.now',
+      Cookie: legacyCookie,
+    },
+  });
+  const legacyFont = await request({
+    path: buildPath(PROJECT_B_ID, BUILD_B_ID, 'assets/font.woff2'),
+    headers: {
+      Host: 'preview.askfluid.now',
+      Cookie: legacyCookie,
+    },
+  });
+  const legacyTokenlessFont = await request({
+    path: buildPath(PROJECT_B_ID, BUILD_B_ID, 'assets/font.woff2'),
+    headers: {
+      Host: 'preview.askfluid.now',
+    },
+  });
   const publishedBuild = await request({
     path: buildPath(PROJECT_A_ID, BUILD_A_ID),
     headers: {
@@ -771,6 +844,12 @@ test('legacy preview host and normal build publication access remain unchanged',
   assert.equal(legacyPreview.statusCode, 200);
   assert.match(legacyPreview.body, /project-b/);
   assert.doesNotMatch(legacyPreview.body, new RegExp(`previewToken=${encodeURIComponent(legacyToken)}`));
+  assert.equal(legacyCss.statusCode, 200);
+  assert.match(legacyCss.body, /url\("\.\/font\.woff2#font"\)/);
+  assert.doesNotMatch(legacyCss.body, /previewToken=/);
+  assert.equal(legacyFont.statusCode, 200);
+  assert.deepEqual(legacyFont.bodyBuffer, Buffer.from('font-bytes'));
+  assert.equal(legacyTokenlessFont.statusCode, 404);
   assert.equal(publishedBuild.statusCode, 200);
   assert.match(publishedBuild.body, /project-a-requested/);
   assert.equal(publishedBuild.headers.deprecation, 'true');

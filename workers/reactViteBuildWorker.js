@@ -28,7 +28,7 @@ const {
   ensureViteRelativeBase,
   extractZipSafely,
   findReactViteRoot,
-  fixDistIndexAssetPaths,
+  fixDistBuildAssetPaths,
   formatConnectorInjectionLog,
   publishValidatedDist,
   redactBuildLogs,
@@ -173,8 +173,9 @@ async function runBuildPipeline(job, workspace) {
     const distDir = path.join(appRoot, 'dist');
     if (!(await pathExists(distDir))) throw new Error('Build concluído sem gerar a pasta dist.');
     await reactViteBuildHelpers.validateDistDirectory(distDir);
-    if (await fixDistIndexAssetPaths(distDir)) {
-      logs += '\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist/index.html.\n';
+    const rewrittenAssetPaths = await fixDistBuildAssetPaths(distDir);
+    if (rewrittenAssetPaths.length > 0) {
+      logs += `\nAuto-fix aplicado: caminhos /assets/ corrigidos em dist (${rewrittenAssetPaths.join(', ')}).\n`;
       await reactViteBuildHelpers.validateDistDirectory(distDir);
     }
 

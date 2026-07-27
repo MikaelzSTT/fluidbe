@@ -57,6 +57,10 @@ test('asset capability rewrite is idempotent and ignores non-fetch URLs', () => 
     withBuildPreviewTokenOnAssetUrl('#section', parsedPath, 'new-token'),
     '#section'
   );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/font.woff2', parsedPath, 'new-token'),
+    '/assets/font.woff2'
+  );
 });
 
 test('asset capability rewrite supports artifact-relative and same-origin generated URLs', () => {
@@ -155,8 +159,12 @@ test('private build CSS assets propagate capability only in CSS fetch contexts',
   };
   const css = [
     '@import "./imported.css";',
-    '.hero{background:url("./bg.svg")}@font-face{src:url("./font.woff2")}',
+    '.hero{background:url("./bg.svg")}@font-face{src:url("./font.woff2")}@font-face{src:url("./font.woff")}',
+    '.sameBuild{src:url("/builds/64f000000000000000000001/64f000000000000000000002/assets/root-font.woff2?mode=prod#font")}',
+    '.otherBuild{src:url("/builds/64f000000000000000000001/other-build/assets/leak.woff2")}',
+    '.otherProject{src:url("/builds/64f000000000000000000099/64f000000000000000000002/assets/leak.woff")}',
     '.external{background:url("https://cdn.example/bg.png")}',
+    '.data{background:url(data:image/svg+xml,%3Csvg%3E%3C/svg%3E)}',
   ].join('\n');
 
   const rewritten = injectBuildPreviewTokenIntoCssAssets(css, assetParsedPath, 'token.value');
@@ -164,8 +172,15 @@ test('private build CSS assets propagate capability only in CSS fetch contexts',
   assert.match(rewritten, /@import "\.\/imported\.css\?previewToken=token\.value";/);
   assert.match(rewritten, /url\("\.\/bg\.svg\?previewToken=token\.value"\)/);
   assert.match(rewritten, /url\("\.\/font\.woff2\?previewToken=token\.value"\)/);
+  assert.match(rewritten, /url\("\.\/font\.woff\?previewToken=token\.value"\)/);
+  assert.match(rewritten, /url\("\/builds\/64f000000000000000000001\/64f000000000000000000002\/assets\/root-font\.woff2\?mode=prod&previewToken=token\.value#font"\)/);
+  assert.match(rewritten, /url\("\/builds\/64f000000000000000000001\/other-build\/assets\/leak\.woff2"\)/);
+  assert.match(rewritten, /url\("\/builds\/64f000000000000000000099\/64f000000000000000000002\/assets\/leak\.woff"\)/);
   assert.match(rewritten, /url\("https:\/\/cdn\.example\/bg\.png"\)/);
+  assert.match(rewritten, /url\(data:image\/svg\+xml,%3Csvg%3E%3C\/svg%3E\)/);
   assert.doesNotMatch(rewritten, /cdn\.example\/bg\.png\?previewToken/);
+  assert.doesNotMatch(rewritten, /other-build\/assets\/leak\.woff2\?previewToken/);
+  assert.doesNotMatch(rewritten, /000000000099\/64f000000000000000000002\/assets\/leak\.woff\?previewToken/);
 });
 
 test('transformed JavaScript parse validation rejects corrupted output', () => {

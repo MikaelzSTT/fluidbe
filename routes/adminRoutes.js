@@ -2583,15 +2583,8 @@ async function ensureViteRelativeBase(appRoot) {
   return null;
 }
 
-async function fixDistIndexAssetPaths(distDir) {
-  const indexPath = path.join(distDir, 'index.html');
-
-  if (!(await pathExists(indexPath))) {
-    throw new Error('Build concluído sem gerar dist/index.html.');
-  }
-
-  const html = await fs.readFile(indexPath, 'utf8');
-  const fixedHtml = html
+function rewriteRootRelativeIndexAssetPaths(html) {
+  return String(html || '')
     .replaceAll('src="/assets/', 'src="./assets/')
     .replaceAll("src='/assets/", "src='./assets/")
     .replaceAll('href="/assets/', 'href="./assets/')
@@ -2599,13 +2592,118 @@ async function fixDistIndexAssetPaths(distDir) {
     .replaceAll('url(/assets/', 'url(./assets/')
     .replaceAll('url("/assets/', 'url("./assets/')
     .replaceAll("url('/assets/", "url('./assets/");
+}
+
+function toCssRelativeRootAssetUrl(rootRelativeUrl, cssRelativePath) {
+  const rawValue = String(rootRelativeUrl || '');
+
+  if (!rawValue.startsWith('/assets/')) {
+    return rawValue;
+  }
+
+  const hashIndex = rawValue.indexOf('#');
+  const queryIndex = rawValue.indexOf('?');
+  const suffixIndex = [hashIndex, queryIndex]
+    .filter((index) => index !== -1)
+    .sort((a, b) => a - b)[0];
+  const pathname = suffixIndex === undefined ? rawValue : rawValue.slice(0, suffixIndex);
+  const suffix = suffixIndex === undefined ? '' : rawValue.slice(suffixIndex);
+  const assetPath = pathname.slice(1);
+
+  if (
+    !assetPath.startsWith('assets/') ||
+    assetPath.split('/').some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return rawValue;
+  }
+
+  const cssDir = path.posix.dirname(String(cssRelativePath || '').replace(/\\/g, '/'));
+  const fromDir = cssDir === '.' ? '' : cssDir;
+  let relativeUrl = path.posix.relative(fromDir, assetPath);
+
+  if (!relativeUrl.startsWith('.')) {
+    relativeUrl = `./${relativeUrl}`;
+  }
+
+  return `${relativeUrl}${suffix}`;
+}
+
+function rewriteRootRelativeCssAssetPaths(css, cssRelativePath) {
+  const rewriteAsset = (assetValue) => toCssRelativeRootAssetUrl(assetValue, cssRelativePath);
+
+  return String(css || '')
+    .replace(
+      /(@import\s+)(["'])(\/assets\/[^"']+)\2/gi,
+      (match, prefix, quote, assetValue) => `${prefix}${quote}${rewriteAsset(assetValue)}${quote}`
+    )
+    .replace(
+      /url\(\s*(["']?)(\/assets\/[^"')\s]+)\1\s*\)/gi,
+      (match, quote, assetValue) => `url(${quote}${rewriteAsset(assetValue)}${quote})`
+    );
+}
+
+async function findDistCssFiles(distDir) {
+  const distRoot = path.resolve(distDir);
+  const cssFiles = [];
+
+  async function discover(currentDir) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const entryPath = path.resolve(currentDir, entry.name);
+
+      if (entryPath !== distRoot && !entryPath.startsWith(`${distRoot}${path.sep}`)) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await discover(entryPath);
+        continue;
+      }
+
+      if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.css') {
+        cssFiles.push(entryPath);
+      }
+    }
+  }
+
+  await discover(distRoot);
+  return cssFiles;
+}
+
+async function fixDistBuildAssetPaths(distDir) {
+  const distRoot = path.resolve(distDir);
+  const changedPaths = [];
+  const indexPath = path.join(distRoot, 'index.html');
+
+  if (!(await pathExists(indexPath))) {
+    throw new Error('Build concluído sem gerar dist/index.html.');
+  }
+
+  const html = await fs.readFile(indexPath, 'utf8');
+  const fixedHtml = rewriteRootRelativeIndexAssetPaths(html);
 
   if (fixedHtml !== html) {
     await fs.writeFile(indexPath, fixedHtml);
-    return true;
+    changedPaths.push('index.html');
   }
 
-  return false;
+  for (const cssPath of await findDistCssFiles(distRoot)) {
+    const cssRelativePath = path.relative(distRoot, cssPath).split(path.sep).join('/');
+    const css = await fs.readFile(cssPath, 'utf8');
+    const fixedCss = rewriteRootRelativeCssAssetPaths(css, cssRelativePath);
+
+    if (fixedCss !== css) {
+      await fs.writeFile(cssPath, fixedCss);
+      changedPaths.push(cssRelativePath);
+    }
+  }
+
+  return changedPaths;
+}
+
+async function fixDistIndexAssetPaths(distDir) {
+  return (await fixDistBuildAssetPaths(distDir)).length > 0;
 }
 
 function pickBuildPayload(body) {
@@ -3308,7 +3406,8 @@ router.post(
       const precompiledManifest = await extractPrecompiledDistZipSafely(req.file.path, extractedDistDir);
       await validateDistDirectory(extractedDistDir);
 
-      if (await fixDistIndexAssetPaths(extractedDistDir)) {
+      const rewrittenAssetPaths = await fixDistBuildAssetPaths(extractedDistDir);
+      if (rewrittenAssetPaths.length > 0) {
         await validateDistDirectory(extractedDistDir);
       }
 
@@ -3319,6 +3418,7 @@ router.post(
       const zipSha256ByPath = new Map(
         precompiledManifest.entries
           .filter((entry) => !entry.isDirectory && entry.sha256)
+          .filter((entry) => !rewrittenAssetPaths.includes(entry.relativePath))
           .map((entry) => [entry.relativePath, entry.sha256])
       );
       const artifactSnapshot = await collectBuildArtifactFiles(extractedDistDir, { zipSha256ByPath });
@@ -3874,6 +3974,7 @@ module.exports.reactViteBuildHelpers = {
   ensureViteRelativeBase,
   extractZipSafely,
   findReactViteRoot,
+  fixDistBuildAssetPaths,
   fixDistIndexAssetPaths,
   formatConnectorInjectionLog,
   publishValidatedDist,

@@ -19,6 +19,7 @@ const {
 const {
   publishValidatedDist,
   extractZipSafely,
+  fixDistBuildAssetPaths,
   runLocalBinCommand,
   runNpmCommand,
   runNpxCommand,
@@ -306,6 +307,73 @@ test('publishValidatedDist stages and publishes only validated regular files', a
     assert.equal(await fs.readFile(path.join(finalDir, 'assets', 'app.js'), 'utf8'), 'console.log("ok");');
     const siblings = await fs.readdir(path.dirname(finalDir));
     assert.deepEqual(siblings, ['build']);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('dist asset path fix rewrites root-relative CSS font assets relative to each CSS file', async () => {
+  const root = await makeTempDir('fluid-css-root-assets');
+
+  try {
+    const dist = path.join(root, 'dist');
+    await fs.mkdir(path.join(dist, 'assets', 'nested'), { recursive: true });
+    await fs.mkdir(path.join(dist, 'styles'), { recursive: true });
+    await fs.writeFile(
+      path.join(dist, 'index.html'),
+      '<link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js"></script>'
+    );
+    await fs.writeFile(
+      path.join(dist, 'assets', 'app.css'),
+      [
+        '@font-face{font-family:"A";src:url("/assets/manrope-latin-700-normal.woff2") format("woff2")}',
+        '@font-face{font-family:"B";src:url(/assets/dm-sans-latin-400-normal.woff) format("woff")}',
+        '@import "/assets/imported.css";',
+        '.relative{src:url("./kept.woff2")}',
+        '.parent{src:url("../assets/kept.woff")}',
+        '.external{src:url("https://cdn.example/font.woff2")}',
+        '.data{src:url(data:font/woff2;base64,AAAA)}',
+      ].join('\n')
+    );
+    await fs.writeFile(
+      path.join(dist, 'styles', 'theme.css'),
+      '@font-face{font-family:"C";src:url("/assets/dm-sans-latin-500-normal.woff2") format("woff2")}'
+    );
+    await fs.writeFile(
+      path.join(dist, 'assets', 'nested', 'theme.css'),
+      '@font-face{font-family:"D";src:url("/assets/dm-sans-latin-600-normal.woff2") format("woff2")}'
+    );
+
+    const changedPaths = await fixDistBuildAssetPaths(dist);
+
+    assert.deepEqual(
+      changedPaths.sort(),
+      ['assets/app.css', 'assets/nested/theme.css', 'index.html', 'styles/theme.css'].sort()
+    );
+    assert.equal(
+      await fs.readFile(path.join(dist, 'index.html'), 'utf8'),
+      '<link rel="stylesheet" href="./assets/app.css"><script src="./assets/app.js"></script>'
+    );
+    assert.equal(
+      await fs.readFile(path.join(dist, 'assets', 'app.css'), 'utf8'),
+      [
+        '@font-face{font-family:"A";src:url("./manrope-latin-700-normal.woff2") format("woff2")}',
+        '@font-face{font-family:"B";src:url(./dm-sans-latin-400-normal.woff) format("woff")}',
+        '@import "./imported.css";',
+        '.relative{src:url("./kept.woff2")}',
+        '.parent{src:url("../assets/kept.woff")}',
+        '.external{src:url("https://cdn.example/font.woff2")}',
+        '.data{src:url(data:font/woff2;base64,AAAA)}',
+      ].join('\n')
+    );
+    assert.equal(
+      await fs.readFile(path.join(dist, 'styles', 'theme.css'), 'utf8'),
+      '@font-face{font-family:"C";src:url("../assets/dm-sans-latin-500-normal.woff2") format("woff2")}'
+    );
+    assert.equal(
+      await fs.readFile(path.join(dist, 'assets', 'nested', 'theme.css'), 'utf8'),
+      '@font-face{font-family:"D";src:url("../dm-sans-latin-600-normal.woff2") format("woff2")}'
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
