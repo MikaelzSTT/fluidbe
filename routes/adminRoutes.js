@@ -37,6 +37,7 @@ const {
 } = require('../utils/projectPublication');
 const { invalidateProjectSnapshotCache } = require('../utils/projectSnapshot');
 const {
+  buildPublishedProjectUrl,
   buildPreviewUrl,
   parseBuildPathFromUrl,
   toCanonicalPreviewUrl,
@@ -107,6 +108,68 @@ const BUILD_FIELDS = [
   'sourceFiles',
   'artifactFilesSource',
   'logs',
+];
+const ADMIN_PROJECT_LIST_PROJECTION = [
+  '_id',
+  'userId',
+  'name',
+  'title',
+  'appName',
+  'appNameSource',
+  'appNameLocked',
+  'slug',
+  'publishedAt',
+  'isPublished',
+  'runtimeEnabled',
+  'visibility',
+  'seo',
+  'description',
+  'summary',
+  'type',
+  'status',
+  'buildMode',
+  'generationStatus',
+  'generation_status',
+  'publish',
+  'prompt',
+  'briefingSessionId',
+  'creationIdempotencyKey',
+  'settings',
+  'deploy',
+  'distUrl',
+  'previewUrl',
+  'buildUrl',
+  'deployUrl',
+  'latestPublishedBuildId',
+  'reactVite',
+  'requiredConnectors',
+  'metadata',
+  'ownerDeleted',
+  'accountDeleted',
+  'ownerDeletedAt',
+  'accountDeletedAt',
+  'createdAt',
+  'updatedAt',
+  '+publicHostKey',
+].join(' ');
+const ADMIN_PROJECT_LIST_HEAVY_FIELDS = [
+  'build',
+  'response',
+  'html',
+  'css',
+  'js',
+  'fullHtml',
+  'latestFullHtml',
+  'pages',
+  'components',
+  'files',
+  'briefing',
+  'artifactFiles',
+  'sourceFiles',
+  'artifactFilesSource',
+  'indexedFiles',
+  'logs',
+  'sourceZipUrl',
 ];
 const CONNECTOR_STATUSES = ['pending', 'connected', 'skipped', 'error'];
 const CONNECTOR_STATUS_LABELS = {
@@ -309,6 +372,29 @@ function withAbsoluteProjectBuildUrls(req, document, options = {}) {
     payload.build = withAbsoluteBuildUrls(req, payload.build, { project: projectContext });
   }
 
+  return payload;
+}
+
+function withCompactAdminProjectListResponse(req, project) {
+  const payload = withAbsoluteProjectBuildUrls(req, project);
+
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+
+  for (const field of ADMIN_PROJECT_LIST_HEAVY_FIELDS) {
+    delete payload[field];
+  }
+
+  if (payload._id && !payload.id) {
+    payload.id = String(payload._id);
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(payload, 'publicUrl')) {
+    payload.publicUrl = payload.slug ? buildPublishedProjectUrl(payload.slug) : '';
+  }
+
+  delete payload.publicHostKey;
   return payload;
 }
 
@@ -2862,10 +2948,13 @@ router.get('/change-requests', requireAdmin, async (req, res) => {
 router.get('/projects', requireAdmin, async (req, res) => {
   try {
     const limit = parsePositiveInt(req.query.limit, 100, 100);
-    const projectQuery = withSelectedProjectPublicHostKey(Project.find()).sort({
-      updatedAt: -1,
-      createdAt: -1,
-    });
+    const projectQuery = Project.find()
+      .select(ADMIN_PROJECT_LIST_PROJECTION)
+      .lean()
+      .sort({
+        updatedAt: -1,
+        createdAt: -1,
+      });
 
     if (typeof projectQuery.limit === 'function') {
       projectQuery.limit(limit);
@@ -2894,7 +2983,7 @@ router.get('/projects', requireAdmin, async (req, res) => {
       success: true,
       limit,
       projects: projects.map((project) => ({
-        ...withAbsoluteProjectBuildUrls(req, project),
+        ...withCompactAdminProjectListResponse(req, project),
         pendingChangeRequestCount: pendingCountByProjectId.get(String(project._id)) || 0,
       })),
     });

@@ -269,10 +269,20 @@ test('admin project aggregate pipeline is static and ignores request filters', a
   let pipeline;
 
   Project.find = () => ({
-    sort: async () => [{
-      _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
-      toObject: () => ({ _id: '64f000000000000000000001' }),
-    }],
+    select() {
+      return this;
+    },
+    lean() {
+      return this;
+    },
+    sort() {
+      return this;
+    },
+    then(resolve, reject) {
+      return Promise.resolve([{
+        _id: new mongoose.Types.ObjectId('64f000000000000000000001'),
+      }]).then(resolve, reject);
+    },
   });
   ProjectChangeRequest.aggregate = async (capturedPipeline) => {
     pipeline = capturedPipeline;
