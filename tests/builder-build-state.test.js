@@ -208,7 +208,7 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.equal(readyA.body.status, 'done');
     assert.equal(readyA.body.buildId, BUILD_A_ID);
     assert.equal(readyA.body.previewReady, true);
-    assert.match(readyA.body.fullHtml, />A</);
+    assert.equal(readyA.body.fullHtml, '');
     const tokenA = assertGeneratedPreviewUrl(readyA.body.previewUrl, BUILD_A_ID);
     assert.equal(builds.get(BUILD_A_ID).previewUrl, `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`);
 
@@ -235,7 +235,7 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.equal(readyB.body.status, 'done');
     assert.equal(readyB.body.buildId, BUILD_B_ID);
     assert.notEqual(readyB.body.buildId, readyA.body.buildId);
-    assert.match(readyB.body.fullHtml, />B</);
+    assert.equal(readyB.body.fullHtml, '');
     const tokenB = assertGeneratedPreviewUrl(readyB.body.previewUrl, BUILD_B_ID);
     assert.notEqual(readyB.body.previewUrl, readyA.body.previewUrl);
     assert.notEqual(tokenB, tokenA);
@@ -263,7 +263,7 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.equal(readyC.body.status, 'done');
     assert.equal(readyC.body.buildId, BUILD_C_ID);
     assert.notEqual(readyC.body.buildId, readyB.body.buildId);
-    assert.match(readyC.body.fullHtml, />C</);
+    assert.equal(readyC.body.fullHtml, '');
 
     assert.deepEqual(
       buildQueries.map((query) => String(query._id)),
@@ -313,7 +313,7 @@ test('Builder build contract recovers stale pending project with valid published
     assert.equal(res.body.generationStatus, 'done');
     assert.equal(res.body.buildId, BUILD_A_ID);
     assert.equal(res.body.previewReady, true);
-    assert.match(res.body.fullHtml, />A</);
+    assert.equal(res.body.fullHtml, '');
     assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_A_ID);
     assert.deepEqual(queries.map((query) => ({
       _id: query._id ? String(query._id) : undefined,
@@ -431,7 +431,7 @@ test('Builder build contract recovers pending project from legacy project-level 
     assert.equal(res.body.status, 'done');
     assert.equal(res.body.buildId, BUILD_A_ID);
     assert.equal(res.body.previewReady, true);
-    assert.match(res.body.fullHtml, />A</);
+    assert.equal(res.body.fullHtml, '');
     assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_A_ID);
   } finally {
     Project.findOne = originalProjectFindOne;

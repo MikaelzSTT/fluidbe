@@ -68,6 +68,7 @@ app.disable('x-powered-by');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PUBLIC_BUILDS_DIR = path.join(PUBLIC_DIR, 'builds');
 const SETTINGS_ACCOUNT_HTML_PATH = path.join(PUBLIC_DIR, 'settings', 'account', 'index.html');
+const BUILD_ARTIFACT_VERBOSE_LOGS = process.env.BUILD_ARTIFACT_VERBOSE_LOGS === 'true';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://apps.askfluid.now').replace(/\/+$/, '');
 const PUBLIC_APP_HOST = new URL(PUBLIC_BASE_URL).hostname.toLowerCase();
 const APPS_CUSTOM_HOST = 'apps.askfluid.now';
@@ -433,17 +434,19 @@ function sendBuildArtifactBuffer(req, res, artifactPath, contentType, body, expe
     }
   );
 
-  console.info('[build-artifact-serve]', {
-    artifactPath,
-    byteLength: transport.body.length,
-    contentType,
-    expectedSha256: expectedSha256 || null,
-    servedSha256,
-    sha256Match: expectedSha256
-      ? sha256Buffer(transport.originalBody) === expectedSha256
-      : null,
-    transformed: transport.transformed,
-  });
+  if (BUILD_ARTIFACT_VERBOSE_LOGS) {
+    console.info('[build-artifact-serve]', {
+      artifactPath,
+      byteLength: transport.body.length,
+      contentType,
+      expectedSha256: expectedSha256 || null,
+      servedSha256,
+      sha256Match: expectedSha256
+        ? sha256Buffer(transport.originalBody) === expectedSha256
+        : null,
+      transformed: transport.transformed,
+    });
+  }
 
   return res.status(200).set('Content-Type', contentType).send(transport.body);
 }
@@ -1269,16 +1272,50 @@ async function findMongoBuildArtifact(requestPath, expectedBuildId = null) {
     return null;
   }
 
-  const builds = await ProjectBuild.find({
+  const projection = {
+    _id: 1,
+    artifactFiles: {
+      $elemMatch: {
+        $or: [
+          { relativePath: parsedPath.artifactPath },
+          { path: parsedPath.artifactPath },
+        ],
+      },
+    },
+  };
+
+  if (parsedPath.artifactPath === 'index.html') {
+    projection.fullHtml = 1;
+    projection.html = 1;
+  }
+
+  let buildsQuery = ProjectBuild.find({
     ...(expectedBuildId ? { _id: expectedBuildId } : {}),
     projectId: parsedPath.projectId,
     ...buildUrlMatchQuery(parsedPath.indexBuildUrl),
-  }).sort({
-    updatedAt: -1,
-    createdAt: -1,
   });
 
+  if (buildsQuery && typeof buildsQuery.select === 'function') {
+    buildsQuery = buildsQuery.select(projection) || buildsQuery;
+  }
+
+  if (buildsQuery && typeof buildsQuery.lean === 'function') {
+    buildsQuery = buildsQuery.lean() || buildsQuery;
+  }
+
+  if (buildsQuery && typeof buildsQuery.sort === 'function') {
+    buildsQuery = buildsQuery.sort({
+      updatedAt: -1,
+      createdAt: -1,
+    });
+  }
+
+  const builds = await buildsQuery;
   const logArtifactLookup = (found) => {
+    if (!BUILD_ARTIFACT_VERBOSE_LOGS) {
+      return;
+    }
+
     console.info('[build-artifact]', {
       artifactPath: parsedPath.artifactPath,
       candidates: builds.length,

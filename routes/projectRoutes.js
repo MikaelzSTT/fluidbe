@@ -31,6 +31,7 @@ const {
   scanBuildSecurity,
 } = require('../utils/projectPublication');
 const {
+  buildPublishedProjectUrl,
   toCanonicalPreviewUrl,
 } = require('../utils/previewOrigin');
 const {
@@ -119,6 +120,146 @@ const PUBLISHED_PROJECT_LIMITS = {
 };
 const BUILD_NOW_MODE = 'build_now';
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
+const PROJECT_LIST_PROJECTION = [
+  '_id',
+  'name',
+  'title',
+  'appName',
+  'slug',
+  'publishedAt',
+  'isPublished',
+  'description',
+  'type',
+  'status',
+  'buildMode',
+  'generationStatus',
+  'generation_status',
+  'publish',
+  'prompt',
+  'deploy',
+  'distUrl',
+  'previewUrl',
+  'buildUrl',
+  'deployUrl',
+  'latestPublishedBuildId',
+  'reactVite',
+  'metadata',
+  'createdAt',
+  'updatedAt',
+  '+publicHostKey',
+].join(' ');
+const PROJECT_DETAIL_PROJECTION = [
+  '_id',
+  'name',
+  'title',
+  'appName',
+  'appNameSource',
+  'appNameLocked',
+  'slug',
+  'publishedAt',
+  'isPublished',
+  'runtimeEnabled',
+  'visibility',
+  'seo',
+  'description',
+  'type',
+  'status',
+  'buildMode',
+  'generationStatus',
+  'generation_status',
+  'summary',
+  'publish',
+  'prompt',
+  'briefing',
+  'briefingSessionId',
+  'settings',
+  'deploy',
+  'distUrl',
+  'previewUrl',
+  'buildUrl',
+  'deployUrl',
+  'latestPublishedBuildId',
+  'reactVite',
+  'requiredConnectors',
+  'metadata',
+  'createdAt',
+  'updatedAt',
+  '+publicHostKey',
+].join(' ');
+const PROJECT_BUILD_POLL_PROJECTION = [
+  '_id',
+  'type',
+  'status',
+  'buildMode',
+  'generationStatus',
+  'generation_status',
+  'isPublished',
+  'publish',
+  'slug',
+  'deploy',
+  'distUrl',
+  'previewUrl',
+  'buildUrl',
+  'deployUrl',
+  'latestPublishedBuildId',
+  'reactVite',
+  'build._id',
+  'build.id',
+  'build.buildId',
+  'build.type',
+  'build.status',
+  'build.reactVite',
+  'build.distUrl',
+  'build.previewUrl',
+  'build.buildUrl',
+  'build.deployUrl',
+  'createdAt',
+  'updatedAt',
+  '+publicHostKey',
+].join(' ');
+const PROJECT_BUILD_SUMMARY_PROJECTION = [
+  '_id',
+  'projectId',
+  'buildJobId',
+  'type',
+  'status',
+  'distUrl',
+  'previewUrl',
+  'buildUrl',
+  'deployUrl',
+  'createdAt',
+  'updatedAt',
+].join(' ');
+const PROJECT_BUILD_INLINE_PREVIEW_PROJECTION = [
+  '_id',
+  'projectId',
+  'type',
+  'status',
+  'html',
+  'css',
+  'js',
+  'fullHtml',
+].join(' ');
+const HEAVY_PROJECT_RESPONSE_FIELDS = [
+  'build',
+  'response',
+  'html',
+  'css',
+  'js',
+  'fullHtml',
+  'latestFullHtml',
+  'pages',
+  'components',
+  'files',
+  'artifactFiles',
+  'sourceFiles',
+  'indexedFiles',
+  'artifactFilesSource',
+  'logs',
+  'sourceZipUrl',
+];
+const PROJECT_MESSAGES_DEFAULT_LIMIT = 100;
+const PROJECT_MESSAGES_MAX_LIMIT = 200;
 
 function getPublishedProjectLimit(plan) {
   return PUBLISHED_PROJECT_LIMITS[plan] || PUBLISHED_PROJECT_LIMITS.free;
@@ -685,6 +826,20 @@ function withSelectedProjectPublicHostKey(query) {
   return query;
 }
 
+function selectLean(query, projection) {
+  let selection = query;
+
+  if (selection && typeof selection.select === 'function') {
+    selection = selection.select(projection) || selection;
+  }
+
+  if (selection && typeof selection.lean === 'function') {
+    selection = selection.lean() || selection;
+  }
+
+  return selection;
+}
+
 function readDocumentField(value, field) {
   if (!value || typeof value !== 'object') {
     return undefined;
@@ -774,6 +929,116 @@ function withAbsoluteProjectBuildUrls(req, value, options = {}) {
   return payload;
 }
 
+function withCompactProjectResponse(req, value, options = {}) {
+  const payload = withAbsoluteProjectBuildUrls(req, value, options);
+
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+
+  for (const field of HEAVY_PROJECT_RESPONSE_FIELDS) {
+    delete payload[field];
+  }
+
+  if (payload._id && !payload.id) {
+    payload.id = String(payload._id);
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(payload, 'publicUrl')) {
+    payload.publicUrl = payload.slug ? buildPublishedProjectUrl(payload.slug) : '';
+  }
+
+  return payload;
+}
+
+function toCompactBuildSummary(build, options = {}) {
+  if (!build || typeof build !== 'object') {
+    return {};
+  }
+
+  const source =
+    typeof build.toObject === 'function'
+      ? build.toObject({ getters: true, virtuals: true })
+      : build;
+  const payload = {};
+
+  for (const field of [
+    '_id',
+    'id',
+    'projectId',
+    'buildJobId',
+    'type',
+    'status',
+    'distUrl',
+    'previewUrl',
+    'buildUrl',
+    'deployUrl',
+    'createdAt',
+    'updatedAt',
+    ...(options.includeInlinePreview ? ['html', 'css', 'js', 'fullHtml'] : []),
+  ]) {
+    if (source[field] !== undefined) {
+      payload[field] = source[field];
+    }
+  }
+
+  if (payload._id && !payload.id) {
+    payload.id = String(payload._id);
+  }
+
+  return payload;
+}
+
+function getProjectMessagesLimit(value) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return PROJECT_MESSAGES_DEFAULT_LIMIT;
+  }
+
+  return Math.min(parsed, PROJECT_MESSAGES_MAX_LIMIT);
+}
+
+function encodeProjectMessagesCursor(message) {
+  if (!message?._id || !message?.createdAt) {
+    return null;
+  }
+
+  return Buffer.from(
+    `${new Date(message.createdAt).toISOString()}|${String(message._id)}`,
+    'utf8'
+  ).toString('base64url');
+}
+
+function decodeProjectMessagesCursor(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return null;
+  }
+
+  try {
+    const [createdAtValue, idValue, ...extra] = Buffer.from(
+      value.trim(),
+      'base64url'
+    ).toString('utf8').split('|');
+    const createdAt = new Date(createdAtValue);
+
+    if (
+      extra.length > 0 ||
+      Number.isNaN(createdAt.getTime()) ||
+      !mongoose.Types.ObjectId.isValid(idValue)
+    ) {
+      return null;
+    }
+
+    return {
+      createdAt,
+      _id: new mongoose.Types.ObjectId(idValue),
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
 function getEffectiveBuildStatus(project) {
   return project.generationStatus || project.generation_status || project.status || 'pending';
 }
@@ -830,12 +1095,44 @@ function hasLegacyCompletedProjectPreview(project) {
 }
 
 async function findDoneProjectBuild(query, sort = null) {
-  const selection = ProjectBuild.findOne(query);
-  const result = sort && selection && typeof selection.sort === 'function'
-    ? selection.sort(sort)
-    : selection;
+  let selection = selectLean(
+    ProjectBuild.findOne(query),
+    PROJECT_BUILD_SUMMARY_PROJECTION
+  );
 
-  return result && typeof result.then === 'function' ? result : Promise.resolve(result);
+  if (sort && selection && typeof selection.sort === 'function') {
+    selection = selection.sort(sort);
+  }
+
+  return selection && typeof selection.then === 'function'
+    ? selection
+    : Promise.resolve(selection);
+}
+
+function hasBuildPreviewUrl(build) {
+  return ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']
+    .some((field) => typeof build?.[field] === 'string' && build[field]);
+}
+
+async function loadInlineBuildPreviewIfRequired(build) {
+  if (
+    !build ||
+    hasBuildPreviewUrl(build) ||
+    !['html', 'full_html'].includes(String(build.type || '').trim().toLowerCase())
+  ) {
+    return build;
+  }
+
+  const inlineBuild = await selectLean(
+    ProjectBuild.findOne({
+      _id: build._id,
+      projectId: build.projectId,
+      status: 'done',
+    }),
+    PROJECT_BUILD_INLINE_PREVIEW_PROJECTION
+  );
+
+  return inlineBuild ? { ...build, ...inlineBuild } : build;
 }
 
 async function resolveCompletedBuilderBuild(project) {
@@ -849,7 +1146,10 @@ async function resolveCompletedBuilderBuild(project) {
     });
 
     if (publishedBuild) {
-      return { source: 'latestPublishedBuildId', build: publishedBuild };
+      return {
+        source: 'latestPublishedBuildId',
+        build: await loadInlineBuildPreviewIfRequired(publishedBuild),
+      };
     }
   }
 
@@ -866,7 +1166,10 @@ async function resolveCompletedBuilderBuild(project) {
   );
 
   if (latestDoneBuild) {
-    return { source: 'latestDoneBuild', build: latestDoneBuild };
+    return {
+      source: 'latestDoneBuild',
+      build: await loadInlineBuildPreviewIfRequired(latestDoneBuild),
+    };
   }
 
   const projectPayload =
@@ -889,8 +1192,9 @@ function buildProjectPayload(req, projectDocument, options = {}) {
   const projectPreviewContext = buildProjectPreviewContext(projectDocument, project);
   const effectiveStatus = options.effectiveStatus || getEffectiveBuildStatus(project);
   const publishedBuildId = getProjectPublishedBuildId(project);
-  const fullHtml = project.fullHtml || project.latestFullHtml || '';
-  const build = project.build && typeof project.build === 'object' ? project.build : {};
+  const build = toCompactBuildSummary(
+    project.build && typeof project.build === 'object' ? project.build : {}
+  );
   const payload = {
     success: true,
     status: effectiveStatus,
@@ -898,7 +1202,7 @@ function buildProjectPayload(req, projectDocument, options = {}) {
     generation_status: effectiveStatus,
     buildId: null,
     previewReady: false,
-    project: withAbsoluteProjectBuildUrls(req, projectDocument, { project: projectPreviewContext }),
+    project: withCompactProjectResponse(req, projectDocument, { project: projectPreviewContext }),
   };
 
   if (effectiveStatus !== 'done') {
@@ -909,7 +1213,6 @@ function buildProjectPayload(req, projectDocument, options = {}) {
     ...payload,
     buildId: publishedBuildId || (build._id ? String(build._id) : null),
     previewReady: Boolean(
-      fullHtml ||
       project.previewUrl ||
       project.buildUrl ||
       project.distUrl ||
@@ -917,13 +1220,13 @@ function buildProjectPayload(req, projectDocument, options = {}) {
       build.buildUrl ||
       build.distUrl
     ),
-    response: project.response || '',
-    summary: project.summary || '',
-    html: project.html || '',
-    css: project.css || '',
-    js: project.js || '',
-    fullHtml,
-    latestFullHtml: project.latestFullHtml || fullHtml,
+    response: '',
+    summary: '',
+    html: '',
+    css: '',
+    js: '',
+    fullHtml: '',
+    latestFullHtml: '',
     distUrl: toAbsoluteBackendUrl(req, project.distUrl || build.distUrl || '', {
       project: projectPreviewContext,
       build,
@@ -943,10 +1246,13 @@ function buildProjectPayload(req, projectDocument, options = {}) {
 }
 
 function buildDoneProjectBuildPayload(req, project, buildDocument) {
-  const build =
-    typeof buildDocument.toObject === 'function'
-      ? buildDocument.toObject({ getters: true, virtuals: true })
-      : buildDocument;
+  const includeInlinePreview = !hasBuildPreviewUrl(buildDocument) && Boolean(
+    buildDocument?.fullHtml ||
+    buildDocument?.html ||
+    buildDocument?.css ||
+    buildDocument?.js
+  );
+  const build = toCompactBuildSummary(buildDocument, { includeInlinePreview });
   const projectPreviewContext = buildProjectPreviewContext(project, {
     reactVite: readDocumentField(project, 'reactVite') === true || build.type === 'react_vite',
     build,
@@ -967,8 +1273,8 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     generationStatus: 'done',
     generation_status: 'done',
     buildId: String(build._id),
-    previewReady: Boolean(build.fullHtml || previewUrl || buildUrl),
-    project: withAbsoluteProjectBuildUrls(req, project, { project: projectPreviewContext }),
+    previewReady: Boolean(build.fullHtml || build.html || previewUrl || buildUrl),
+    project: withCompactProjectResponse(req, project, { project: projectPreviewContext }),
     build: withAbsoluteBuildUrls(req, build, { project: projectPreviewContext }),
     html: build.html || '',
     css: build.css || '',
@@ -979,8 +1285,6 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     previewUrl,
     buildUrl,
     deployUrl: toAbsoluteBackendUrl(req, build.deployUrl || '', { project: projectPreviewContext, build }),
-    sourceZipUrl: build.sourceZipUrl || '',
-    logs: build.logs || '',
     reactVite: build.type === 'react_vite',
   };
 }
@@ -1178,11 +1482,13 @@ async function setProjectRuntimeEnabled(req, res, runtimeEnabled) {
 
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const projects = await withSelectedProjectPublicHostKey(Project.find({ userId: req.userId })).sort({
-      createdAt: -1,
-    });
+    const query = selectLean(
+      Project.find({ userId: req.userId }),
+      PROJECT_LIST_PROJECTION
+    );
+    const projects = await query.sort({ createdAt: -1 });
 
-    return res.json(projects.map((project) => withAbsoluteProjectBuildUrls(req, project)));
+    return res.json(projects.map((project) => withCompactProjectResponse(req, project)));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
@@ -1596,10 +1902,13 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     }
 
     const projectObjectId = new mongoose.Types.ObjectId(req.params.id);
-    const project = await withSelectedProjectPublicHostKey(Project.findOne({
-      _id: projectObjectId,
-      userId: req.userId,
-    }));
+    const project = await selectLean(
+      Project.findOne({
+        _id: projectObjectId,
+        userId: req.userId,
+      }),
+      PROJECT_BUILD_POLL_PROJECTION
+    );
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1826,17 +2135,50 @@ router.get('/:id/messages', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    const messages = await ProjectMessage.find({
+    const limit = getProjectMessagesLimit(req.query?.limit);
+    const requestedCursor = req.query?.before;
+    const cursor = decodeProjectMessagesCursor(requestedCursor);
+
+    if (requestedCursor && !cursor) {
+      return res.status(400).json({ message: 'Cursor de mensagens inválido.' });
+    }
+
+    const messageQuery = {
       projectId: project._id,
       role: { $in: ['user', 'assistant'] },
-    })
-      .sort({ createdAt: 1, _id: 1 })
-      .select('role content createdAt -_id')
+    };
+
+    if (cursor) {
+      messageQuery.$or = [
+        { createdAt: { $lt: cursor.createdAt } },
+        { createdAt: cursor.createdAt, _id: { $lt: cursor._id } },
+      ];
+    }
+
+    const messageDocuments = await ProjectMessage.find(messageQuery)
+      .sort({ createdAt: -1, _id: -1 })
+      .select('_id role content createdAt')
+      .limit(limit + 1)
       .lean();
+    const hasMore = messageDocuments.length > limit;
+    const page = messageDocuments.slice(0, limit);
+    const nextCursor = hasMore
+      ? encodeProjectMessagesCursor(page[page.length - 1])
+      : null;
+    const messages = page.reverse().map((message) => ({
+      role: message.role,
+      content: message.content,
+      createdAt: message.createdAt,
+    }));
 
     return res.json({
       success: true,
       messages,
+      pagination: {
+        limit,
+        hasMore,
+        nextCursor,
+      },
     });
   } catch (error) {
     return res.status(500).json({
@@ -2071,16 +2413,19 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
 
 router.get('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
-    const project = await withSelectedProjectPublicHostKey(Project.findOne({
-      _id: req.projectObjectId,
-      userId: req.userId,
-    }));
+    const project = await selectLean(
+      Project.findOne({
+        _id: req.projectObjectId,
+        userId: req.userId,
+      }),
+      PROJECT_DETAIL_PROJECTION
+    );
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    return res.json(withAbsoluteProjectBuildUrls(req, project));
+    return res.json(withCompactProjectResponse(req, project));
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
