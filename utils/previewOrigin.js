@@ -1,6 +1,7 @@
 const DEFAULT_PREVIEW_BASE_URL = 'https://preview.askfluid.now';
 const DEFAULT_LEGACY_PREVIEW_REMOVAL_DATE = '2026-08-31';
 const BUILD_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const { buildGeneratedPreviewOrigin } = require('./generatedAppHostname');
 
 function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
@@ -190,6 +191,65 @@ function toDedicatedPreviewUrl(value) {
   return url.toString();
 }
 
+function readDocumentField(value, field) {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, field)) {
+    return value[field];
+  }
+
+  if (typeof value.get === 'function') {
+    return value.get(field);
+  }
+
+  return undefined;
+}
+
+function isReactVitePreviewContext(project, build) {
+  return (
+    readDocumentField(build, 'type') === 'react_vite' ||
+    readDocumentField(build, 'reactVite') === true ||
+    readDocumentField(project, 'reactVite') === true ||
+    readDocumentField(readDocumentField(project, 'build'), 'type') === 'react_vite' ||
+    readDocumentField(readDocumentField(project, 'build'), 'reactVite') === true
+  );
+}
+
+function buildGeneratedPreviewUrl(project, value) {
+  const parsed = parseBuildPathFromUrl(value);
+
+  if (!parsed) {
+    return '';
+  }
+
+  try {
+    const origin = buildGeneratedPreviewOrigin(readDocumentField(project, 'publicHostKey'));
+    const url = new URL(parsed.pathname, `${origin}/`);
+    url.search = parsed.search;
+    url.hash = parsed.hash;
+    return url.toString();
+  } catch (error) {
+    return '';
+  }
+}
+
+function toCanonicalPreviewUrl(value, options = {}) {
+  const project = options.project || null;
+  const build = options.build || null;
+
+  if (isReactVitePreviewContext(project, build)) {
+    const generatedPreviewUrl = buildGeneratedPreviewUrl(project, value);
+
+    if (generatedPreviewUrl) {
+      return generatedPreviewUrl;
+    }
+  }
+
+  return toDedicatedPreviewUrl(value);
+}
+
 function buildPublishedProjectUrl(slug) {
   const cleanSlug = String(slug || '').trim();
 
@@ -216,5 +276,6 @@ module.exports = {
   isPreviewHost,
   isBuildUrlLike,
   parseBuildPathFromUrl,
+  toCanonicalPreviewUrl,
   toDedicatedPreviewUrl,
 };

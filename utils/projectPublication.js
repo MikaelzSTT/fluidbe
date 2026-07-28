@@ -13,7 +13,7 @@ const {
 const {
   buildPublishedProjectUrl,
   parseBuildPathFromUrl,
-  toDedicatedPreviewUrl,
+  toCanonicalPreviewUrl,
 } = require('./previewOrigin');
 const { invalidateProjectSnapshotCache } = require('./projectSnapshot');
 
@@ -43,21 +43,21 @@ function getBackendBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
-function toAbsoluteBackendUrl(req, value) {
+function toAbsoluteBackendUrl(req, value, options = {}) {
   if (typeof value !== 'string' || !value) {
     return value || '';
   }
 
-  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  const absoluteValue = dedicatedPreviewUrl !== value
-    ? dedicatedPreviewUrl
+  const canonicalPreviewUrl = toCanonicalPreviewUrl(value, options);
+  const absoluteValue = canonicalPreviewUrl !== value
+    ? canonicalPreviewUrl
     : value.startsWith('/builds/')
       ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
       : value;
   return addBuildPreviewToken(absoluteValue);
 }
 
-function withAbsoluteBuildUrls(req, document) {
+function withAbsoluteBuildUrls(req, document, options = {}) {
   if (!document || typeof document !== 'object') {
     return document;
   }
@@ -68,7 +68,10 @@ function withAbsoluteBuildUrls(req, document) {
       : { ...document };
 
   for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
-    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+    payload[field] = toAbsoluteBackendUrl(req, payload[field], {
+      project: options.project,
+      build: payload,
+    });
   }
 
   return payload;
@@ -331,8 +334,9 @@ function getCanonicalBuildPreviewUrl(projectId, projectBuild) {
   return '';
 }
 
-async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
+async function getServableBuildPreviewUrl(req, projectId, projectBuild, options = {}) {
   const indexBuildUrl = getCanonicalBuildPreviewUrl(projectId, projectBuild);
+  const project = options.project || projectBuild.project;
 
   if (!indexBuildUrl) {
     return '';
@@ -345,7 +349,7 @@ async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
       const indexStats = await fs.stat(indexPath);
 
       if (indexStats.isFile()) {
-        return toAbsoluteBackendUrl(req, indexBuildUrl);
+        return toAbsoluteBackendUrl(req, indexBuildUrl, { project, build: projectBuild });
       }
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -355,7 +359,7 @@ async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
   }
 
   if (await hasMongoBuildFallback(indexBuildUrl)) {
-    return toAbsoluteBackendUrl(req, indexBuildUrl);
+    return toAbsoluteBackendUrl(req, indexBuildUrl, { project, build: projectBuild });
   }
 
   return '';
@@ -601,7 +605,8 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
     const publicUrl = publishedProject.publicUrl || (publishedProject.deploy && publishedProject.deploy.url) || '';
     const previewUrl = toAbsoluteBackendUrl(
       req,
-      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.deployUrl || projectBuild.distUrl || ''
+      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.deployUrl || projectBuild.distUrl || '',
+      { project, build: projectBuild }
     );
     invalidateProjectSnapshotCache(project._id);
 
@@ -612,7 +617,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
       previewUrl,
       publicUrl,
       deployUrl: publicUrl,
-      build: withAbsoluteBuildUrls(req, projectBuild),
+      build: withAbsoluteBuildUrls(req, projectBuild, { project }),
     };
   }
 
@@ -665,7 +670,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
     });
   }
 
-  const previewUrl = await getServableBuildPreviewUrl(req, project._id, projectBuild);
+  const previewUrl = await getServableBuildPreviewUrl(req, project._id, projectBuild, { project });
 
   if (!previewUrl) {
     throw createHttpError(409, {
@@ -711,7 +716,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
     previewUrl,
     publicUrl,
     deployUrl: publicUrl,
-    build: withAbsoluteBuildUrls(req, publishedBuild),
+    build: withAbsoluteBuildUrls(req, publishedBuild, { project }),
   };
 }
 

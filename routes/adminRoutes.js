@@ -39,7 +39,7 @@ const { invalidateProjectSnapshotCache } = require('../utils/projectSnapshot');
 const {
   buildPreviewUrl,
   parseBuildPathFromUrl,
-  toDedicatedPreviewUrl,
+  toCanonicalPreviewUrl,
 } = require('../utils/previewOrigin');
 const {
   INVALID_PRECOMPILED_DIST_CODE,
@@ -215,21 +215,53 @@ function getBackendBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
-function toAbsoluteBackendUrl(req, value) {
+function withSelectedProjectPublicHostKey(query) {
+  if (query && typeof query.select === 'function') {
+    query.select('+publicHostKey');
+  }
+
+  return query;
+}
+
+function readDocumentField(value, field) {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, field)) {
+    return value[field];
+  }
+
+  if (typeof value.get === 'function') {
+    return value.get(field);
+  }
+
+  return undefined;
+}
+
+function buildProjectPreviewContext(project, payload) {
+  return {
+    publicHostKey: readDocumentField(project, 'publicHostKey'),
+    reactVite: payload?.reactVite === true || readDocumentField(project, 'reactVite') === true,
+    build: payload?.build || readDocumentField(project, 'build'),
+  };
+}
+
+function toAbsoluteBackendUrl(req, value, options = {}) {
   if (typeof value !== 'string' || !value) {
     return value || '';
   }
 
-  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  const absoluteValue = dedicatedPreviewUrl !== value
-    ? dedicatedPreviewUrl
+  const canonicalPreviewUrl = toCanonicalPreviewUrl(value, options);
+  const absoluteValue = canonicalPreviewUrl !== value
+    ? canonicalPreviewUrl
     : value.startsWith('/builds/')
       ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
       : value;
   return addBuildPreviewToken(absoluteValue);
 }
 
-function withAbsoluteBuildUrls(req, document) {
+function withAbsoluteBuildUrls(req, document, options = {}) {
   if (!document || typeof document !== 'object') {
     return document;
   }
@@ -240,28 +272,41 @@ function withAbsoluteBuildUrls(req, document) {
       : { ...document };
 
   for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
-    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+    payload[field] = toAbsoluteBackendUrl(req, payload[field], {
+      project: options.project,
+      build: payload,
+    });
   }
 
   return payload;
 }
 
-function withAbsoluteProjectBuildUrls(req, document) {
+function withAbsoluteProjectBuildUrls(req, document, options = {}) {
   if (!document || typeof document !== 'object') {
     return document;
   }
 
+  const projectContext = {
+    ...buildProjectPreviewContext(document, null),
+    ...options.project,
+  };
   const payload =
     typeof document.toObject === 'function'
       ? document.toObject({ getters: true, virtuals: true })
       : { ...document };
+  delete payload.publicHostKey;
+  projectContext.reactVite = projectContext.reactVite || payload.reactVite === true;
+  projectContext.build = projectContext.build || payload.build;
 
   for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
-    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+    payload[field] = toAbsoluteBackendUrl(req, payload[field], {
+      project: projectContext,
+      build: payload.build,
+    });
   }
 
   if (payload.build && typeof payload.build === 'object') {
-    payload.build = withAbsoluteBuildUrls(req, payload.build);
+    payload.build = withAbsoluteBuildUrls(req, payload.build, { project: projectContext });
   }
 
   return payload;
@@ -792,8 +837,9 @@ function getCanonicalBuildPreviewUrl(projectId, projectBuild) {
   return '';
 }
 
-async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
+async function getServableBuildPreviewUrl(req, projectId, projectBuild, options = {}) {
   const indexBuildUrl = getCanonicalBuildPreviewUrl(projectId, projectBuild);
+  const project = options.project || projectBuild.project;
 
   if (!indexBuildUrl) {
     return '';
@@ -806,7 +852,10 @@ async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
       const indexStats = await fs.stat(indexPath);
 
       if (indexStats.isFile()) {
-        return toAbsoluteBackendUrl(req, indexBuildUrl);
+        return toAbsoluteBackendUrl(req, indexBuildUrl, {
+          project,
+          build: projectBuild,
+        });
       }
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -816,7 +865,10 @@ async function getServableBuildPreviewUrl(req, projectId, projectBuild) {
   }
 
   if (await hasMongoBuildFallback(indexBuildUrl)) {
-    return toAbsoluteBackendUrl(req, indexBuildUrl);
+    return toAbsoluteBackendUrl(req, indexBuildUrl, {
+      project,
+      build: projectBuild,
+    });
   }
 
   return '';
@@ -1215,7 +1267,7 @@ async function collectProjectSourceFiles(sourceDir) {
 
 async function loadProject(req, res, next) {
   try {
-    const project = await Project.findById(req.params.id);
+    const project = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -2810,7 +2862,7 @@ router.get('/change-requests', requireAdmin, async (req, res) => {
 router.get('/projects', requireAdmin, async (req, res) => {
   try {
     const limit = parsePositiveInt(req.query.limit, 100, 100);
-    const projectQuery = Project.find().sort({
+    const projectQuery = withSelectedProjectPublicHostKey(Project.find()).sort({
       updatedAt: -1,
       createdAt: -1,
     });
@@ -3342,7 +3394,7 @@ router.post(
 
       return res.status(202).json({
         success: true,
-        build: withAbsoluteBuildUrls(req, build),
+        build: withAbsoluteBuildUrls(req, build, { project }),
         buildId: String(build._id),
         jobId: String(job._id),
         status: 'queued',
@@ -3465,8 +3517,8 @@ router.post(
         publicationRequired: true,
         publishEndpoint: `/api/admin/projects/${project._id}/builds/${build._id}/publish`,
         buildId: String(build._id),
-        previewUrl: toAbsoluteBackendUrl(req, previewUrl),
-        build: withAbsoluteBuildUrls(req, build),
+        previewUrl: toAbsoluteBackendUrl(req, previewUrl, { project, build }),
+        build: withAbsoluteBuildUrls(req, build, { project }),
         security: securityScan,
       });
     } catch (error) {
@@ -3509,7 +3561,7 @@ router.post(
 
 router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id);
+    const project = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3523,7 +3575,7 @@ router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req,
 
     return res.status(201).json({
       success: true,
-      build: withAbsoluteBuildUrls(req, build),
+      build: withAbsoluteBuildUrls(req, build, { project }),
     });
   } catch (error) {
     if (error.name === 'ValidationError') {
@@ -3546,7 +3598,7 @@ router.post(
   async (req, res) => {
     try {
       const { projectId, buildId } = req.params;
-      const project = await Project.findById(projectId);
+      const project = await withSelectedProjectPublicHostKey(Project.findById(projectId));
 
       if (!project) {
         return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3578,8 +3630,10 @@ router.post(
       return res.json({
         success: true,
         ...(alreadyPublished ? { alreadyPublished } : {}),
-        project: withAbsoluteProjectBuildUrls(req, publishedProject),
-        build: withAbsoluteBuildUrlsShared(req, publishedBuild),
+        project: withAbsoluteProjectBuildUrls(req, publishedProject, {
+          project: buildProjectPreviewContext(project, publishedProject),
+        }),
+        build: withAbsoluteBuildUrlsShared(req, publishedBuild, { project }),
         previewUrl,
         publicUrl,
         deployUrl,
@@ -3602,10 +3656,11 @@ router.get(
   async (req, res) => {
     try {
       const { projectId, buildId } = req.params;
+      const project = await withSelectedProjectPublicHostKey(Project.findById(projectId));
       const projectBuild = await ProjectBuild.findOne({
         _id: buildId,
         projectId,
-      }).select('status previewUrl buildUrl deployUrl distUrl buildJobId');
+      }).select('type status previewUrl buildUrl deployUrl distUrl buildJobId');
 
       if (!projectBuild) {
         return res.status(404).json({ message: 'Build não encontrado.' });
@@ -3626,7 +3681,7 @@ router.get(
           .select('status errorCode errorMessage');
       }
 
-      const previewUrl = await getServableBuildPreviewUrl(req, projectId, projectBuild);
+      const previewUrl = await getServableBuildPreviewUrl(req, projectId, projectBuild, { project });
       const projectBuildStatus = projectBuild.status;
       const jobStatus = buildJob ? buildJob.status : getLegacyBuildJobStatus(projectBuildStatus);
 
@@ -3678,7 +3733,7 @@ router.get(
 
 router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id);
+    const project = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3727,7 +3782,7 @@ router.get('/projects/:id/builds/check', requireAdmin, validateProjectId, async 
 
 router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id);
+    const project = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3740,7 +3795,7 @@ router.get('/projects/:id/builds', requireAdmin, validateProjectId, async (req, 
 
     return res.json({
       success: true,
-      builds: builds.map((build) => withAbsoluteBuildUrls(req, build)),
+      builds: builds.map((build) => withAbsoluteBuildUrls(req, build, { project })),
     });
   } catch (error) {
     return res.status(500).json({
@@ -3760,14 +3815,14 @@ router.patch('/projects/:id/build-mode', requireAdmin, validateProjectId, async 
       });
     }
 
-    const project = await Project.findByIdAndUpdate(
+    const project = await withSelectedProjectPublicHostKey(Project.findByIdAndUpdate(
       req.params.id,
       { buildMode },
       {
         new: true,
         runValidators: true,
       }
-    );
+    ));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3786,7 +3841,7 @@ router.patch('/projects/:id/build-mode', requireAdmin, validateProjectId, async 
 
 router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const existingProject = await Project.findById(req.params.id);
+    const existingProject = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!existingProject) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3884,10 +3939,10 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
       removePublicPublishFields(update);
     }
 
-    const project = await Project.findByIdAndUpdate(req.params.id, update, {
+    const project = await withSelectedProjectPublicHostKey(Project.findByIdAndUpdate(req.params.id, update, {
       new: true,
       runValidators: true,
-    });
+    }));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3906,7 +3961,7 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
 
 router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req, res) => {
   try {
-    const existingProject = await Project.findById(req.params.id);
+    const existingProject = await withSelectedProjectPublicHostKey(Project.findById(req.params.id));
 
     if (!existingProject) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -3941,14 +3996,14 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
       removePublicPublishFields(update);
     }
 
-    const project = await Project.findByIdAndUpdate(
+    const project = await withSelectedProjectPublicHostKey(Project.findByIdAndUpdate(
       req.params.id,
       update,
       {
         new: true,
         runValidators: true,
       }
-    );
+    ));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });

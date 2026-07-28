@@ -31,7 +31,7 @@ const {
   scanBuildSecurity,
 } = require('../utils/projectPublication');
 const {
-  toDedicatedPreviewUrl,
+  toCanonicalPreviewUrl,
 } = require('../utils/previewOrigin');
 const {
   extractExplicitAppName,
@@ -677,21 +677,53 @@ function getBackendBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
-function toAbsoluteBackendUrl(req, value) {
+function withSelectedProjectPublicHostKey(query) {
+  if (query && typeof query.select === 'function') {
+    query.select('+publicHostKey');
+  }
+
+  return query;
+}
+
+function readDocumentField(value, field) {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, field)) {
+    return value[field];
+  }
+
+  if (typeof value.get === 'function') {
+    return value.get(field);
+  }
+
+  return undefined;
+}
+
+function buildProjectPreviewContext(project, payload) {
+  return {
+    publicHostKey: readDocumentField(project, 'publicHostKey'),
+    reactVite: payload?.reactVite === true || readDocumentField(project, 'reactVite') === true,
+    build: payload?.build || readDocumentField(project, 'build'),
+  };
+}
+
+function toAbsoluteBackendUrl(req, value, options = {}) {
   if (typeof value !== 'string' || !value) {
     return value || '';
   }
 
-  const dedicatedPreviewUrl = toDedicatedPreviewUrl(value);
-  const absoluteValue = dedicatedPreviewUrl !== value
-    ? dedicatedPreviewUrl
+  const canonicalPreviewUrl = toCanonicalPreviewUrl(value, options);
+  const absoluteValue = canonicalPreviewUrl !== value
+    ? canonicalPreviewUrl
     : value.startsWith('/builds/')
       ? new URL(value, `${getBackendBaseUrl(req)}/`).toString()
       : value;
   return addBuildPreviewToken(absoluteValue);
 }
 
-function withAbsoluteBuildUrls(req, value) {
+function withAbsoluteBuildUrls(req, value, options = {}) {
   if (!value || typeof value !== 'object') {
     return value;
   }
@@ -702,28 +734,41 @@ function withAbsoluteBuildUrls(req, value) {
       : { ...value };
 
   for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
-    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+    payload[field] = toAbsoluteBackendUrl(req, payload[field], {
+      project: options.project,
+      build: payload,
+    });
   }
 
   return payload;
 }
 
-function withAbsoluteProjectBuildUrls(req, value) {
+function withAbsoluteProjectBuildUrls(req, value, options = {}) {
   if (!value || typeof value !== 'object') {
     return value;
   }
 
+  const projectContext = {
+    ...buildProjectPreviewContext(value, null),
+    ...options.project,
+  };
   const payload =
     typeof value.toObject === 'function'
       ? value.toObject({ getters: true, virtuals: true })
       : { ...value };
+  delete payload.publicHostKey;
+  projectContext.reactVite = projectContext.reactVite || payload.reactVite === true;
+  projectContext.build = projectContext.build || payload.build;
 
   for (const field of ['distUrl', 'previewUrl', 'buildUrl']) {
-    payload[field] = toAbsoluteBackendUrl(req, payload[field]);
+    payload[field] = toAbsoluteBackendUrl(req, payload[field], {
+      project: projectContext,
+      build: payload.build,
+    });
   }
 
   if (payload.build && typeof payload.build === 'object') {
-    payload.build = withAbsoluteBuildUrls(req, payload.build);
+    payload.build = withAbsoluteBuildUrls(req, payload.build, { project: projectContext });
   }
 
   return payload;
@@ -748,6 +793,7 @@ function buildProjectPayload(req, projectDocument) {
     typeof projectDocument.toObject === 'function'
       ? projectDocument.toObject({ getters: true, virtuals: true })
       : projectDocument;
+  const projectPreviewContext = buildProjectPreviewContext(projectDocument, project);
   const effectiveStatus = getEffectiveBuildStatus(project);
   const publishedBuildId = getProjectPublishedBuildId(project);
   const fullHtml = project.fullHtml || project.latestFullHtml || '';
@@ -759,7 +805,7 @@ function buildProjectPayload(req, projectDocument) {
     generation_status: effectiveStatus,
     buildId: null,
     previewReady: false,
-    project: withAbsoluteProjectBuildUrls(req, project),
+    project: withAbsoluteProjectBuildUrls(req, projectDocument, { project: projectPreviewContext }),
   };
 
   if (effectiveStatus !== 'done') {
@@ -785,12 +831,21 @@ function buildProjectPayload(req, projectDocument) {
     js: project.js || '',
     fullHtml,
     latestFullHtml: project.latestFullHtml || fullHtml,
-    distUrl: toAbsoluteBackendUrl(req, project.distUrl || build.distUrl || ''),
-    previewUrl: toAbsoluteBackendUrl(req, project.previewUrl || build.previewUrl || ''),
-    buildUrl: toAbsoluteBackendUrl(req, project.buildUrl || build.buildUrl || ''),
+    distUrl: toAbsoluteBackendUrl(req, project.distUrl || build.distUrl || '', {
+      project: projectPreviewContext,
+      build,
+    }),
+    previewUrl: toAbsoluteBackendUrl(req, project.previewUrl || build.previewUrl || '', {
+      project: projectPreviewContext,
+      build,
+    }),
+    buildUrl: toAbsoluteBackendUrl(req, project.buildUrl || build.buildUrl || '', {
+      project: projectPreviewContext,
+      build,
+    }),
     deploy: project.deploy || {},
     reactVite: project.reactVite === true || build.reactVite === true,
-    build: withAbsoluteBuildUrls(req, build),
+    build: withAbsoluteBuildUrls(req, build, { project: projectPreviewContext }),
   };
 }
 
@@ -799,10 +854,18 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     typeof buildDocument.toObject === 'function'
       ? buildDocument.toObject({ getters: true, virtuals: true })
       : buildDocument;
-  const previewUrl = toAbsoluteBackendUrl(req, build.previewUrl || '');
+  const projectPreviewContext = buildProjectPreviewContext(project, {
+    reactVite: readDocumentField(project, 'reactVite') === true || build.type === 'react_vite',
+    build,
+  });
+  const previewUrl = toAbsoluteBackendUrl(req, build.previewUrl || '', {
+    project: projectPreviewContext,
+    build,
+  });
   const buildUrl = toAbsoluteBackendUrl(
     req,
-    build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || ''
+    build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '',
+    { project: projectPreviewContext, build }
   );
 
   return {
@@ -812,17 +875,17 @@ function buildDoneProjectBuildPayload(req, project, buildDocument) {
     generation_status: 'done',
     buildId: String(build._id),
     previewReady: Boolean(build.fullHtml || previewUrl || buildUrl),
-    project: withAbsoluteProjectBuildUrls(req, project),
-    build: withAbsoluteBuildUrls(req, build),
+    project: withAbsoluteProjectBuildUrls(req, project, { project: projectPreviewContext }),
+    build: withAbsoluteBuildUrls(req, build, { project: projectPreviewContext }),
     html: build.html || '',
     css: build.css || '',
     js: build.js || '',
     fullHtml: build.fullHtml || '',
     latestFullHtml: build.fullHtml || '',
-    distUrl: toAbsoluteBackendUrl(req, build.distUrl || ''),
+    distUrl: toAbsoluteBackendUrl(req, build.distUrl || '', { project: projectPreviewContext, build }),
     previewUrl,
     buildUrl,
-    deployUrl: toAbsoluteBackendUrl(req, build.deployUrl || ''),
+    deployUrl: toAbsoluteBackendUrl(req, build.deployUrl || '', { project: projectPreviewContext, build }),
     sourceZipUrl: build.sourceZipUrl || '',
     logs: build.logs || '',
     reactVite: build.type === 'react_vite',
@@ -1022,7 +1085,7 @@ async function setProjectRuntimeEnabled(req, res, runtimeEnabled) {
 
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const projects = await Project.find({ userId: req.userId }).sort({
+    const projects = await withSelectedProjectPublicHostKey(Project.find({ userId: req.userId })).sort({
       createdAt: -1,
     });
 
@@ -1440,10 +1503,10 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
     }
 
     const projectObjectId = new mongoose.Types.ObjectId(req.params.id);
-    const project = await Project.findOne({
+    const project = await withSelectedProjectPublicHostKey(Project.findOne({
       _id: projectObjectId,
       userId: req.userId,
-    });
+    }));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1494,10 +1557,10 @@ router.get('/:projectId/builds/:buildId/status', authMiddleware, async (req, res
       return res.status(400).json({ message: 'ID de projeto ou build inválido.' });
     }
 
-    const project = await Project.findOne({
+    const project = await withSelectedProjectPublicHostKey(Project.findOne({
       _id: projectId,
       userId: req.userId,
-    }).select('_id');
+    }).select('_id reactVite build +publicHostKey'));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1506,7 +1569,7 @@ router.get('/:projectId/builds/:buildId/status', authMiddleware, async (req, res
     const projectBuild = await ProjectBuild.findOne({
       _id: buildId,
       projectId: project._id,
-    }).select('status previewUrl buildUrl distUrl buildJobId');
+    }).select('type status previewUrl buildUrl distUrl buildJobId');
 
     if (!projectBuild) {
       return res.status(404).json({ message: 'Build não encontrado.' });
@@ -1518,9 +1581,14 @@ router.get('/:projectId/builds/:buildId/status', authMiddleware, async (req, res
     const buildJob = await BuildJob.findOne(buildJobQuery)
       .sort({ createdAt: -1 })
       .select('status errorCode errorMessage');
+    const projectPreviewContext = buildProjectPreviewContext(project, {
+      reactVite: readDocumentField(project, 'reactVite') === true || projectBuild.type === 'react_vite',
+      build: projectBuild,
+    });
     const previewUrl = toAbsoluteBackendUrl(
       req,
-      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.distUrl || ''
+      projectBuild.previewUrl || projectBuild.buildUrl || projectBuild.distUrl || '',
+      { project: projectPreviewContext, build: projectBuild }
     );
     const projectBuildStatus = projectBuild.status;
     const jobStatus = buildJob ? buildJob.status : getLegacyBuildJobStatus(projectBuildStatus);
@@ -1586,10 +1654,10 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
       return res.status(404).json({ message: 'User not found.' });
     }
 
-    const project = await Project.findOne({
+    const project = await withSelectedProjectPublicHostKey(Project.findOne({
       _id: projectId,
       userId: req.userId,
-    });
+    }));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1638,7 +1706,9 @@ router.post('/:projectId/builds/:buildId/publish', authMiddleware, async (req, r
     return res.json({
       success: true,
       ...(alreadyPublished ? { alreadyPublished } : {}),
-      project: withAbsoluteProjectBuildUrls(req, publishedProject),
+      project: withAbsoluteProjectBuildUrls(req, publishedProject, {
+        project: buildProjectPreviewContext(project, publishedProject),
+      }),
       build,
       previewUrl,
       publicUrl,
@@ -1913,10 +1983,10 @@ router.get('/:id/files/content', authMiddleware, async (req, res) => {
 
 router.get('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
   try {
-    const project = await Project.findOne({
+    const project = await withSelectedProjectPublicHostKey(Project.findOne({
       _id: req.projectObjectId,
       userId: req.userId,
-    });
+    }));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1978,7 +2048,7 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
       update.briefing = briefingEvaluation.briefing;
     }
 
-    const project = await Project.findOneAndUpdate(
+    const project = await withSelectedProjectPublicHostKey(Project.findOneAndUpdate(
       {
         _id: req.projectObjectId,
         userId: req.userId,
@@ -1988,7 +2058,7 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
         new: true,
         runValidators: true,
       }
-    );
+    ));
 
     if (!project) {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
@@ -1996,7 +2066,7 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
 
     return res.json({
       message: 'Projeto atualizado com sucesso.',
-      project,
+      project: withAbsoluteProjectBuildUrls(req, project),
     });
   } catch (error) {
     return sendProjectUpdateError(res, error);

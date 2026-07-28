@@ -2,10 +2,15 @@ const assert = require('assert/strict');
 const test = require('node:test');
 const mongoose = require('mongoose');
 
+process.env.BUILD_PREVIEW_SECRET = 'builder-build-state-preview-secret';
+process.env.GENERATED_APP_DOMAIN = 'fluidapps.dev';
+process.env.PREVIEW_BASE_URL = 'https://preview.askfluid.now';
+
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const projectRoutes = require('../routes/projectRoutes');
 const adminRoutes = require('../routes/adminRoutes');
+const { verifyBuildPreviewToken } = require('../utils/buildPreviewAccess');
 
 const PROJECT_ID = '64f000000000000000000101';
 const USER_ID = '64f000000000000000000102';
@@ -13,6 +18,7 @@ const OTHER_USER_ID = '64f000000000000000000103';
 const BUILD_A_ID = '64f000000000000000000111';
 const BUILD_B_ID = '64f000000000000000000112';
 const BUILD_C_ID = '64f000000000000000000113';
+const PUBLIC_HOST_KEY = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
 function getFinalRouteHandler(router, pathname, method) {
   const layer = router.stack.find((item) => (
@@ -55,6 +61,43 @@ function buildDocument(buildId, label) {
   };
 }
 
+async function withGeneratedAppDomain(value, fn) {
+  const previousValue = process.env.GENERATED_APP_DOMAIN;
+
+  if (value === undefined) {
+    delete process.env.GENERATED_APP_DOMAIN;
+  } else {
+    process.env.GENERATED_APP_DOMAIN = value;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (previousValue === undefined) {
+      delete process.env.GENERATED_APP_DOMAIN;
+    } else {
+      process.env.GENERATED_APP_DOMAIN = previousValue;
+    }
+  }
+}
+
+function assertGeneratedPreviewUrl(value, buildId) {
+  const url = new URL(value);
+  assert.equal(url.origin, `https://pv-${PUBLIC_HOST_KEY}.fluidapps.dev`);
+  assert.equal(url.pathname, `/builds/${PROJECT_ID}/${buildId}/index.html`);
+  const previewToken = url.searchParams.get('previewToken');
+  assert.ok(previewToken);
+  assert.equal(verifyBuildPreviewToken(previewToken, PROJECT_ID, buildId), true);
+  return previewToken;
+}
+
+function assertLegacyPreviewUrl(value, buildId) {
+  const url = new URL(value);
+  assert.equal(url.origin, 'https://preview.askfluid.now');
+  assert.equal(url.pathname, `/builds/${PROJECT_ID}/${buildId}/index.html`);
+  assert.equal(verifyBuildPreviewToken(url.searchParams.get('previewToken'), PROJECT_ID, buildId), true);
+}
+
 function buildRequest(userId = USER_ID) {
   return {
     params: { id: PROJECT_ID },
@@ -87,6 +130,8 @@ test('Builder build contract supports repeated ready and loading transitions', a
     generationStatus: 'done',
     generation_status: 'done',
     latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+    publicHostKey: PUBLIC_HOST_KEY,
+    reactVite: true,
     previewUrl: builds.get(BUILD_A_ID).previewUrl,
     buildUrl: builds.get(BUILD_A_ID).buildUrl,
     fullHtml: builds.get(BUILD_A_ID).fullHtml,
@@ -110,6 +155,8 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.equal(readyA.body.buildId, BUILD_A_ID);
     assert.equal(readyA.body.previewReady, true);
     assert.match(readyA.body.fullHtml, />A</);
+    const tokenA = assertGeneratedPreviewUrl(readyA.body.previewUrl, BUILD_A_ID);
+    assert.equal(builds.get(BUILD_A_ID).previewUrl, `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`);
 
     project.status = 'in_progress';
     project.generationStatus = 'in_progress';
@@ -135,6 +182,10 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.equal(readyB.body.buildId, BUILD_B_ID);
     assert.notEqual(readyB.body.buildId, readyA.body.buildId);
     assert.match(readyB.body.fullHtml, />B</);
+    const tokenB = assertGeneratedPreviewUrl(readyB.body.previewUrl, BUILD_B_ID);
+    assert.notEqual(readyB.body.previewUrl, readyA.body.previewUrl);
+    assert.notEqual(tokenB, tokenA);
+    assert.equal(new URL(readyB.body.build.previewUrl).pathname, `/builds/${PROJECT_ID}/${BUILD_B_ID}/index.html`);
 
     project.status = 'in_progress';
     project.generationStatus = 'in_progress';
@@ -170,6 +221,119 @@ test('Builder build contract supports repeated ready and loading transitions', a
   } finally {
     Project.findOne = originalProjectFindOne;
     ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract falls back to legacy preview origin without generated domain', async () => {
+  await withGeneratedAppDomain(undefined, async () => {
+    const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+    const originalProjectFindOne = Project.findOne;
+    const originalBuildFindOne = ProjectBuild.findOne;
+
+    try {
+      Project.findOne = async () => ({
+        _id: new mongoose.Types.ObjectId(PROJECT_ID),
+        generationStatus: 'done',
+        publicHostKey: PUBLIC_HOST_KEY,
+        reactVite: true,
+        latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+      });
+      ProjectBuild.findOne = async () => buildDocument(BUILD_A_ID, 'A');
+
+      const res = await runBuilderBuild(handler);
+      assert.equal(res.statusCode, 200);
+      assertLegacyPreviewUrl(res.body.previewUrl, BUILD_A_ID);
+    } finally {
+      Project.findOne = originalProjectFindOne;
+      ProjectBuild.findOne = originalBuildFindOne;
+    }
+  });
+});
+
+test('Builder build contract falls back to legacy preview origin without valid publicHostKey', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      generationStatus: 'done',
+      publicHostKey: 'not-valid',
+      reactVite: true,
+      latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+    });
+    ProjectBuild.findOne = async () => buildDocument(BUILD_A_ID, 'A');
+
+    const res = await runBuilderBuild(handler);
+    assert.equal(res.statusCode, 200);
+    assertLegacyPreviewUrl(res.body.previewUrl, BUILD_A_ID);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Project hydration returns canonical generated preview URL without exposing publicHostKey', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id', 'get');
+  const originalProjectFindOne = Project.findOne;
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      userId: new mongoose.Types.ObjectId(USER_ID),
+      publicHostKey: PUBLIC_HOST_KEY,
+      reactVite: true,
+      previewUrl: `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`,
+      buildUrl: `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`,
+      build: buildDocument(BUILD_A_ID, 'A'),
+    });
+
+    const res = createResponse();
+    await handler({
+      params: { id: PROJECT_ID },
+      projectObjectId: new mongoose.Types.ObjectId(PROJECT_ID),
+      userId: USER_ID,
+      protocol: 'https',
+      get: () => 'backend.example.test',
+    }, res);
+
+    assert.equal(res.statusCode, 200);
+    assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_A_ID);
+    assert.equal(Object.hasOwn(res.body, 'publicHostKey'), false);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+  }
+});
+
+test('Project list response uses canonical generated preview URL for React/Vite thumbnails', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/', 'get');
+  const originalProjectFind = Project.find;
+
+  try {
+    Project.find = () => ({
+      select() {
+        return this;
+      },
+      sort: async () => [{
+        _id: new mongoose.Types.ObjectId(PROJECT_ID),
+        userId: new mongoose.Types.ObjectId(USER_ID),
+        publicHostKey: PUBLIC_HOST_KEY,
+        reactVite: true,
+        previewUrl: `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`,
+        build: buildDocument(BUILD_A_ID, 'A'),
+      }],
+    });
+
+    const res = createResponse();
+    await handler(buildRequest(), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(Array.isArray(res.body), true);
+    assertGeneratedPreviewUrl(res.body[0].previewUrl, BUILD_A_ID);
+    assert.equal(Object.hasOwn(res.body[0], 'publicHostKey'), false);
+  } finally {
+    Project.find = originalProjectFind;
   }
 });
 
