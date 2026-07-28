@@ -97,6 +97,64 @@ test('asset capability rewrite supports artifact-relative and same-origin genera
   );
 });
 
+test('generated preview can rewrite root-relative asset URLs to exact build URLs', () => {
+  const assetParsedPath = {
+    ...parsedPath,
+    artifactPath: 'assets/app.js',
+  };
+  const options = {
+    baseOrigin: 'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev',
+    allowedOrigins: ['https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev'],
+    rewriteRootRelativeAssetUrls: true,
+  };
+
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/hero.png#img', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/hero.png?previewToken=new-token#img'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/photo.jpg?size=1', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/photo.jpg?size=1&previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/photo.jpeg', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/photo.jpeg?previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/card.webp', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/card.webp?previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/icon.svg', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/icon.svg?previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/font.woff2', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/font.woff2?previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/assets/font.woff', assetParsedPath, 'new-token', options),
+    '/builds/64f000000000000000000001/64f000000000000000000002/assets/font.woff?previewToken=new-token'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl(
+      'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev/assets/app.css#sheet',
+      assetParsedPath,
+      'new-token',
+      options
+    ),
+    'https://pv-0123456789abcdef0123456789abcdef.fluidapps.dev/builds/64f000000000000000000001/64f000000000000000000002/assets/app.css?previewToken=new-token#sheet'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('https://cdn.example/assets/hero.png', assetParsedPath, 'new-token', options),
+    'https://cdn.example/assets/hero.png'
+  );
+  assert.equal(
+    withBuildPreviewTokenOnAssetUrl('/api/runtime/project', assetParsedPath, 'new-token', options),
+    '/api/runtime/project'
+  );
+});
+
 test('private build code assets propagate capability to Vite dynamic assets', () => {
   const assetParsedPath = {
     ...parsedPath,

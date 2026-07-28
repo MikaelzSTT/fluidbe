@@ -376,6 +376,7 @@ function propagateGeneratedPreviewCapability(req, artifactPath, contentType, bod
   const options = {
     baseOrigin: `https://${req.generatedAppContext.hostname}`,
     allowedOrigins: [`https://${req.generatedAppContext.hostname}`],
+    rewriteRootRelativeAssetUrls: true,
   };
   const originalText = originalBody.toString('utf8');
   let transformedText = originalText;
@@ -1129,8 +1130,13 @@ function buildUrlMatchQuery(indexBuildUrl) {
   };
 }
 
-function authorizePrivateBuildPreview(req, res, parsedPath, secureCookie = false) {
+function authorizePrivateBuildPreview(req, res, parsedPath, options = {}) {
   const previewCookieName = 'fluid_build_preview';
+  const cookieOptions = typeof options === 'object' && options !== null
+    ? options
+    : { secureCookie: options };
+  const secureCookie = cookieOptions.secureCookie === true;
+  const sameSite = cookieOptions.sameSite || 'lax';
   const queryToken = typeof req.query.previewToken === 'string' ? req.query.previewToken : '';
   const cookieToken = getCookie(req, previewCookieName);
   const previewToken = queryToken || cookieToken;
@@ -1143,7 +1149,7 @@ function authorizePrivateBuildPreview(req, res, parsedPath, secureCookie = false
     res.cookie(previewCookieName, queryToken, {
       httpOnly: true,
       secure: secureCookie || process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite,
       path: `/builds/${parsedPath.projectId}/${parsedPath.buildKey}`,
       maxAge: BUILD_PREVIEW_TTL_SECONDS * 1000,
     });
@@ -1182,7 +1188,10 @@ async function authorizeBuildAccess(req, res, next) {
     const generatedPreviewRequest = req.generatedAppContext?.type === 'preview';
 
     if (generatedPreviewRequest) {
-      const previewToken = authorizePrivateBuildPreview(req, res, parsedPath, true);
+      const previewToken = authorizePrivateBuildPreview(req, res, parsedPath, {
+        secureCookie: true,
+        sameSite: 'none',
+      });
 
       if (!previewToken) {
         return res.sendStatus(404);

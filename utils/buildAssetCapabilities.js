@@ -92,16 +92,42 @@ function withBuildPreviewTokenOnAssetUrl(rawValue, parsedPath, previewToken, opt
 
   const buildBasePath = `/builds/${parsedPath.projectId}/${parsedPath.buildKey}/`;
 
-  if (
-    !allowedOrigins.has(resolvedUrl.origin) ||
-    !resolvedUrl.pathname.startsWith(buildBasePath) ||
-    resolvedUrl.pathname === basePath ||
-    resolvedUrl.searchParams.has('previewToken')
-  ) {
+  if (!allowedOrigins.has(resolvedUrl.origin)) {
     return rawValue;
   }
 
-  return appendQueryParam(rawValue, 'previewToken', previewToken);
+  if (resolvedUrl.pathname.startsWith(buildBasePath)) {
+    if (
+      resolvedUrl.pathname === basePath ||
+      resolvedUrl.searchParams.has('previewToken')
+    ) {
+      return rawValue;
+    }
+
+    return appendQueryParam(rawValue, 'previewToken', previewToken);
+  }
+
+  if (
+    options.rewriteRootRelativeAssetUrls === true &&
+    resolvedUrl.pathname.startsWith('/') &&
+    !resolvedUrl.pathname.startsWith('/builds/') &&
+    !trimmedValue.startsWith('//') &&
+    isLikelyBuildAssetReference(trimmedValue) &&
+    !resolvedUrl.searchParams.has('previewToken')
+  ) {
+    const scopedUrl = new URL(
+      `${resolvedUrl.origin}${buildBasePath.replace(/\/$/, '')}${resolvedUrl.pathname}`
+    );
+    scopedUrl.search = resolvedUrl.search;
+    scopedUrl.hash = resolvedUrl.hash;
+    scopedUrl.searchParams.set('previewToken', previewToken);
+
+    return /^[a-z][a-z\d+.-]*:/i.test(trimmedValue)
+      ? scopedUrl.toString()
+      : `${scopedUrl.pathname}${scopedUrl.search}${scopedUrl.hash}`;
+  }
+
+  return rawValue;
 }
 
 function injectBuildPreviewTokenIntoHtmlAssets(html, parsedPath, previewToken, options = {}) {

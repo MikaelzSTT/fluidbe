@@ -199,8 +199,10 @@ async function writeBuild(projectId, buildId, label) {
     [
       '<!doctype html><html><head>',
       `<link rel="stylesheet" href="./assets/app.css?theme=dark#sheet">`,
+      '<link rel="stylesheet" href="/assets/app.css?root=1#rootsheet">',
       `<link rel="modulepreload" href="/builds/${projectId}/${buildId}/assets/chunk.js">`,
       `<script type="module" src="./assets/app.js"></script>`,
+      '<script type="module" src="/assets/app.js?root=1#rootjs"></script>',
       `<script type="module" src="./assets/already.js?previewToken=existing#ready"></script>`,
       `<script type="module" src="/builds/${projectId}/${buildId}/assets/absolute.js?mode=prod#abs"></script>`,
       `<script type="module" src="https://pv-${PROJECT_A_KEY}.fluidapps.dev/builds/${projectId}/${buildId}/assets/generated-origin.js?x=1#origin"></script>`,
@@ -211,6 +213,7 @@ async function writeBuild(projectId, buildId, label) {
       '</head><body>',
       `<main>${label}</main>`,
       `<img src="./images/logo.png?size=small#hero">`,
+      '<img src="/images/photo.jpg#rootphoto">',
       '</body></html>',
     ].join('')
   );
@@ -227,10 +230,14 @@ async function writeBuild(projectId, buildId, label) {
       'const workerUrl = new URL("./worker.js#worker", import.meta.url);',
       'const viteWorker = new Worker(new URL("worker-B7T9.js",import.meta.url),{type:"module"});',
       'const imageUrl = new URL("../images/logo.png?from=js#logo", import.meta.url);',
+      'const rootPngUrl = new URL("/images/logo.png?root=1#root-logo", import.meta.url).href;',
+      'const rootJpgUrl = new URL("/images/photo.jpg", import.meta.url).href;',
+      'const rootWebpUrl = new URL("/images/card.webp", import.meta.url).href;',
+      'const rootSvgUrl = new URL("/images/icon.svg", import.meta.url).href;',
       `const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/charts-rVXgnjvt.js","assets/icons-AbCdEf12.js","./assets/from-dot.js","../images/logo.png#dep","/builds/${projectId}/${buildId}/assets/root.js?mode=prod#root","/builds/${projectId}/other-build/assets/leak.js","/builds/${PROJECT_B_ID}/${BUILD_B_ID}/assets/leak.js","https://cdn.example/preload.js","https://preview.askfluid.now/builds/${projectId}/${buildId}/assets/legacy.js","data:text/javascript,alert(1)","#section","ready"])))=>i.map(i=>d[i]);`,
       'const external = "https://cdn.example/external.js";',
       `document.body.dataset.build = "${label}";`,
-      'export { workerUrl, viteWorker, imageUrl, external, chartLoader };',
+      'export { workerUrl, viteWorker, imageUrl, rootPngUrl, rootJpgUrl, rootWebpUrl, rootSvgUrl, external, chartLoader };',
     ].join('\n')
   );
   await fs.writeFile(path.join(root, 'assets', 'chunk.js'), 'export const chunk = true;\n');
@@ -259,6 +266,8 @@ async function writeBuild(projectId, buildId, label) {
     [
       '@import "./imported.css";',
       '.hero{background:url("../images/logo.png?variant=hero#img")}',
+      '.root-webp{background:url("/images/card.webp#card")}',
+      '.root-svg{background:url("/images/icon.svg")}',
       '@font-face{font-family:"Test";src:url("./font.woff2#font") format("woff2")}',
       '@font-face{font-family:"TestWoff";src:url("./font.woff") format("woff")}',
       `.same-build{src:url("/builds/${projectId}/${buildId}/assets/root-font.woff2?mode=prod#font")}`,
@@ -280,6 +289,11 @@ async function writeBuild(projectId, buildId, label) {
     0x0d, 0x0a, 0x1a, 0x0a,
     0x00, 0x00, 0x00, 0x00,
   ]));
+  await fs.writeFile(path.join(root, 'images', 'photo.jpg'), Buffer.from([
+    0xff, 0xd8, 0xff, 0xd9,
+  ]));
+  await fs.writeFile(path.join(root, 'images', 'card.webp'), Buffer.from('RIFFxxxxWEBP'));
+  await fs.writeFile(path.join(root, 'images', 'icon.svg'), '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
 }
 
 test.before(async () => {
@@ -375,11 +389,19 @@ test('generated preview HTML tokenizes same-build assets and preserves URL bound
   );
   assert.match(
     response.body,
+    new RegExp(`href="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/app\\.css\\?root=1&previewToken=${encodedToken}#rootsheet"`)
+  );
+  assert.match(
+    response.body,
     new RegExp(`href="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/chunk\\.js\\?previewToken=${encodedToken}"`)
   );
   assert.match(
     response.body,
     new RegExp(`src="\\.\\/assets\\/app\\.js\\?previewToken=${encodedToken}"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/app\\.js\\?root=1&previewToken=${encodedToken}#rootjs"`)
   );
   assert.match(
     response.body,
@@ -396,6 +418,10 @@ test('generated preview HTML tokenizes same-build assets and preserves URL bound
   assert.match(
     response.body,
     new RegExp(`src="\\.\\/images\\/logo\\.png\\?size=small&previewToken=${encodedToken}#hero"`)
+  );
+  assert.match(
+    response.body,
+    new RegExp(`src="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/photo\\.jpg\\?previewToken=${encodedToken}#rootphoto"`)
   );
   assert.match(response.body, /src="https:\/\/cdn\.example\/app\.js"/);
   assert.match(response.body, /src="data:text\/javascript,console\.log\(1\)"/);
@@ -470,6 +496,10 @@ test('generated preview disk JS propagates static, dynamic, CSS, worker, and ass
   assert.match(response.body, new RegExp(`new URL\\("\\.\\/worker\\.js\\?previewToken=${encodedToken}#worker", import\\.meta\\.url\\)`));
   assert.match(response.body, new RegExp(`new URL\\("worker-B7T9\\.js\\?previewToken=${encodedToken}",import\\.meta\\.url\\)`));
   assert.match(response.body, new RegExp(`new URL\\("\\.\\.\\/images\\/logo\\.png\\?from=js&previewToken=${encodedToken}#logo", import\\.meta\\.url\\)`));
+  assert.match(response.body, new RegExp(`new URL\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/logo\\.png\\?root=1&previewToken=${encodedToken}#root-logo", import\\.meta\\.url\\)\\.href`));
+  assert.match(response.body, new RegExp(`new URL\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/photo\\.jpg\\?previewToken=${encodedToken}", import\\.meta\\.url\\)\\.href`));
+  assert.match(response.body, new RegExp(`new URL\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/card\\.webp\\?previewToken=${encodedToken}", import\\.meta\\.url\\)\\.href`));
+  assert.match(response.body, new RegExp(`new URL\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/icon\\.svg\\?previewToken=${encodedToken}", import\\.meta\\.url\\)\\.href`));
   assert.match(response.body, new RegExp(`"assets\\/charts-rVXgnjvt\\.js\\?previewToken=${encodedToken}"`));
   assert.match(response.body, new RegExp(`"assets\\/icons-AbCdEf12\\.js\\?previewToken=${encodedToken}"`));
   assert.match(response.body, new RegExp(`"\\.\\/assets\\/from-dot\\.js\\?previewToken=${encodedToken}"`));
@@ -496,6 +526,8 @@ test('generated preview disk CSS propagates imported CSS, image, and font URLs',
   assert.equal(response.statusCode, 200);
   assert.match(response.body, new RegExp(`@import "\\.\\/imported\\.css\\?previewToken=${encodedToken}";`));
   assert.match(response.body, new RegExp(`url\\("\\.\\.\\/images\\/logo\\.png\\?variant=hero&previewToken=${encodedToken}#img"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/card\\.webp\\?previewToken=${encodedToken}#card"\\)`));
+  assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/images\\/icon\\.svg\\?previewToken=${encodedToken}"\\)`));
   assert.match(response.body, new RegExp(`url\\("\\.\\/font\\.woff2\\?previewToken=${encodedToken}#font"\\)`));
   assert.match(response.body, new RegExp(`url\\("\\.\\/font\\.woff\\?previewToken=${encodedToken}"\\)`));
   assert.match(response.body, new RegExp(`url\\("\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/root-font\\.woff2\\?mode=prod&previewToken=${encodedToken}#font"\\)`));
@@ -585,6 +617,29 @@ test('generated preview binary artifacts are unchanged', async () => {
   assert.equal(response.headers['x-build-artifact-sha256'], sha256(original));
 });
 
+test('generated preview artifact serving does not log preview capabilities', async () => {
+  const token = validToken(PROJECT_A_ID, BUILD_A_ID);
+  const previousConsoleInfo = console.info;
+  const logs = [];
+  console.info = (...args) => logs.push(args);
+
+  try {
+    const index = await request({
+      path: `${buildPath(PROJECT_A_ID, BUILD_A_ID)}?previewToken=${token}`,
+    });
+    const image = await request({
+      path: `${buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png')}?previewToken=${token}`,
+    });
+
+    assert.equal(index.statusCode, 200);
+    assert.equal(image.statusCode, 200);
+    assert.equal(JSON.stringify(logs).includes(token), false);
+    assert.equal(JSON.stringify(logs).includes('previewToken'), false);
+  } finally {
+    console.info = previousConsoleInfo;
+  }
+});
+
 test('Project A host denies Project B path even with a valid Project B capability', async () => {
   const response = await request({
     path: `${buildPath(PROJECT_B_ID, BUILD_B_ID)}?previewToken=${validToken(PROJECT_B_ID, BUILD_B_ID)}`,
@@ -635,7 +690,7 @@ test('valid query capability establishes a secure host-only build-scoped cookie'
   assert.match(setCookie, /fluid_build_preview=/);
   assert.match(setCookie, /HttpOnly/i);
   assert.match(setCookie, /Secure/i);
-  assert.match(setCookie, /SameSite=Lax/i);
+  assert.match(setCookie, /SameSite=None/i);
   assert.match(
     setCookie,
     new RegExp(`Path=\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}`)
@@ -643,13 +698,66 @@ test('valid query capability establishes a secure host-only build-scoped cookie'
   assert.doesNotMatch(setCookie, /Domain=/i);
 
   const cookie = response.headers['set-cookie'][0].split(';')[0];
-  const asset = await request({
+  const jsAsset = await request({
     path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.js'),
     headers: { Cookie: cookie },
   });
+  const cssAsset = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.css'),
+    headers: { Cookie: cookie },
+  });
+  const pngAsset = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png'),
+    headers: { Cookie: cookie },
+  });
+  const fontAsset = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/font.woff2'),
+    headers: { Cookie: cookie },
+  });
+  const otherBuildAsset = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_NEWER_ID, 'assets/app.js'),
+    headers: { Cookie: cookie },
+  });
+  const otherProjectAsset = await request({
+    path: buildPath(PROJECT_B_ID, BUILD_B_ID, 'assets/app.js'),
+    headers: {
+      Host: generatedPreviewHost(PROJECT_B_KEY),
+      Cookie: cookie,
+    },
+  });
 
-  assert.equal(asset.statusCode, 200);
-  assert.match(asset.body, /project-a-requested/);
+  assert.equal(jsAsset.statusCode, 200);
+  assert.match(jsAsset.body, /project-a-requested/);
+  assert.equal(cssAsset.statusCode, 200);
+  assert.match(cssAsset.body, /font\.woff2/);
+  assert.equal(pngAsset.statusCode, 200);
+  assert.equal(pngAsset.headers['content-type'], 'image/png');
+  assert.equal(fontAsset.statusCode, 200);
+  assert.equal(fontAsset.headers['content-type'], 'font/woff2');
+  assert.equal(otherBuildAsset.statusCode, 404);
+  assert.equal(otherProjectAsset.statusCode, 404);
+});
+
+test('invalid and expired preview capability cookies remain denied', async () => {
+  const expiredStart =
+    Math.floor(Date.now() / 1000) - BUILD_PREVIEW_TTL_SECONDS - 10;
+  const expiredToken = createBuildPreviewToken(
+    PROJECT_A_ID,
+    BUILD_A_ID,
+    expiredStart
+  );
+
+  for (const cookie of [
+    'fluid_build_preview=invalid-token',
+    `fluid_build_preview=${encodeURIComponent(expiredToken)}`,
+  ]) {
+    const response = await request({
+      path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png'),
+      headers: { Cookie: cookie },
+    });
+
+    assert.equal(response.statusCode, 404);
+  }
 });
 
 test('Project A preview cookie cannot authorize Project B host', async () => {
@@ -843,6 +951,7 @@ test('legacy preview host and normal build publication access remain unchanged',
 
   assert.equal(legacyPreview.statusCode, 200);
   assert.match(legacyPreview.body, /project-b/);
+  assert.match(String(legacyPreview.headers['set-cookie'] || ''), /SameSite=Lax/i);
   assert.doesNotMatch(legacyPreview.body, new RegExp(`previewToken=${encodeURIComponent(legacyToken)}`));
   assert.equal(legacyCss.statusCode, 200);
   assert.match(legacyCss.body, /url\("\.\/font\.woff2#font"\)/);
