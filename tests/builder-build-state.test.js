@@ -61,6 +61,60 @@ function buildDocument(buildId, label) {
   };
 }
 
+function queryMatchesBuild(query, build) {
+  if (query._id !== undefined && String(query._id) !== String(build._id)) {
+    return false;
+  }
+
+  if (query.projectId !== undefined && String(query.projectId) !== String(build.projectId)) {
+    return false;
+  }
+
+  if (query.status !== undefined && query.status !== build.status) {
+    return false;
+  }
+
+  return true;
+}
+
+function mockBuildFindOne(builds, queries = []) {
+  return (query) => {
+    queries.push(query);
+    const matches = builds.filter((build) => queryMatchesBuild(query, build));
+
+    return {
+      sort(sortSpec) {
+        const sorted = [...matches].sort((left, right) => {
+          for (const [field, direction] of Object.entries(sortSpec || {})) {
+            const leftValue = left[field] instanceof mongoose.Types.ObjectId
+              ? String(left[field])
+              : left[field];
+            const rightValue = right[field] instanceof mongoose.Types.ObjectId
+              ? String(right[field])
+              : right[field];
+
+            if (leftValue === rightValue) {
+              continue;
+            }
+
+            return leftValue > rightValue ? direction : -direction;
+          }
+
+          return 0;
+        });
+
+        return Promise.resolve(sorted[0] || null);
+      },
+      then(resolve, reject) {
+        return Promise.resolve(matches[0] || null).then(resolve, reject);
+      },
+      catch(reject) {
+        return Promise.resolve(matches[0] || null).catch(reject);
+      },
+    };
+  };
+}
+
 async function withGeneratedAppDomain(value, fn) {
   const previousValue = process.env.GENERATED_APP_DOMAIN;
 
@@ -218,6 +272,279 @@ test('Builder build contract supports repeated ready and loading transitions', a
     assert.ok(buildQueries.every((query) => (
       String(query.projectId) === PROJECT_ID && query.status === 'done'
     )));
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract recovers stale pending project with valid published done build', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const build = buildDocument(BUILD_A_ID, 'A');
+  const queries = [];
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      userId: new mongoose.Types.ObjectId(USER_ID),
+      name: 'FitTrack',
+      status: 'pending',
+      generationStatus: 'pending',
+      generation_status: 'pending',
+      publicHostKey: PUBLIC_HOST_KEY,
+      reactVite: true,
+      latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+      previewUrl: build.previewUrl,
+      buildUrl: build.buildUrl,
+      distUrl: build.distUrl,
+      deployUrl: build.deployUrl,
+      fullHtml: build.fullHtml,
+      latestFullHtml: build.fullHtml,
+      build,
+    });
+    ProjectBuild.findOne = mockBuildFindOne([build], queries);
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'done');
+    assert.equal(res.body.generationStatus, 'done');
+    assert.equal(res.body.buildId, BUILD_A_ID);
+    assert.equal(res.body.previewReady, true);
+    assert.match(res.body.fullHtml, />A</);
+    assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_A_ID);
+    assert.deepEqual(queries.map((query) => ({
+      _id: query._id ? String(query._id) : undefined,
+      projectId: String(query.projectId),
+      status: query.status,
+    })), [{
+      _id: BUILD_A_ID,
+      projectId: PROJECT_ID,
+      status: 'done',
+    }]);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract keeps pending project pending without completed build evidence', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      status: 'pending',
+      generationStatus: 'pending',
+      generation_status: 'pending',
+    });
+    ProjectBuild.findOne = mockBuildFindOne([]);
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'pending');
+    assert.equal(res.body.buildId, null);
+    assert.equal(res.body.previewReady, false);
+    assert.equal(Object.hasOwn(res.body, 'previewUrl'), false);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract falls back from invalid published build id to newest done build', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const doneBuild = {
+    ...buildDocument(BUILD_B_ID, 'B'),
+    createdAt: new Date('2026-07-24T02:00:00Z'),
+    updatedAt: new Date('2026-07-24T02:00:00Z'),
+  };
+  const olderDoneBuild = {
+    ...buildDocument(BUILD_C_ID, 'C'),
+    createdAt: new Date('2026-07-24T01:00:00Z'),
+    updatedAt: new Date('2026-07-24T01:00:00Z'),
+  };
+  const queries = [];
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      status: 'pending',
+      generationStatus: 'pending',
+      generation_status: 'pending',
+      publicHostKey: PUBLIC_HOST_KEY,
+      reactVite: true,
+      latestPublishedBuildId: 'not-a-valid-build-id',
+    });
+    ProjectBuild.findOne = mockBuildFindOne([olderDoneBuild, doneBuild], queries);
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'done');
+    assert.equal(res.body.buildId, BUILD_B_ID);
+    assert.equal(res.body.previewReady, true);
+    assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_B_ID);
+    assert.equal(queries.length, 1);
+    assert.equal(String(queries[0].projectId), PROJECT_ID);
+    assert.equal(queries[0].status, 'done');
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract recovers pending project from legacy project-level preview fields', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const legacyBuild = buildDocument(BUILD_A_ID, 'A');
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      status: 'pending',
+      generationStatus: 'pending',
+      generation_status: 'pending',
+      publicHostKey: PUBLIC_HOST_KEY,
+      reactVite: true,
+      latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+      previewUrl: legacyBuild.previewUrl,
+      buildUrl: legacyBuild.buildUrl,
+      distUrl: legacyBuild.distUrl,
+      fullHtml: legacyBuild.fullHtml,
+      latestFullHtml: legacyBuild.fullHtml,
+      build: legacyBuild,
+    });
+    ProjectBuild.findOne = mockBuildFindOne([]);
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'done');
+    assert.equal(res.body.buildId, BUILD_A_ID);
+    assert.equal(res.body.previewReady, true);
+    assert.match(res.body.fullHtml, />A</);
+    assertGeneratedPreviewUrl(res.body.previewUrl, BUILD_A_ID);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract keeps active generation authoritative over old done build', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  let buildQueried = false;
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      status: 'in_progress',
+      generationStatus: 'in_progress',
+      generation_status: 'in_progress',
+      latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+      previewUrl: `/builds/${PROJECT_ID}/${BUILD_A_ID}/index.html`,
+      fullHtml: '<main>old</main>',
+    });
+    ProjectBuild.findOne = () => {
+      buildQueried = true;
+      return mockBuildFindOne([buildDocument(BUILD_A_ID, 'A')])({});
+    };
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'in_progress');
+    assert.equal(res.body.buildId, null);
+    assert.equal(res.body.previewReady, false);
+    assert.equal(Object.hasOwn(res.body, 'previewUrl'), false);
+    assert.equal(buildQueried, false);
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract replaces stale stored previewToken with response-time token', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const originalNow = Date.now;
+  const build = buildDocument(BUILD_A_ID, 'A');
+  build.previewUrl = `${build.previewUrl}?previewToken=persisted-token`;
+  build.buildUrl = `${build.buildUrl}?previewToken=persisted-token`;
+  build.distUrl = `${build.distUrl}?previewToken=persisted-token`;
+
+  try {
+    Project.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(PROJECT_ID),
+      status: 'pending',
+      generationStatus: 'pending',
+      generation_status: 'pending',
+      publicHostKey: PUBLIC_HOST_KEY,
+      reactVite: true,
+      latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
+    });
+    ProjectBuild.findOne = mockBuildFindOne([build]);
+    Date.now = () => new Date('2026-07-28T12:00:00Z').getTime();
+    const first = await runBuilderBuild(handler);
+    Date.now = () => new Date('2026-07-28T12:01:00Z').getTime();
+    const second = await runBuilderBuild(handler);
+
+    const firstToken = new URL(first.body.previewUrl).searchParams.get('previewToken');
+    const secondToken = new URL(second.body.previewUrl).searchParams.get('previewToken');
+    assert.notEqual(firstToken, 'persisted-token');
+    assert.notEqual(secondToken, 'persisted-token');
+    assert.notEqual(firstToken, secondToken);
+    assert.equal(build.previewUrl.endsWith('previewToken=persisted-token'), true);
+    assert.equal(verifyBuildPreviewToken(firstToken, PROJECT_ID, BUILD_A_ID, Math.floor(new Date('2026-07-28T12:00:00Z').getTime() / 1000)), true);
+    assert.equal(verifyBuildPreviewToken(secondToken, PROJECT_ID, BUILD_A_ID, Math.floor(new Date('2026-07-28T12:01:00Z').getTime() / 1000)), true);
+  } finally {
+    Date.now = originalNow;
+    Project.findOne = originalProjectFindOne;
+    ProjectBuild.findOne = originalBuildFindOne;
+  }
+});
+
+test('Builder build contract scopes fallback lookup to the authenticated project', async () => {
+  const handler = getFinalRouteHandler(projectRoutes, '/:id/build', 'get');
+  const originalProjectFindOne = Project.findOne;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const otherProjectBuild = {
+    ...buildDocument(BUILD_A_ID, 'A'),
+    projectId: new mongoose.Types.ObjectId('64f000000000000000000199'),
+  };
+  const queries = [];
+
+  try {
+    Project.findOne = async (query) => (
+      String(query.userId) === USER_ID
+        ? {
+            _id: new mongoose.Types.ObjectId(PROJECT_ID),
+            status: 'pending',
+            generationStatus: 'pending',
+            generation_status: 'pending',
+          }
+        : null
+    );
+    ProjectBuild.findOne = mockBuildFindOne([otherProjectBuild], queries);
+
+    const res = await runBuilderBuild(handler);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'pending');
+    assert.equal(res.body.buildId, null);
+    assert.equal(res.body.previewReady, false);
+    assert.equal(queries.every((query) => String(query.projectId) === PROJECT_ID), true);
   } finally {
     Project.findOne = originalProjectFindOne;
     ProjectBuild.findOne = originalBuildFindOne;

@@ -778,6 +778,13 @@ function getEffectiveBuildStatus(project) {
   return project.generationStatus || project.generation_status || project.status || 'pending';
 }
 
+function isActiveBuildStatus(project) {
+  return ['generationStatus', 'generation_status', 'status'].some((field) => {
+    const value = String(project?.[field] || '').trim().toLowerCase();
+    return value === 'in_progress' || value === 'building';
+  });
+}
+
 function getProjectPublishedBuildId(project) {
   const buildId = project && project.latestPublishedBuildId;
 
@@ -788,13 +795,99 @@ function getProjectPublishedBuildId(project) {
   return String(buildId._id || buildId);
 }
 
-function buildProjectPayload(req, projectDocument) {
+function hasLegacyCompletedProjectPreview(project) {
+  if (!project || typeof project !== 'object') {
+    return false;
+  }
+
+  const build = project.build && typeof project.build === 'object' ? project.build : {};
+  const buildStatus = String(build.status || '').trim().toLowerCase();
+
+  if (buildStatus && buildStatus !== 'done') {
+    return false;
+  }
+
+  const hasCompletedIdentity = Boolean(
+    buildStatus === 'done' ||
+    getProjectPublishedBuildId(project) ||
+    build._id
+  );
+  const hasPreviewEvidence = Boolean(
+    project.fullHtml ||
+    project.latestFullHtml ||
+    project.previewUrl ||
+    project.buildUrl ||
+    project.distUrl ||
+    project.deployUrl ||
+    build.fullHtml ||
+    build.previewUrl ||
+    build.buildUrl ||
+    build.distUrl ||
+    build.deployUrl
+  );
+
+  return hasCompletedIdentity && hasPreviewEvidence;
+}
+
+async function findDoneProjectBuild(query, sort = null) {
+  const selection = ProjectBuild.findOne(query);
+  const result = sort && selection && typeof selection.sort === 'function'
+    ? selection.sort(sort)
+    : selection;
+
+  return result && typeof result.then === 'function' ? result : Promise.resolve(result);
+}
+
+async function resolveCompletedBuilderBuild(project) {
+  const publishedBuildId = getProjectPublishedBuildId(project);
+
+  if (publishedBuildId && mongoose.Types.ObjectId.isValid(publishedBuildId)) {
+    const publishedBuild = await findDoneProjectBuild({
+      _id: publishedBuildId,
+      projectId: project._id,
+      status: 'done',
+    });
+
+    if (publishedBuild) {
+      return { source: 'latestPublishedBuildId', build: publishedBuild };
+    }
+  }
+
+  const latestDoneBuild = await findDoneProjectBuild(
+    {
+      projectId: project._id,
+      status: 'done',
+    },
+    {
+      createdAt: -1,
+      updatedAt: -1,
+      _id: -1,
+    }
+  );
+
+  if (latestDoneBuild) {
+    return { source: 'latestDoneBuild', build: latestDoneBuild };
+  }
+
+  const projectPayload =
+    typeof project.toObject === 'function'
+      ? project.toObject({ getters: true, virtuals: true })
+      : project;
+
+  if (hasLegacyCompletedProjectPreview(projectPayload)) {
+    return { source: 'legacyProjectFields', build: null };
+  }
+
+  return { source: 'none', build: null };
+}
+
+function buildProjectPayload(req, projectDocument, options = {}) {
   const project =
     typeof projectDocument.toObject === 'function'
       ? projectDocument.toObject({ getters: true, virtuals: true })
       : projectDocument;
   const projectPreviewContext = buildProjectPreviewContext(projectDocument, project);
-  const effectiveStatus = getEffectiveBuildStatus(project);
+  const effectiveStatus = options.effectiveStatus || getEffectiveBuildStatus(project);
   const publishedBuildId = getProjectPublishedBuildId(project);
   const fullHtml = project.fullHtml || project.latestFullHtml || '';
   const build = project.build && typeof project.build === 'object' ? project.build : {};
@@ -1512,33 +1605,28 @@ router.get('/:id/build', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'Projeto não encontrado.' });
     }
 
-    if (getEffectiveBuildStatus(project) !== 'done') {
+    const effectiveStatus = getEffectiveBuildStatus(project);
+
+    if (isActiveBuildStatus(project)) {
       return res.json(buildProjectPayload(req, project));
     }
 
-    const publishedBuildId = getProjectPublishedBuildId(project);
-    let activeDoneBuild = null;
-
-    if (publishedBuildId && mongoose.Types.ObjectId.isValid(publishedBuildId)) {
-      activeDoneBuild = await ProjectBuild.findOne({
-        _id: publishedBuildId,
-        projectId: project._id,
-        status: 'done',
-      });
-    } else if (!publishedBuildId) {
-      // Legacy projects may predate latestPublishedBuildId. Keep their newest
-      // completed preview available without overriding explicit publication.
-      activeDoneBuild = await ProjectBuild.findOne({
-        projectId: project._id,
-        status: 'done',
-      }).sort({
-        createdAt: -1,
-        updatedAt: -1,
-      });
+    if (!['done', 'pending'].includes(effectiveStatus)) {
+      return res.json(buildProjectPayload(req, project));
     }
 
-    if (activeDoneBuild) {
-      return res.json(buildDoneProjectBuildPayload(req, project, activeDoneBuild));
+    const completedBuildResolution = await resolveCompletedBuilderBuild(project);
+
+    if (completedBuildResolution.build) {
+      return res.json(buildDoneProjectBuildPayload(req, project, completedBuildResolution.build));
+    }
+
+    if (completedBuildResolution.source === 'legacyProjectFields') {
+      return res.json(buildProjectPayload(req, project, { effectiveStatus: 'done' }));
+    }
+
+    if (effectiveStatus !== 'done') {
+      return res.json(buildProjectPayload(req, project));
     }
 
     return res.json(buildProjectPayload(req, project));
