@@ -21,6 +21,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const PUBLIC_BUILDS_DIR = path.join(ROOT_DIR, 'public', 'builds');
 const SECURITY_SCAN_MAX_FINDINGS = 50;
 const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
+const PUBLISHABLE_BUILD_TYPES = new Set(['html', 'full_html', 'react_vite']);
 
 function createHttpError(statusCode, payload) {
   const error = new Error(payload && payload.message ? payload.message : 'Request failed.');
@@ -105,6 +106,109 @@ function idsEqual(left, right) {
   const leftId = left._id || left;
   const rightId = right._id || right;
   return String(leftId) === String(rightId);
+}
+
+function getDocumentId(value) {
+  if (!value) {
+    return '';
+  }
+
+  if (typeof value === 'object') {
+    if (value._id !== undefined) {
+      return value._id ? String(value._id) : '';
+    }
+
+    if (value.id !== undefined) {
+      return value.id ? String(value.id) : '';
+    }
+  }
+
+  return String(value);
+}
+
+function assertBuildUrlIdentity(project, projectBuild, field) {
+  const value = projectBuild && projectBuild[field];
+
+  if (typeof value !== 'string' || !value) {
+    return;
+  }
+
+  const parsedUrl = parsePublicBuildUrl(value);
+
+  if (!parsedUrl) {
+    return;
+  }
+
+  const projectId = getDocumentId(project);
+  const buildId = getDocumentId(projectBuild);
+
+  if (parsedUrl.projectId !== projectId || parsedUrl.buildKey !== buildId) {
+    throw createHttpError(409, {
+      message: 'URL de build não pertence ao projeto/build solicitado.',
+      code: 'BUILD_IDENTITY_MISMATCH',
+      field,
+    });
+  }
+}
+
+function assertPublishBuildIdentity(project, projectBuild, options = {}) {
+  const projectId = getDocumentId(project);
+  const buildId = getDocumentId(projectBuild);
+  const buildProjectId = getDocumentId(projectBuild && projectBuild.projectId);
+
+  if (!projectId) {
+    throw createHttpError(400, {
+      message: 'ID de projeto inválido.',
+      code: 'PROJECT_ID_REQUIRED',
+    });
+  }
+
+  if (!buildId) {
+    throw createHttpError(400, {
+      message: 'ID de build obrigatório para publicação.',
+      code: 'BUILD_ID_REQUIRED',
+    });
+  }
+
+  if (!buildProjectId || buildProjectId !== projectId) {
+    throw createHttpError(404, {
+      message: 'Build não encontrado.',
+      code: 'BUILD_NOT_FOUND',
+    });
+  }
+
+  if (!PUBLISHABLE_BUILD_TYPES.has(projectBuild.type)) {
+    throw createHttpError(409, {
+      message: 'Tipo de build não pode ser publicado.',
+      code: 'BUILD_TYPE_NOT_PUBLISHABLE',
+      buildType: projectBuild.type || '',
+    });
+  }
+
+  const alreadyPublished =
+    options.alreadyPublished === undefined
+      ? isProjectBuildExplicitlyPublished(project, projectBuild)
+      : options.alreadyPublished;
+
+  if (projectBuild.status === 'done' && !alreadyPublished) {
+    throw createHttpError(409, {
+      message: 'Build já está concluído, mas não é o build publicado deste projeto.',
+      code: 'BUILD_NOT_READY_FOR_PUBLICATION',
+      buildStatus: projectBuild.status,
+    });
+  }
+
+  if (projectBuild.status !== 'draft' && !alreadyPublished) {
+    throw createHttpError(409, {
+      message: 'Apenas builds em draft podem ser publicados.',
+      code: 'BUILD_NOT_READY_FOR_PUBLICATION',
+      buildStatus: projectBuild.status,
+    });
+  }
+
+  for (const field of ['distUrl', 'previewUrl', 'buildUrl', 'deployUrl']) {
+    assertBuildUrlIdentity(project, projectBuild, field);
+  }
 }
 
 function slugifyProjectTitle(value) {
@@ -591,6 +695,7 @@ function assertBuildSecurityAllowsPublication(projectBuild) {
 async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publishMetadataUpdate = buildPublishMetadataUpdate(body);
   const isAlreadyPublishedBuild = isProjectBuildExplicitlyPublished(project, projectBuild);
+  assertPublishBuildIdentity(project, projectBuild, { alreadyPublished: isAlreadyPublishedBuild });
 
   if (isAlreadyPublishedBuild) {
     assertBuildSecurityAllowsPublication(projectBuild);
@@ -619,21 +724,6 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
       deployUrl: publicUrl,
       build: withAbsoluteBuildUrls(req, projectBuild, { project }),
     };
-  }
-
-  if (projectBuild.status === 'done') {
-    throw createHttpError(409, {
-      message: 'Build já está publicado.',
-      code: 'BUILD_ALREADY_PUBLISHED',
-    });
-  }
-
-  if (projectBuild.status !== 'draft') {
-    throw createHttpError(409, {
-      message: 'Apenas builds concluídos e em draft podem ser publicados.',
-      code: 'BUILD_NOT_READY_FOR_PUBLICATION',
-      buildStatus: projectBuild.status,
-    });
   }
 
   assertBuildSecurityAllowsPublication(projectBuild);
@@ -695,6 +785,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
       code: 'BUILD_STATUS_CHANGED',
     });
   }
+  assertPublishBuildIdentity(project, publishedBuild, { alreadyPublished: true });
 
   const update = { ...publishMetadataUpdate };
   applyPublishedBuildFields(publishedBuild, update);
@@ -726,6 +817,7 @@ module.exports = {
   buildPublishMetadataUpdate,
   buildUnpublishUpdate,
   getServableBuildPreviewUrl,
+  assertPublishBuildIdentity,
   publishProjectBuild,
   assertBuildSecurityAllowsPublication,
   scanBuildSecurity,

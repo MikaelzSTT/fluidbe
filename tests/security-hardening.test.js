@@ -525,7 +525,7 @@ test('publication blocks critical secret findings without leaking the secret or 
           projectId: '64f000000000000000000010',
           status: 'draft',
           type: 'html',
-          previewUrl: '/builds/64f000000000000000000010/build-a/index.html',
+          previewUrl: '/builds/64f000000000000000000010/64f000000000000000000011/index.html',
           html: `<script>const leaked = "${secret}";</script>`,
         },
         body: {
@@ -568,8 +568,8 @@ test('clean publication still marks the selected draft build as done', async () 
     projectId,
     status: 'done',
     type: 'html',
-    previewUrl: `/builds/${projectId}/build-clean/index.html`,
-    buildUrl: `/builds/${projectId}/build-clean/index.html`,
+    previewUrl: `/builds/${projectId}/${buildId}/index.html`,
+    buildUrl: `/builds/${projectId}/${buildId}/index.html`,
     fullHtml: '<main>clean</main>',
   };
 
@@ -611,8 +611,8 @@ test('clean publication still marks the selected draft build as done', async () 
         projectId,
         status: 'draft',
         type: 'html',
-        previewUrl: `/builds/${projectId}/build-clean/index.html`,
-        buildUrl: `/builds/${projectId}/build-clean/index.html`,
+        previewUrl: `/builds/${projectId}/${buildId}/index.html`,
+        buildUrl: `/builds/${projectId}/${buildId}/index.html`,
         fullHtml: '<main>clean</main>',
       },
       body: {
@@ -629,5 +629,223 @@ test('clean publication still marks the selected draft build as done', async () 
     Project.findByIdAndUpdate = originalProjectFindByIdAndUpdate;
     Project.exists = originalProjectExists;
     BuildJob.findOne = originalBuildJobFindOne;
+  }
+});
+
+test('publication updates project from the exact reviewed build only', async () => {
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const originalProjectBuildFindOneAndUpdate = ProjectBuild.findOneAndUpdate;
+  const originalProjectFindByIdAndUpdate = Project.findByIdAndUpdate;
+  const originalProjectExists = Project.exists;
+  const originalBuildJobFindOne = BuildJob.findOne;
+  const projectId = '64f000000000000000000030';
+  const reviewedBuildId = '64f000000000000000000031';
+  const staleBuildId = '64f000000000000000000032';
+  const project = {
+    _id: projectId,
+    slug: 'reviewed-app',
+  };
+  const reviewedBuild = {
+    _id: reviewedBuildId,
+    projectId,
+    status: 'draft',
+    type: 'react_vite',
+    previewUrl: `/builds/${projectId}/${reviewedBuildId}/index.html`,
+    buildUrl: `/builds/${projectId}/${reviewedBuildId}/index.html`,
+    distUrl: `/builds/${projectId}/${reviewedBuildId}/index.html`,
+    deployUrl: `/builds/${projectId}/${reviewedBuildId}/index.html`,
+    fullHtml: '<main>reviewed build A</main>',
+  };
+  const staleDraftBuild = {
+    _id: staleBuildId,
+    projectId,
+    status: 'draft',
+    type: 'react_vite',
+    previewUrl: `/builds/${projectId}/${staleBuildId}/index.html`,
+    fullHtml: '<main>stale build B</main>',
+  };
+  let staleTouched = false;
+
+  try {
+    ProjectBuild.findOne = () => ({
+      select: async () => ({ fullHtml: reviewedBuild.fullHtml }),
+    });
+    ProjectBuild.findOneAndUpdate = async (query, update) => {
+      assert.equal(String(query._id), reviewedBuildId);
+      assert.notEqual(String(query._id), staleBuildId);
+      assert.equal(String(query.projectId), projectId);
+      assert.equal(query.status, 'draft');
+      assert.equal(update.$set.status, 'done');
+      staleTouched = String(query._id) === String(staleDraftBuild._id);
+      return {
+        ...reviewedBuild,
+        status: 'done',
+      };
+    };
+    Project.findByIdAndUpdate = async (id, update) => {
+      assert.equal(String(id), projectId);
+      assert.equal(String(update.latestPublishedBuildId), reviewedBuildId);
+      assert.equal(String(update.build._id), reviewedBuildId);
+      assert.equal(update.build.fullHtml, reviewedBuild.fullHtml);
+      assert.notEqual(update.build.fullHtml, staleDraftBuild.fullHtml);
+      return {
+        ...project,
+        ...update,
+        publicUrl: 'https://apps.askfluid.now/p/reviewed-app',
+      };
+    };
+    Project.exists = async () => false;
+    BuildJob.findOne = () => ({
+      sort: () => ({
+        select: async () => null,
+      }),
+    });
+
+    const result = await publishProjectBuild({
+      req: {
+        protocol: 'https',
+        get: () => 'backend.example.test',
+      },
+      project,
+      projectBuild: reviewedBuild,
+      body: {},
+    });
+
+    assert.equal(result.publishedBuild.status, 'done');
+    assert.equal(String(result.publishedBuild._id), reviewedBuildId);
+    assert.equal(staleTouched, false);
+  } finally {
+    ProjectBuild.findOne = originalProjectBuildFindOne;
+    ProjectBuild.findOneAndUpdate = originalProjectBuildFindOneAndUpdate;
+    Project.findByIdAndUpdate = originalProjectFindByIdAndUpdate;
+    Project.exists = originalProjectExists;
+    BuildJob.findOne = originalBuildJobFindOne;
+  }
+});
+
+test('publication rejects missing, foreign, ineligible, and mismatched build identities', async () => {
+  const projectId = '64f000000000000000000040';
+  const buildId = '64f000000000000000000041';
+  const otherProjectId = '64f000000000000000000042';
+  const project = {
+    _id: projectId,
+    slug: 'identity-app',
+  };
+  const baseBuild = {
+    _id: buildId,
+    projectId,
+    status: 'draft',
+    type: 'react_vite',
+    previewUrl: `/builds/${projectId}/${buildId}/index.html`,
+    fullHtml: '<main>identity</main>',
+  };
+  const req = {
+    protocol: 'https',
+    get: () => 'backend.example.test',
+  };
+
+  await assert.rejects(
+    publishProjectBuild({
+      req,
+      project,
+      projectBuild: {
+        ...baseBuild,
+        _id: null,
+      },
+      body: {},
+    }),
+    (error) => error.statusCode === 400 && error.payload.code === 'BUILD_ID_REQUIRED'
+  );
+
+  await assert.rejects(
+    publishProjectBuild({
+      req,
+      project,
+      projectBuild: {
+        ...baseBuild,
+        projectId: otherProjectId,
+      },
+      body: {},
+    }),
+    (error) => error.statusCode === 404 && error.payload.code === 'BUILD_NOT_FOUND'
+  );
+
+  await assert.rejects(
+    publishProjectBuild({
+      req,
+      project,
+      projectBuild: {
+        ...baseBuild,
+        type: 'backend',
+      },
+      body: {},
+    }),
+    (error) => error.statusCode === 409 && error.payload.code === 'BUILD_TYPE_NOT_PUBLISHABLE'
+  );
+
+  await assert.rejects(
+    publishProjectBuild({
+      req,
+      project,
+      projectBuild: {
+        ...baseBuild,
+        previewUrl: `/builds/${otherProjectId}/${buildId}/index.html`,
+      },
+      body: {},
+    }),
+    (error) => error.statusCode === 409 && error.payload.code === 'BUILD_IDENTITY_MISMATCH'
+  );
+
+  await assert.rejects(
+    publishProjectBuild({
+      req,
+      project,
+      projectBuild: {
+        ...baseBuild,
+        previewUrl: `/builds/${projectId}/64f000000000000000000043/index.html`,
+      },
+      body: {},
+    }),
+    (error) => error.statusCode === 409 && error.payload.code === 'BUILD_IDENTITY_MISMATCH'
+  );
+});
+
+test('Admin explicit publish route rejects a build id from another project', async () => {
+  const handler = getRouteHandler(adminRoutes, '/projects/:projectId/builds/:buildId/publish', 'post');
+  const originalProjectFindById = Project.findById;
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const projectId = '64f000000000000000000050';
+  const foreignBuildId = '64f000000000000000000051';
+  let capturedBuildQuery = null;
+
+  try {
+    Project.findById = async (id) => ({
+      _id: id,
+      slug: 'route-project',
+    });
+    ProjectBuild.findOne = async (query) => {
+      capturedBuildQuery = query;
+      return null;
+    };
+
+    const res = await runHandler(handler, {
+      params: {
+        projectId,
+        buildId: foreignBuildId,
+      },
+      body: {
+        visibility: 'public',
+      },
+      protocol: 'https',
+      get: () => 'backend.example.test',
+    });
+
+    assert.equal(res.statusCode, 404);
+    assert.equal(res.body.message, 'Build não encontrado.');
+    assert.equal(String(capturedBuildQuery._id), foreignBuildId);
+    assert.equal(String(capturedBuildQuery.projectId), projectId);
+  } finally {
+    Project.findById = originalProjectFindById;
+    ProjectBuild.findOne = originalProjectBuildFindOne;
   }
 });

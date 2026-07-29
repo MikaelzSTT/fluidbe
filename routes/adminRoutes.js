@@ -4023,7 +4023,6 @@ router.patch('/projects/:id/manual', requireAdmin, validateProjectId, async (req
     }
 
     if (shouldMarkDone) {
-      await applyLatestPendingBuild(req.params.id, update);
       update['metadata.lastBuildAt'] = new Date();
       removePublicPublishFields(update);
     }
@@ -4080,7 +4079,6 @@ router.patch('/projects/:id/status', requireAdmin, validateProjectId, async (req
     }
 
     if (requestedStatus === 'done') {
-      await applyLatestPendingBuild(req.params.id, update);
       update['metadata.lastBuildAt'] = new Date();
       removePublicPublishFields(update);
     }

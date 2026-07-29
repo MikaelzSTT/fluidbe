@@ -721,22 +721,19 @@ test('Builder build contract preserves project ownership boundary', async () => 
   }
 });
 
-test('Admin status handler supports repeated loading and done cycles with distinct build identities', async () => {
+test('Admin status handler never implicitly promotes a draft build on done', async () => {
   const handler = getFinalRouteHandler(adminRoutes, '/projects/:id/status', 'patch');
   const originalFindById = Project.findById;
   const originalFindByIdAndUpdate = Project.findByIdAndUpdate;
   const originalBuildFindOne = ProjectBuild.findOne;
   const updates = [];
-  const pendingBuilds = [
-    buildDocument(BUILD_B_ID, 'B'),
-    buildDocument(BUILD_C_ID, 'C'),
-  ].map((build) => ({
-    ...build,
+  const pendingBuild = {
+    ...buildDocument(BUILD_B_ID, 'B'),
     status: 'draft',
     async save() {
-      return this;
+      throw new Error('status-only done must not save or promote a draft build');
     },
-  }));
+  };
   let project = {
     _id: new mongoose.Types.ObjectId(PROJECT_ID),
     latestPublishedBuildId: new mongoose.Types.ObjectId(BUILD_A_ID),
@@ -756,9 +753,9 @@ test('Admin status handler supports repeated loading and done cycles with distin
       };
       return project;
     };
-    ProjectBuild.findOne = () => ({
-      sort: async () => pendingBuilds.shift() || null,
-    });
+    ProjectBuild.findOne = () => {
+      throw new Error(`status-only done must not query draft builds: ${pendingBuild._id}`);
+    };
 
     async function setAdminStatus(generationStatus) {
       const req = {
@@ -777,24 +774,25 @@ test('Admin status handler supports repeated loading and done cycles with distin
 
     const readyB = await setAdminStatus('done');
     assert.equal(readyB.generationStatus, 'done');
-    assert.equal(String(readyB.latestPublishedBuildId), BUILD_B_ID);
+    assert.equal(String(readyB.latestPublishedBuildId), BUILD_A_ID);
 
     const loadingAfterB = await setAdminStatus('in_progress');
     assert.equal(loadingAfterB.generationStatus, 'in_progress');
-    assert.equal(String(loadingAfterB.latestPublishedBuildId), BUILD_B_ID);
+    assert.equal(String(loadingAfterB.latestPublishedBuildId), BUILD_A_ID);
 
     const readyC = await setAdminStatus('done');
     assert.equal(readyC.generationStatus, 'done');
-    assert.equal(String(readyC.latestPublishedBuildId), BUILD_C_ID);
+    assert.equal(String(readyC.latestPublishedBuildId), BUILD_A_ID);
 
     assert.equal(updates.length, 4);
     assert.equal(updates[0].latestPublishedBuildId, undefined);
-    assert.equal(String(updates[1].latestPublishedBuildId), BUILD_B_ID);
+    assert.equal(updates[1].latestPublishedBuildId, undefined);
     assert.equal(updates[2].latestPublishedBuildId, undefined);
-    assert.equal(String(updates[3].latestPublishedBuildId), BUILD_C_ID);
+    assert.equal(updates[3].latestPublishedBuildId, undefined);
     assert.equal(updates[0].previewUrl, undefined);
+    assert.equal(updates[1].previewUrl, undefined);
     assert.equal(updates[2].previewUrl, undefined);
-    assert.equal(pendingBuilds.length, 0);
+    assert.equal(updates[3].previewUrl, undefined);
   } finally {
     Project.findById = originalFindById;
     Project.findByIdAndUpdate = originalFindByIdAndUpdate;
