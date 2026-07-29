@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
 const AdmZip = require('adm-zip');
+const acorn = require('acorn');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const BuildJob = require('../models/BuildJob');
@@ -2780,6 +2781,452 @@ function rewriteRootRelativeCssAssetPaths(css, cssRelativePath) {
     );
 }
 
+const STATIC_DIST_ASSET_EXTENSIONS = new Set([
+  '.avif',
+  '.css',
+  '.gif',
+  '.html',
+  '.ico',
+  '.jpeg',
+  '.jpg',
+  '.js',
+  '.json',
+  '.mjs',
+  '.mp3',
+  '.mp4',
+  '.ogg',
+  '.png',
+  '.svg',
+  '.ttf',
+  '.txt',
+  '.wasm',
+  '.wav',
+  '.webm',
+  '.webp',
+  '.woff',
+  '.woff2',
+]);
+
+function createDistAssetReferenceError(message, details = {}) {
+  const error = new Error(message);
+  error.code = 'INVALID_DIST_ASSET_REFERENCE';
+  Object.assign(error, details);
+  return error;
+}
+
+function splitAssetReference(value) {
+  const rawValue = String(value || '').trim();
+
+  if (
+    !rawValue ||
+    rawValue.startsWith('#') ||
+    rawValue.startsWith('//') ||
+    /^(?:https?|data|blob|mailto|javascript):/i.test(rawValue)
+  ) {
+    return null;
+  }
+
+  const suffixIndex = [rawValue.indexOf('?'), rawValue.indexOf('#')]
+    .filter((index) => index !== -1)
+    .sort((a, b) => a - b)[0];
+  const pathname = suffixIndex === undefined ? rawValue : rawValue.slice(0, suffixIndex);
+  const suffix = suffixIndex === undefined ? '' : rawValue.slice(suffixIndex);
+
+  if (!pathname || pathname.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(pathname)) {
+    return null;
+  }
+
+  if (
+    !pathname.startsWith('/') &&
+    !pathname.startsWith('./') &&
+    !pathname.startsWith('../')
+  ) {
+    return null;
+  }
+
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch (error) {
+    throw createDistAssetReferenceError(
+      `Build inválido: referência de asset inválida em ${value}.`,
+      { originalReference: value }
+    );
+  }
+
+  const extension = path.posix.extname(decodedPathname).toLowerCase();
+  if (!STATIC_DIST_ASSET_EXTENSIONS.has(extension)) {
+    return null;
+  }
+
+  return {
+    originalReference: rawValue,
+    pathname: decodedPathname,
+    suffix,
+  };
+}
+
+function isTextualDistArtifact(relativePath) {
+  return ['.html', '.css', '.js', '.mjs'].includes(path.posix.extname(String(relativePath || '')).toLowerCase());
+}
+
+function normalizeArtifactPath(value) {
+  const normalized = path.posix.normalize(String(value || '').replace(/\\/g, '/'));
+
+  if (
+    !normalized ||
+    normalized === '.' ||
+    normalized.startsWith('../') ||
+    normalized === '..' ||
+    path.posix.isAbsolute(normalized) ||
+    normalized.split('/').some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return '';
+  }
+
+  return normalized;
+}
+
+function resolveDistAssetReference(sourceArtifactPath, originalReference) {
+  const parsed = splitAssetReference(originalReference);
+
+  if (!parsed) {
+    return null;
+  }
+
+  const pathname = parsed.pathname;
+  const sourceDir = path.posix.dirname(String(sourceArtifactPath || '').replace(/\\/g, '/'));
+  const fromDir = sourceDir === '.' ? '' : sourceDir;
+  const resolvedPath = pathname.startsWith('/')
+    ? normalizeArtifactPath(pathname.slice(1))
+    : normalizeArtifactPath(path.posix.join(fromDir, pathname));
+
+  if (!resolvedPath) {
+    throw createDistAssetReferenceError(
+      `Build inválido: referência de asset escapa do dist (${sourceArtifactPath} -> ${originalReference}).`,
+      {
+        sourceArtifactPath,
+        originalReference: parsed.originalReference,
+        resolvedArtifactPath: '',
+      }
+    );
+  }
+
+  return {
+    sourceArtifactPath,
+    originalReference: parsed.originalReference,
+    resolvedArtifactPath: resolvedPath,
+    rootAliasCandidatePath: pathname.startsWith('/')
+      ? ''
+      : normalizeArtifactPath(pathname.replace(/^\.\/+/, '')),
+  };
+}
+
+function collectHtmlAssetReferences(html) {
+  const references = [];
+  const source = String(html || '');
+
+  for (const pattern of [
+    /\b(?:src|href)=(["'])([^"']+)\1/gi,
+    /url\(\s*(["']?)([^"')\s]+)\1\s*\)/gi,
+  ]) {
+    let match;
+    while ((match = pattern.exec(source))) {
+      references.push(match[2]);
+    }
+  }
+
+  return references;
+}
+
+function collectCssAssetReferences(css) {
+  const references = [];
+  const source = String(css || '');
+
+  for (const pattern of [
+    /@import\s+(?:url\(\s*)?(["'])([^"']+)\1\s*\)?/gi,
+    /url\(\s*(["']?)([^"')\s]+)\1\s*\)/gi,
+  ]) {
+    let match;
+    while ((match = pattern.exec(source))) {
+      references.push(match[2]);
+    }
+  }
+
+  return references;
+}
+
+function parseJavaScriptForDistAssets(code) {
+  try {
+    return acorn.parse(code, {
+      allowHashBang: true,
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+    });
+  } catch (moduleError) {
+    return acorn.parse(code, {
+      allowHashBang: true,
+      ecmaVersion: 'latest',
+      sourceType: 'script',
+    });
+  }
+}
+
+function walkJavaScriptAst(node, visitor) {
+  if (!node || typeof node.type !== 'string') {
+    return;
+  }
+
+  visitor(node);
+
+  for (const [key, value] of Object.entries(node)) {
+    if (
+      key === 'parent' ||
+      key === 'start' ||
+      key === 'end' ||
+      key === 'loc' ||
+      key === 'range'
+    ) {
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        if (child && typeof child.type === 'string') {
+          walkJavaScriptAst(child, visitor);
+        }
+      }
+    } else if (value && typeof value.type === 'string') {
+      walkJavaScriptAst(value, visitor);
+    }
+  }
+}
+
+function collectJavaScriptAssetReferences(code, sourceArtifactPath) {
+  let ast;
+
+  try {
+    ast = parseJavaScriptForDistAssets(String(code || ''));
+  } catch (error) {
+    throw createDistAssetReferenceError(
+      `Build inválido: JavaScript gerado não pôde ser analisado (${sourceArtifactPath}).`,
+      { sourceArtifactPath }
+    );
+  }
+
+  const references = [];
+
+  walkJavaScriptAst(ast, (node) => {
+    if (node.type === 'Literal' && typeof node.value === 'string') {
+      references.push(node.value);
+      return;
+    }
+
+    if (
+      node.type === 'TemplateLiteral' &&
+      Array.isArray(node.expressions) &&
+      node.expressions.length === 0 &&
+      Array.isArray(node.quasis) &&
+      node.quasis.length === 1
+    ) {
+      references.push(node.quasis[0]?.value?.cooked || node.quasis[0]?.value?.raw || '');
+    }
+  });
+
+  return references;
+}
+
+async function collectStaticLocalAssetReferences(distRoot, file) {
+  if (!isTextualDistArtifact(file.relativePath)) {
+    return [];
+  }
+
+  const content = await fs.readFile(file.absolutePath, 'utf8');
+  const extension = path.posix.extname(file.relativePath).toLowerCase();
+  let rawReferences = [];
+
+  if (extension === '.html') {
+    rawReferences = collectHtmlAssetReferences(content);
+  } else if (extension === '.css') {
+    rawReferences = collectCssAssetReferences(content);
+  } else if (extension === '.js' || extension === '.mjs') {
+    rawReferences = collectJavaScriptAssetReferences(content, file.relativePath);
+  }
+
+  return rawReferences
+    .map((reference) => resolveDistAssetReference(file.relativePath, reference))
+    .filter(Boolean);
+}
+
+async function planDistAssetAliases(distRoot, validation) {
+  const fileSet = new Set(validation.files.map((file) => file.relativePath));
+  const fileByPath = new Map(validation.files.map((file) => [file.relativePath, file]));
+  const aliasPlan = new Map();
+
+  for (const file of validation.files) {
+    const references = await collectStaticLocalAssetReferences(distRoot, file);
+
+    for (const reference of references) {
+      if (fileSet.has(reference.resolvedArtifactPath)) {
+        const sourcePath = reference.rootAliasCandidatePath;
+
+        if (
+          sourcePath &&
+          sourcePath !== reference.resolvedArtifactPath &&
+          fileSet.has(sourcePath)
+        ) {
+          const sourceContent = await fs.readFile(fileByPath.get(sourcePath).absolutePath);
+          const destinationContent = await fs.readFile(fileByPath.get(reference.resolvedArtifactPath).absolutePath);
+
+          if (!crypto.timingSafeEqual(
+            crypto.createHash('sha256').update(sourceContent).digest(),
+            crypto.createHash('sha256').update(destinationContent).digest()
+          )) {
+            throw createDistAssetReferenceError(
+              `Build inválido: alias de asset conflita com arquivo existente (${reference.resolvedArtifactPath}).`,
+              reference
+            );
+          }
+        }
+
+        continue;
+      }
+
+      const sourcePath = reference.rootAliasCandidatePath;
+
+      if (!sourcePath || sourcePath === reference.resolvedArtifactPath || !fileSet.has(sourcePath)) {
+        continue;
+      }
+
+      const existingAlias = aliasPlan.get(reference.resolvedArtifactPath);
+
+      if (existingAlias && existingAlias.sourcePath !== sourcePath) {
+        throw createDistAssetReferenceError(
+          `Build inválido: aliases conflitantes para ${reference.resolvedArtifactPath}.`,
+          {
+            sourceArtifactPath: reference.sourceArtifactPath,
+            originalReference: reference.originalReference,
+            resolvedArtifactPath: reference.resolvedArtifactPath,
+          }
+        );
+      }
+
+      aliasPlan.set(reference.resolvedArtifactPath, {
+        sourcePath,
+        destinationPath: reference.resolvedArtifactPath,
+        sourceArtifactPath: reference.sourceArtifactPath,
+        originalReference: reference.originalReference,
+      });
+    }
+  }
+
+  return Array.from(aliasPlan.values()).sort((a, b) => a.destinationPath.localeCompare(b.destinationPath));
+}
+
+async function copyDistAssetAlias(distRoot, alias) {
+  const sourcePath = path.resolve(distRoot, alias.sourcePath);
+  const destinationPath = path.resolve(distRoot, alias.destinationPath);
+
+  if (
+    sourcePath === distRoot ||
+    destinationPath === distRoot ||
+    !sourcePath.startsWith(`${distRoot}${path.sep}`) ||
+    !destinationPath.startsWith(`${distRoot}${path.sep}`)
+  ) {
+    throw createDistAssetReferenceError(
+      `Build inválido: alias de asset fora do dist (${alias.sourcePath} -> ${alias.destinationPath}).`,
+      alias
+    );
+  }
+
+  const sourceStats = await fs.lstat(sourcePath);
+
+  if (!sourceStats.isFile() || sourceStats.isSymbolicLink() || sourceStats.nlink > 1) {
+    throw createDistAssetReferenceError(
+      `Build inválido: fonte de alias de asset não é arquivo regular (${alias.sourcePath}).`,
+      alias
+    );
+  }
+
+  const sourceContent = await fs.readFile(sourcePath);
+
+  try {
+    const destinationStats = await fs.lstat(destinationPath);
+
+    if (!destinationStats.isFile() || destinationStats.isSymbolicLink() || destinationStats.nlink > 1) {
+      throw createDistAssetReferenceError(
+        `Build inválido: destino de alias de asset não é arquivo regular (${alias.destinationPath}).`,
+        alias
+      );
+    }
+
+    const destinationContent = await fs.readFile(destinationPath);
+    if (!crypto.timingSafeEqual(
+      crypto.createHash('sha256').update(sourceContent).digest(),
+      crypto.createHash('sha256').update(destinationContent).digest()
+    )) {
+      throw createDistAssetReferenceError(
+        `Build inválido: alias de asset conflita com arquivo existente (${alias.destinationPath}).`,
+        alias
+      );
+    }
+
+    return false;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.writeFile(destinationPath, sourceContent, { flag: 'wx', mode: 0o600 });
+  return true;
+}
+
+async function validateDistStaticLocalAssetReferences(distDir) {
+  const distRoot = path.resolve(distDir);
+  const validation = await validateDistDirectory(distRoot);
+  const fileSet = new Set(validation.files.map((file) => file.relativePath));
+
+  for (const file of validation.files) {
+    const references = await collectStaticLocalAssetReferences(distRoot, file);
+
+    for (const reference of references) {
+      if (!fileSet.has(reference.resolvedArtifactPath)) {
+        throw createDistAssetReferenceError(
+          `Build inválido: asset local ausente (${reference.sourceArtifactPath} -> ${reference.originalReference} -> ${reference.resolvedArtifactPath}).`,
+          reference
+        );
+      }
+    }
+  }
+
+  return validation;
+}
+
+async function normalizeDistStaticLocalAssetReferences(distDir) {
+  const distRoot = path.resolve(distDir);
+  const changedPaths = [];
+
+  for (let iteration = 0; iteration < MAX_DIST_FILES; iteration += 1) {
+    const validation = await validateDistDirectory(distRoot);
+    const aliases = await planDistAssetAliases(distRoot, validation);
+
+    if (aliases.length === 0) {
+      await validateDistStaticLocalAssetReferences(distRoot);
+      return changedPaths;
+    }
+
+    for (const alias of aliases) {
+      if (await copyDistAssetAlias(distRoot, alias)) {
+        changedPaths.push(alias.destinationPath);
+      }
+    }
+  }
+
+  throw createDistAssetReferenceError('Build inválido: normalização de assets não convergiu.');
+}
+
 async function findDistCssFiles(distDir) {
   const distRoot = path.resolve(distDir);
   const cssFiles = [];
@@ -2836,6 +3283,8 @@ async function fixDistBuildAssetPaths(distDir) {
       changedPaths.push(cssRelativePath);
     }
   }
+
+  changedPaths.push(...(await normalizeDistStaticLocalAssetReferences(distRoot)));
 
   return changedPaths;
 }
@@ -4119,6 +4568,7 @@ module.exports.reactViteBuildHelpers = {
   fixDistBuildAssetPaths,
   fixDistIndexAssetPaths,
   formatConnectorInjectionLog,
+  normalizeDistStaticLocalAssetReferences,
   publishValidatedDist,
   redactBuildLogs,
   runLocalBinCommand,
@@ -4127,5 +4577,6 @@ module.exports.reactViteBuildHelpers = {
   runReactViteBuild,
   runNpxCommand,
   validateDistDirectory,
+  validateDistStaticLocalAssetReferences,
   validateReactViteProject,
 };

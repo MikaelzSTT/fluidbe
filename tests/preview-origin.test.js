@@ -17,6 +17,7 @@ const {
   parseBuildPathFromUrl,
   toDedicatedPreviewUrl,
 } = require('../utils/previewOrigin');
+const { createBuildPreviewToken } = require('../utils/buildPreviewAccess');
 const { withAbsoluteBuildUrls } = require('../utils/projectPublication');
 
 const projectId = '64f000000000000000000101';
@@ -416,6 +417,122 @@ test('preview host serves static build files without setting cookies', async () 
     restore();
     await close(server);
     await fs.rm(path.join(__dirname, '..', 'public', 'builds', projectId), { recursive: true, force: true });
+  }
+});
+
+test('anonymous build assets are limited to the exact latest published build', async () => {
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const originalProjectFindById = Project.findById;
+  const oldBuildId = newerBuildId;
+  const draftBuildId = '64f000000000000000000105';
+  const unpublishedProjectId = '64f000000000000000000106';
+  const unpublishedBuildId = '64f000000000000000000107';
+  const foreignBuildId = '64f000000000000000000108';
+  const foreignProjectId = '64f000000000000000000109';
+  const builds = new Map([
+    [`${projectId}:${buildId}`, { _id: buildId, projectId, status: 'done' }],
+    [`${projectId}:${oldBuildId}`, { _id: oldBuildId, projectId, status: 'done' }],
+    [`${projectId}:${draftBuildId}`, { _id: draftBuildId, projectId, status: 'draft' }],
+    [`${unpublishedProjectId}:${unpublishedBuildId}`, { _id: unpublishedBuildId, projectId: unpublishedProjectId, status: 'done' }],
+    [`${projectId}:${foreignBuildId}`, { _id: foreignBuildId, projectId: foreignProjectId, status: 'done' }],
+  ]);
+  const projects = new Map([
+    [projectId, { _id: projectId, userId: '64f000000000000000000103', isPublished: true, latestPublishedBuildId: buildId }],
+    [unpublishedProjectId, { _id: unpublishedProjectId, userId: '64f000000000000000000103', isPublished: false, latestPublishedBuildId: unpublishedBuildId }],
+  ]);
+  const buildRoot = path.join(__dirname, '..', 'public', 'builds');
+  let server = null;
+
+  function getIndexBuildUrl(query) {
+    for (const condition of query.$or || []) {
+      for (const value of Object.values(condition)) {
+        if (typeof value === 'string') {
+          return value;
+        }
+      }
+    }
+
+    return '';
+  }
+
+  function getBuildKey(query) {
+    return getIndexBuildUrl(query).split('/').filter(Boolean)[2] || '';
+  }
+
+  async function writeBuildAsset(project, build, body) {
+    const assetDir = path.join(buildRoot, project, build, 'assets');
+    await fs.mkdir(assetDir, { recursive: true });
+    await fs.writeFile(path.join(assetDir, 'app.js'), body);
+  }
+
+  try {
+    ProjectBuild.findOne = (query) => ({
+      sort() {
+        return this;
+      },
+      select() {
+        return this;
+      },
+      lean: async () => builds.get(`${query.projectId}:${getBuildKey(query)}`) || null,
+    });
+    Project.findById = (id) => ({
+      select() {
+        return {
+          lean: async () => projects.get(String(id)) || null,
+        };
+      },
+    });
+
+    await writeBuildAsset(projectId, buildId, 'document.body.dataset.current = "true";');
+    await writeBuildAsset(projectId, oldBuildId, 'document.body.dataset.old = "true";');
+    await writeBuildAsset(projectId, draftBuildId, 'document.body.dataset.draft = "true";');
+    await writeBuildAsset(unpublishedProjectId, unpublishedBuildId, 'document.body.dataset.unpublished = "true";');
+    await writeBuildAsset(projectId, foreignBuildId, 'document.body.dataset.foreign = "true";');
+
+    server = await listen();
+
+    const current = await request(server, {
+      path: `/builds/${projectId}/${buildId}/assets/app.js`,
+      headers: { Host: 'apps.askfluid.now' },
+    });
+    assert.equal(current.statusCode, 200);
+    assert.match(current.body, /current/);
+
+    for (const [blockedProjectId, blockedBuildId] of [
+      [projectId, oldBuildId],
+      [projectId, draftBuildId],
+      [unpublishedProjectId, unpublishedBuildId],
+      [projectId, foreignBuildId],
+    ]) {
+      const blocked = await request(server, {
+        path: `/builds/${blockedProjectId}/${blockedBuildId}/assets/app.js`,
+        headers: { Host: 'apps.askfluid.now' },
+      });
+      assert.equal(blocked.statusCode, 404);
+    }
+
+    const oldPreviewToken = createBuildPreviewToken(projectId, oldBuildId);
+    const oldWithPreview = await request(server, {
+      path: `/builds/${projectId}/${oldBuildId}/assets/app.js?previewToken=${encodeURIComponent(oldPreviewToken)}`,
+      headers: { Host: 'apps.askfluid.now' },
+    });
+    assert.equal(oldWithPreview.statusCode, 200);
+    assert.match(oldWithPreview.body, /old/);
+
+    const wrongPreviewToken = createBuildPreviewToken(projectId, buildId);
+    const oldWithWrongPreview = await request(server, {
+      path: `/builds/${projectId}/${oldBuildId}/assets/app.js?previewToken=${encodeURIComponent(wrongPreviewToken)}`,
+      headers: { Host: 'apps.askfluid.now' },
+    });
+    assert.equal(oldWithWrongPreview.statusCode, 404);
+  } finally {
+    ProjectBuild.findOne = originalProjectBuildFindOne;
+    Project.findById = originalProjectFindById;
+    if (server) {
+      await close(server);
+    }
+    await fs.rm(path.join(buildRoot, projectId), { recursive: true, force: true });
+    await fs.rm(path.join(buildRoot, unpublishedProjectId), { recursive: true, force: true });
   }
 });
 

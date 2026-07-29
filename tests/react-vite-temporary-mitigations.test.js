@@ -20,10 +20,12 @@ const {
   publishValidatedDist,
   extractZipSafely,
   fixDistBuildAssetPaths,
+  normalizeDistStaticLocalAssetReferences,
   runLocalBinCommand,
   runNpmCommand,
   runNpxCommand,
   validateDistDirectory,
+  validateDistStaticLocalAssetReferences,
 } = reactViteBuildHelpers;
 
 async function makeTempDir(name) {
@@ -335,6 +337,7 @@ test('dist asset path fix rewrites root-relative CSS font assets relative to eac
         '.data{src:url(data:font/woff2;base64,AAAA)}',
       ].join('\n')
     );
+    await fs.writeFile(path.join(dist, 'assets', 'app.js'), 'console.log("ok");');
     await fs.writeFile(
       path.join(dist, 'styles', 'theme.css'),
       '@font-face{font-family:"C";src:url("/assets/dm-sans-latin-500-normal.woff2") format("woff2")}'
@@ -343,6 +346,17 @@ test('dist asset path fix rewrites root-relative CSS font assets relative to eac
       path.join(dist, 'assets', 'nested', 'theme.css'),
       '@font-face{font-family:"D";src:url("/assets/dm-sans-latin-600-normal.woff2") format("woff2")}'
     );
+    for (const assetPath of [
+      'assets/manrope-latin-700-normal.woff2',
+      'assets/dm-sans-latin-400-normal.woff',
+      'assets/imported.css',
+      'assets/kept.woff2',
+      'assets/kept.woff',
+      'assets/dm-sans-latin-500-normal.woff2',
+      'assets/dm-sans-latin-600-normal.woff2',
+    ]) {
+      await fs.writeFile(path.join(dist, assetPath), 'asset');
+    }
 
     const changedPaths = await fixDistBuildAssetPaths(dist);
 
@@ -373,6 +387,127 @@ test('dist asset path fix rewrites root-relative CSS font assets relative to eac
     assert.equal(
       await fs.readFile(path.join(dist, 'assets', 'nested', 'theme.css'), 'utf8'),
       '@font-face{font-family:"D";src:url("../dm-sans-latin-600-normal.woff2") format("woff2")}'
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('dist asset normalization aliases browser-resolved JS and CSS references', async () => {
+  const root = await makeTempDir('fluid-dist-asset-alias');
+
+  try {
+    const dist = path.join(root, 'dist');
+    await fs.mkdir(path.join(dist, 'assets'), { recursive: true });
+    await fs.mkdir(path.join(dist, 'images'), { recursive: true });
+    await fs.mkdir(path.join(dist, 'fonts'), { recursive: true });
+    await fs.writeFile(
+      path.join(dist, 'index.html'),
+      '<link rel="stylesheet" href="./assets/index.css"><script type="module" src="./assets/index.js"></script><img src="./images/logo.png">'
+    );
+    await fs.writeFile(
+      path.join(dist, 'assets', 'index.js'),
+      [
+        'import "./chunk-BTpeSTNa.js";',
+        'const hero = `./images/hero.png?v=1#x`;',
+        'const external = "https://cdn.example/remote.png";',
+        'document.body.dataset.hero = hero;',
+      ].join('\n')
+    );
+    await fs.writeFile(path.join(dist, 'assets', 'chunk-BTpeSTNa.js'), 'export const ok = true;\n');
+    await fs.writeFile(
+      path.join(dist, 'assets', 'index.css'),
+      [
+        '@font-face{font-family:"A";src:url("./fonts/font.woff2?v=1#font") format("woff2")}',
+        '.hero{background:url("data:image/png;base64,AAAA")}',
+        '.external{background:url(https://cdn.example/remote.png)}',
+      ].join('\n')
+    );
+    await fs.writeFile(path.join(dist, 'images', 'hero.png'), 'hero');
+    await fs.writeFile(path.join(dist, 'images', 'logo.png'), 'logo');
+    await fs.writeFile(path.join(dist, 'fonts', 'font.woff2'), 'font');
+
+    const changedPaths = await fixDistBuildAssetPaths(dist);
+
+    assert.deepEqual(
+      changedPaths.sort(),
+      ['assets/fonts/font.woff2', 'assets/images/hero.png'].sort()
+    );
+    assert.equal(await fs.readFile(path.join(dist, 'assets', 'images', 'hero.png'), 'utf8'), 'hero');
+    assert.equal(await fs.readFile(path.join(dist, 'assets', 'fonts', 'font.woff2'), 'utf8'), 'font');
+    assert.match(
+      await fs.readFile(path.join(dist, 'assets', 'index.js'), 'utf8'),
+      /`\.\/images\/hero\.png\?v=1#x`/
+    );
+    assert.match(await fs.readFile(path.join(dist, 'assets', 'index.js'), 'utf8'), /chunk-BTpeSTNa/);
+    const validation = await validateDistStaticLocalAssetReferences(dist);
+    assert.ok(validation.files.some((file) => file.relativePath === 'assets/images/hero.png'));
+    assert.ok(validation.files.some((file) => file.relativePath === 'assets/fonts/font.woff2'));
+    assert.deepEqual(await fixDistBuildAssetPaths(dist), []);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('dist asset normalization rejects traversal and conflicting aliases', async () => {
+  const traversalRoot = await makeTempDir('fluid-dist-traversal-ref');
+  const conflictRoot = await makeTempDir('fluid-dist-conflict-ref');
+
+  try {
+    const traversalDist = path.join(traversalRoot, 'dist');
+    await fs.mkdir(path.join(traversalDist, 'assets'), { recursive: true });
+    await fs.writeFile(path.join(traversalDist, 'index.html'), '<script src="./assets/app.js"></script>');
+    await fs.writeFile(path.join(traversalDist, 'assets', 'app.js'), 'const escape = "../../outside.png";');
+
+    await assert.rejects(
+      fixDistBuildAssetPaths(traversalDist),
+      (error) => error.code === 'INVALID_DIST_ASSET_REFERENCE' &&
+        error.sourceArtifactPath === 'assets/app.js' &&
+        error.originalReference === '../../outside.png'
+    );
+
+    const conflictDist = path.join(conflictRoot, 'dist');
+    await fs.mkdir(path.join(conflictDist, 'assets', 'images'), { recursive: true });
+    await fs.mkdir(path.join(conflictDist, 'images'), { recursive: true });
+    await fs.writeFile(path.join(conflictDist, 'index.html'), '<script src="./assets/app.js"></script>');
+    await fs.writeFile(path.join(conflictDist, 'assets', 'app.js'), 'const hero = "./images/hero.png";');
+    await fs.writeFile(path.join(conflictDist, 'images', 'hero.png'), 'root hero');
+    await fs.writeFile(path.join(conflictDist, 'assets', 'images', 'hero.png'), 'different hero');
+
+    await assert.rejects(
+      normalizeDistStaticLocalAssetReferences(conflictDist),
+      (error) => error.code === 'INVALID_DIST_ASSET_REFERENCE' &&
+        /conflita/.test(error.message)
+    );
+  } finally {
+    await fs.rm(traversalRoot, { recursive: true, force: true });
+    await fs.rm(conflictRoot, { recursive: true, force: true });
+  }
+});
+
+test('dist asset validation reports missing local references and ignores external schemes', async () => {
+  const root = await makeTempDir('fluid-dist-missing-ref');
+
+  try {
+    const dist = path.join(root, 'dist');
+    await fs.mkdir(path.join(dist, 'assets'), { recursive: true });
+    await fs.writeFile(path.join(dist, 'index.html'), '<script src="./assets/app.js"></script>');
+    await fs.writeFile(
+      path.join(dist, 'assets', 'app.js'),
+      [
+        'const missing = "./images/missing.png";',
+        'const external = "https://cdn.example/missing.png";',
+        'const data = "data:image/png;base64,AAAA";',
+        'const blob = "blob:https://example.test/id";',
+      ].join('\n')
+    );
+
+    await assert.rejects(
+      fixDistBuildAssetPaths(dist),
+      (error) => error.code === 'INVALID_DIST_ASSET_REFERENCE' &&
+        error.sourceArtifactPath === 'assets/app.js' &&
+        error.originalReference === './images/missing.png' &&
+        error.resolvedArtifactPath === 'assets/images/missing.png'
     );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
