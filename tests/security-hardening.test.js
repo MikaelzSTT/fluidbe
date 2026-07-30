@@ -632,6 +632,139 @@ test('clean publication still marks the selected draft build as done', async () 
   }
 });
 
+test('publication repairs stale project pointer for an exact done build', async () => {
+  const originalProjectBuildFindOne = ProjectBuild.findOne;
+  const originalProjectBuildFindOneAndUpdate = ProjectBuild.findOneAndUpdate;
+  const originalProjectFindByIdAndUpdate = Project.findByIdAndUpdate;
+  const originalProjectExists = Project.exists;
+  const originalBuildJobFindOne = BuildJob.findOne;
+  const projectId = '64f000000000000000000026';
+  const oldBuildId = '64f000000000000000000027';
+  const newBuildId = '64f000000000000000000028';
+  const project = {
+    _id: projectId,
+    slug: 'repair-app',
+    isPublished: true,
+    latestPublishedBuildId: oldBuildId,
+  };
+  const doneBuild = {
+    _id: newBuildId,
+    projectId,
+    status: 'done',
+    type: 'react_vite',
+    previewUrl: `/builds/${projectId}/${newBuildId}/index.html`,
+    buildUrl: `/builds/${projectId}/${newBuildId}/index.html`,
+    distUrl: `/builds/${projectId}/${newBuildId}/index.html`,
+    deployUrl: `/builds/${projectId}/${newBuildId}/index.html`,
+    fullHtml: '<main>repaired build</main>',
+  };
+  let buildStatusUpdateCalled = false;
+  let buildJobQueried = false;
+
+  try {
+    ProjectBuild.findOne = () => ({
+      select: async () => ({ fullHtml: doneBuild.fullHtml }),
+    });
+    ProjectBuild.findOneAndUpdate = async () => {
+      buildStatusUpdateCalled = true;
+      throw new Error('done build should not be transitioned again');
+    };
+    Project.findByIdAndUpdate = async (id, update) => {
+      assert.equal(String(id), projectId);
+      assert.equal(update.isPublished, true);
+      assert.equal(String(update.latestPublishedBuildId), newBuildId);
+      assert.equal(String(update.build._id), newBuildId);
+      assert.equal(update.build.status, 'done');
+      assert.match(update.buildUrl, new RegExp(`${newBuildId}/index\\.html$`));
+      return {
+        ...project,
+        ...update,
+        publicUrl: 'https://apps.askfluid.now/p/repair-app',
+      };
+    };
+    Project.exists = async () => false;
+    BuildJob.findOne = () => {
+      buildJobQueried = true;
+      throw new Error('done build should not require BuildJob lookup');
+    };
+
+    const result = await publishProjectBuild({
+      req: {
+        protocol: 'https',
+        get: () => 'backend.example.test',
+      },
+      project,
+      projectBuild: doneBuild,
+      body: {},
+    });
+
+    assert.equal(result.alreadyPublished, false);
+    assert.equal(String(result.publishedBuild._id), newBuildId);
+    assert.equal(result.publishedBuild.status, 'done');
+    assert.equal(buildStatusUpdateCalled, false);
+    assert.equal(buildJobQueried, false);
+  } finally {
+    ProjectBuild.findOne = originalProjectBuildFindOne;
+    ProjectBuild.findOneAndUpdate = originalProjectBuildFindOneAndUpdate;
+    Project.findByIdAndUpdate = originalProjectFindByIdAndUpdate;
+    Project.exists = originalProjectExists;
+    BuildJob.findOne = originalBuildJobFindOne;
+  }
+});
+
+test('republishing the exact latest done build remains idempotent', async () => {
+  const originalProjectBuildFindOneAndUpdate = ProjectBuild.findOneAndUpdate;
+  const originalProjectFindByIdAndUpdate = Project.findByIdAndUpdate;
+  const projectId = '64f00000000000000000002a';
+  const buildId = '64f00000000000000000002b';
+  const project = {
+    _id: projectId,
+    slug: 'idempotent-app',
+    isPublished: true,
+    latestPublishedBuildId: buildId,
+  };
+  const build = {
+    _id: buildId,
+    projectId,
+    status: 'done',
+    type: 'react_vite',
+    previewUrl: `/builds/${projectId}/${buildId}/index.html`,
+    buildUrl: `/builds/${projectId}/${buildId}/index.html`,
+    fullHtml: '<main>already public</main>',
+  };
+  let buildStatusUpdateCalled = false;
+  let projectUpdateCalled = false;
+
+  try {
+    ProjectBuild.findOneAndUpdate = async () => {
+      buildStatusUpdateCalled = true;
+      throw new Error('already published build should not transition status');
+    };
+    Project.findByIdAndUpdate = async () => {
+      projectUpdateCalled = true;
+      throw new Error('metadata-free idempotent publish should not update project');
+    };
+
+    const result = await publishProjectBuild({
+      req: {
+        protocol: 'https',
+        get: () => 'backend.example.test',
+      },
+      project,
+      projectBuild: build,
+      body: {},
+    });
+
+    assert.equal(result.alreadyPublished, true);
+    assert.equal(String(result.publishedBuild._id), buildId);
+    assert.equal(buildStatusUpdateCalled, false);
+    assert.equal(projectUpdateCalled, false);
+  } finally {
+    ProjectBuild.findOneAndUpdate = originalProjectBuildFindOneAndUpdate;
+    Project.findByIdAndUpdate = originalProjectFindByIdAndUpdate;
+  }
+});
+
 test('publication updates project from the exact reviewed build only', async () => {
   const originalProjectBuildFindOne = ProjectBuild.findOne;
   const originalProjectBuildFindOneAndUpdate = ProjectBuild.findOneAndUpdate;

@@ -190,9 +190,14 @@ function generatedPreviewHost(publicHostKey) {
   return `pv-${publicHostKey}.fluidapps.dev`;
 }
 
+function generatedPublishedHost(publicHostKey) {
+  return `app-${publicHostKey}.fluidapps.dev`;
+}
+
 async function writeBuild(projectId, buildId, label) {
   const root = path.join(PUBLIC_BUILDS_DIR, projectId, buildId);
   await fs.mkdir(path.join(root, 'assets'), { recursive: true });
+  await fs.mkdir(path.join(root, 'assets', 'images'), { recursive: true });
   await fs.mkdir(path.join(root, 'images'), { recursive: true });
   await fs.writeFile(
     path.join(root, 'index.html'),
@@ -285,6 +290,11 @@ async function writeBuild(projectId, buildId, label) {
   await fs.writeFile(path.join(root, 'assets', 'font.woff'), Buffer.from('font-woff-bytes'));
   await fs.writeFile(path.join(root, 'assets', 'root-font.woff2'), Buffer.from('root-font-bytes'));
   await fs.writeFile(path.join(root, 'images', 'logo.png'), Buffer.from([
+    0x89, 0x50, 0x4e, 0x47,
+    0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00,
+  ]));
+  await fs.writeFile(path.join(root, 'assets', 'images', 'logo.png'), Buffer.from([
     0x89, 0x50, 0x4e, 0x47,
     0x0d, 0x0a, 0x1a, 0x0a,
     0x00, 0x00, 0x00, 0x00,
@@ -788,12 +798,60 @@ test('published build on pv host still requires preview capability', async () =>
   assert.equal(projectFindByIdCalls, 0);
 });
 
-test('unknown, malformed, and app generated hosts return uniform 404 responses', async () => {
+test('generated published host serves only the exact latest published build', async () => {
+  const index = await request({
+    path: '/',
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const jsAsset = await request({
+    path: '/assets/app.js',
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const nestedImageAlias = await request({
+    path: '/assets/images/logo.png',
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const explicitLatest = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.js'),
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const oldBuild = await request({
+    path: `${buildPath(PROJECT_A_ID, BUILD_A_NEWER_ID, 'assets/app.js')}?previewToken=${validToken(PROJECT_A_ID, BUILD_A_NEWER_ID)}`,
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const unpublishedProject = await request({
+    path: '/',
+    headers: { Host: generatedPublishedHost(PROJECT_B_KEY) },
+  });
+  const controlRoute = await request({
+    path: '/api/auth/me',
+    headers: {
+      Host: generatedPublishedHost(PROJECT_A_KEY),
+      Cookie: 'fluid_session=owner-session',
+    },
+  });
+
+  assert.equal(index.statusCode, 200);
+  assert.match(index.body, /project-a-requested/);
+  assert.equal((index.body.match(/previewToken=existing/g) || []).length, 1);
+  assert.equal(index.headers['set-cookie'], undefined);
+  assert.match(index.headers['content-security-policy'], /default-src 'none'/);
+  assert.equal(jsAsset.statusCode, 200);
+  assert.match(jsAsset.body, /project-a-requested/);
+  assert.doesNotMatch(jsAsset.body, /previewToken=/);
+  assert.equal(nestedImageAlias.statusCode, 200);
+  assert.equal(nestedImageAlias.headers['content-type'], 'image/png');
+  assert.equal(explicitLatest.statusCode, 200);
+  assert.equal(oldBuild.statusCode, 404);
+  assert.equal(unpublishedProject.statusCode, 404);
+  assert.equal(controlRoute.statusCode, 404);
+});
+
+test('unknown and malformed generated hosts return uniform 404 responses', async () => {
   const unknownKey = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const hosts = [
     generatedPreviewHost(unknownKey),
     'pv-abc.fluidapps.dev',
-    `app-${PROJECT_A_KEY}.fluidapps.dev`,
   ];
   const responses = [];
 

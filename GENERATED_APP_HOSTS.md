@@ -51,13 +51,13 @@ context. Unknown keys return a uniform not-found result. Database failures use
 a distinct internal error and map to the same non-disclosing public response as
 unknown generated hosts.
 
-## Private preview serving
+## Generated serving
 
-Only canonical `pv-*` hosts are enabled. They accept `GET`, `HEAD`, and
-`OPTIONS` for the existing `/builds/:projectId/:buildKey/*` path family. The
-host-resolved project must equal the path project before build lookup or
-artifact access. All other paths, unresolved hosts, and every `app-*` host
-return the same 404 surface.
+Canonical `pv-*` hosts accept `GET`, `HEAD`, and `OPTIONS` for the existing
+`/builds/:projectId/:buildKey/*` path family. The host-resolved project must
+equal the path project before build lookup or artifact access. Unknown hosts,
+malformed hosts, foreign project paths, and unsupported routes return the same
+404 surface.
 
 The preview host never treats publication or Fluid owner identity as preview
 authorization. The existing signed `previewToken`, bound to the exact project,
@@ -66,6 +66,13 @@ After a valid query capability, `fluid_build_preview` is set as `HttpOnly`,
 `Secure`, `SameSite=Lax`, without a `Domain` attribute, and with a path scoped
 to that exact build. Existing `preview.askfluid.now` and normal `/builds`
 authorization behavior remain unchanged.
+
+Canonical `app-*` hosts serve only published projects. A request is scoped to
+the host-resolved project and its exact `latestPublishedBuildId`; old builds,
+drafts, unpublished projects, and foreign project/build pairs return 404. `/`
+maps to that build's `index.html`, `/assets/...` and other artifact paths map
+under the same exact build, and explicit `/builds/:projectId/:buildKey/*`
+requests must already name that exact current build.
 
 ## Preview capability propagation
 

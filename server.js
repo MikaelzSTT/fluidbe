@@ -668,6 +668,69 @@ function sendGeneratedAppNotFound(req, res) {
   return res.sendStatus(404);
 }
 
+function resolveGeneratedPublishedBuildRequest(context, originalUrl) {
+  if (
+    !context ||
+    context.type !== 'published' ||
+    context.isPublished !== true ||
+    !mongoose.isObjectIdOrHexString(context.latestPublishedBuildId)
+  ) {
+    return null;
+  }
+
+  const explicitBuildPath = parseBuildRequestPath(originalUrl);
+
+  if (explicitBuildPath) {
+    if (
+      explicitBuildPath.projectId !== context.projectId ||
+      explicitBuildPath.buildKey !== context.latestPublishedBuildId
+    ) {
+      return null;
+    }
+
+    return {
+      parsedPath: explicitBuildPath,
+      requestUrl: `${explicitBuildPath.pathname}${explicitBuildPath.search || ''}`,
+    };
+  }
+
+  let url;
+
+  try {
+    url = new URL(originalUrl, 'http://localhost');
+  } catch (error) {
+    return null;
+  }
+
+  let pathname;
+
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch (error) {
+    return null;
+  }
+
+  if (!pathname || pathname.startsWith('/api/') || pathname === '/api') {
+    return null;
+  }
+
+  const artifactPath = pathname === '/'
+    ? 'index.html'
+    : pathname.replace(/^\/+/, '');
+  const parsedPath = parseBuildRequestPath(
+    `/builds/${context.projectId}/${context.latestPublishedBuildId}/${artifactPath}${url.search}`
+  );
+
+  if (!parsedPath) {
+    return null;
+  }
+
+  return {
+    parsedPath,
+    requestUrl: `${parsedPath.pathname}${parsedPath.search || ''}`,
+  };
+}
+
 async function generatedAppHostOnly(req, res, next) {
   let resolution;
 
@@ -694,22 +757,36 @@ async function generatedAppHostOnly(req, res, next) {
 
   const context = resolution.context;
 
-  if (context.type !== 'preview') {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return sendGeneratedAppNotFound(req, res);
   }
 
-  const parsedPath = parseBuildRequestPath(req.originalUrl);
+  if (context.type === 'preview') {
+    const parsedPath = parseBuildRequestPath(req.originalUrl);
 
-  if (
-    !['GET', 'HEAD', 'OPTIONS'].includes(req.method)
-    || !parsedPath
-    || parsedPath.projectId !== context.projectId
-  ) {
+    if (!parsedPath || parsedPath.projectId !== context.projectId) {
+      return sendGeneratedAppNotFound(req, res);
+    }
+
+    req.generatedAppContext = context;
+    req.generatedAppBuildPath = parsedPath;
+    applyPreviewHostHeaders(req, res);
+    return next();
+  }
+
+  if (context.type !== 'published') {
+    return sendGeneratedAppNotFound(req, res);
+  }
+
+  const publishedRequest = resolveGeneratedPublishedBuildRequest(context, req.originalUrl);
+
+  if (!publishedRequest) {
     return sendGeneratedAppNotFound(req, res);
   }
 
   req.generatedAppContext = context;
-  req.generatedAppBuildPath = parsedPath;
+  req.generatedAppBuildPath = publishedRequest.parsedPath;
+  req.url = publishedRequest.requestUrl;
   applyPreviewHostHeaders(req, res);
   return next();
 }

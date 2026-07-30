@@ -191,14 +191,14 @@ function assertPublishBuildIdentity(project, projectBuild, options = {}) {
       : options.alreadyPublished;
 
   if (projectBuild.status === 'done' && !alreadyPublished) {
-    throw createHttpError(409, {
-      message: 'Build já está concluído, mas não é o build publicado deste projeto.',
-      code: 'BUILD_NOT_READY_FOR_PUBLICATION',
-      buildStatus: projectBuild.status,
-    });
-  }
-
-  if (projectBuild.status !== 'draft' && !alreadyPublished) {
+    if (options.allowDonePublication !== true) {
+      throw createHttpError(409, {
+        message: 'Build já está concluído, mas não é o build publicado deste projeto.',
+        code: 'BUILD_NOT_READY_FOR_PUBLICATION',
+        buildStatus: projectBuild.status,
+      });
+    }
+  } else if (projectBuild.status !== 'draft' && !alreadyPublished) {
     throw createHttpError(409, {
       message: 'Apenas builds em draft podem ser publicados.',
       code: 'BUILD_NOT_READY_FOR_PUBLICATION',
@@ -695,7 +695,10 @@ function assertBuildSecurityAllowsPublication(projectBuild) {
 async function publishProjectBuild({ req, project, projectBuild, body }) {
   const publishMetadataUpdate = buildPublishMetadataUpdate(body);
   const isAlreadyPublishedBuild = isProjectBuildExplicitlyPublished(project, projectBuild);
-  assertPublishBuildIdentity(project, projectBuild, { alreadyPublished: isAlreadyPublishedBuild });
+  assertPublishBuildIdentity(project, projectBuild, {
+    alreadyPublished: isAlreadyPublishedBuild,
+    allowDonePublication: true,
+  });
 
   if (isAlreadyPublishedBuild) {
     assertBuildSecurityAllowsPublication(projectBuild);
@@ -730,7 +733,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
 
   let buildJob = null;
 
-  if (projectBuild.buildJobId) {
+  if (projectBuild.status === 'draft' && projectBuild.buildJobId) {
     buildJob = await BuildJob.findOne({
       _id: projectBuild.buildJobId,
       projectBuildId: projectBuild._id,
@@ -743,7 +746,7 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
         code: 'BUILD_JOB_LINK_INVALID',
       });
     }
-  } else {
+  } else if (projectBuild.status === 'draft') {
     buildJob = await BuildJob.findOne({
       projectBuildId: projectBuild._id,
       projectId: project._id,
@@ -769,22 +772,27 @@ async function publishProjectBuild({ req, project, projectBuild, body }) {
     });
   }
 
-  const publishedBuild = await ProjectBuild.findOneAndUpdate(
-    {
-      _id: projectBuild._id,
-      projectId: project._id,
-      status: 'draft',
-    },
-    { $set: { status: 'done' } },
-    { new: true, runValidators: true }
-  );
+  let publishedBuild = projectBuild;
 
-  if (!publishedBuild) {
-    throw createHttpError(409, {
-      message: 'O estado do build mudou antes da publicação. Atualize e tente novamente.',
-      code: 'BUILD_STATUS_CHANGED',
-    });
+  if (projectBuild.status === 'draft') {
+    publishedBuild = await ProjectBuild.findOneAndUpdate(
+      {
+        _id: projectBuild._id,
+        projectId: project._id,
+        status: 'draft',
+      },
+      { $set: { status: 'done' } },
+      { new: true, runValidators: true }
+    );
+
+    if (!publishedBuild) {
+      throw createHttpError(409, {
+        message: 'O estado do build mudou antes da publicação. Atualize e tente novamente.',
+        code: 'BUILD_STATUS_CHANGED',
+      });
+    }
   }
+
   assertPublishBuildIdentity(project, publishedBuild, { alreadyPublished: true });
 
   const update = { ...publishMetadataUpdate };
