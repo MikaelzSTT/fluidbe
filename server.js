@@ -960,6 +960,26 @@ function injectTagIntoHead(html, tag) {
   return `${headBlock}\n${html}`;
 }
 
+function injectPublishedBaseHref(html, buildUrl) {
+  if (typeof html !== 'string' || !html || typeof buildUrl !== 'string' || !buildUrl) {
+    return html || '';
+  }
+
+  const parsedPath = parseBuildPathFromUrl(buildUrl);
+
+  if (!parsedPath) {
+    return html;
+  }
+
+  const baseHref = escapeHtmlAttribute(
+    parsedPath.pathname.replace(/\/index\.html$/, '/')
+  );
+  const baseTag = `<base href="${baseHref}">`;
+  const withoutExistingBase = html.replace(/<base\b[^>]*>/gi, '');
+
+  return injectTagIntoHead(withoutExistingBase, baseTag);
+}
+
 function upsertHeadTag(html, matcher, tag) {
   return injectTagIntoHead(html.replace(matcher, ''), tag);
 }
@@ -1468,7 +1488,7 @@ async function loadPublishedHtml(project) {
   const buildUrl = build.buildUrl || build.deployUrl || build.previewUrl || build.distUrl || '';
 
   if (inlineHtml) {
-    return rewriteBuildAssetPaths(inlineHtml, buildUrl);
+    return injectPublishedBaseHref(rewriteBuildAssetPaths(inlineHtml, buildUrl), buildUrl);
   }
 
   const mongoArtifact = await findMongoBuildArtifact(buildUrl, build._id);
@@ -1478,7 +1498,7 @@ async function loadPublishedHtml(project) {
       ? mongoArtifact.body.toString('utf8')
       : String(mongoArtifact.body || '');
 
-    return rewriteBuildAssetPaths(artifactHtml, buildUrl);
+    return injectPublishedBaseHref(rewriteBuildAssetPaths(artifactHtml, buildUrl), buildUrl);
   }
 
   const indexPath = resolvePublicBuildIndexPath(buildUrl);
@@ -1489,7 +1509,7 @@ async function loadPublishedHtml(project) {
 
   try {
     const fileHtml = await fs.readFile(indexPath, 'utf8');
-    return rewriteBuildAssetPaths(fileHtml, buildUrl);
+    return injectPublishedBaseHref(rewriteBuildAssetPaths(fileHtml, buildUrl), buildUrl);
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       return '';
@@ -1497,6 +1517,19 @@ async function loadPublishedHtml(project) {
 
     throw error;
   }
+}
+
+function allowPublishedBaseHrefCsp(res) {
+  const csp = String(res.getHeader('Content-Security-Policy') || '');
+
+  if (!csp) {
+    return;
+  }
+
+  res.setHeader(
+    'Content-Security-Policy',
+    csp.replace("base-uri 'none'", "base-uri 'self'")
+  );
 }
 
 // Render encaminha requisições por um proxy; assim req.ip representa o cliente.
@@ -1607,6 +1640,7 @@ app.get('/p/:slug', async (req, res) => {
       return res.status(404).send('Projeto não encontrado.');
     }
 
+    allowPublishedBaseHrefCsp(res);
     return res.type('html').send(html);
   } catch (error) {
     return res.status(500).send('Erro ao carregar projeto publicado.');

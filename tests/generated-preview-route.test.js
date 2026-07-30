@@ -43,6 +43,7 @@ const MONGO_ENTRY_BODY = Buffer.from([
 const projectA = {
   _id: PROJECT_A_ID,
   publicHostKey: PROJECT_A_KEY,
+  slug: 'project-a',
   userId: '64f000000000000000000391',
   isPublished: true,
   latestPublishedBuildId: BUILD_A_ID,
@@ -51,6 +52,7 @@ const projectA = {
 const projectB = {
   _id: PROJECT_B_ID,
   publicHostKey: PROJECT_B_KEY,
+  slug: 'project-b',
   userId: '64f000000000000000000392',
   isPublished: false,
   latestPublishedBuildId: null,
@@ -146,6 +148,10 @@ function request(options = {}) {
 }
 
 function matchesBuildUrlQuery(build, query) {
+  if (!query.$or) {
+    return true;
+  }
+
   return (query.$or || []).some((condition) => {
     const [[field, expected]] = Object.entries(condition);
     const actual = build[field];
@@ -162,6 +168,7 @@ function findBuild(query) {
   return builds.find((build) => (
     String(build.projectId) === String(query.projectId)
     && (!query._id || String(build._id) === String(query._id))
+    && (!query.status || String(build.status) === String(query.status))
     && matchesBuildUrlQuery(build, query)
   )) || null;
 }
@@ -175,6 +182,9 @@ function queryResult(valueFactory) {
       return this;
     },
     lean: async () => valueFactory(),
+    then(resolve, reject) {
+      return Promise.resolve(valueFactory()).then(resolve, reject);
+    },
   };
 }
 
@@ -310,6 +320,13 @@ test.before(async () => {
   Project.findOne = (filter) => queryResult(() => {
     if (projectLookupError) {
       throw projectLookupError;
+    }
+
+    if (filter.slug) {
+      return [projectA, projectB].find((project) => (
+        project.slug === filter.slug &&
+        (filter.isPublished === undefined || project.isPublished === filter.isPublished)
+      )) || null;
     }
 
     return [projectA, projectB].find((project) => (
@@ -811,8 +828,16 @@ test('generated published host serves only the exact latest published build', as
     path: '/assets/images/logo.png',
     headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
   });
+  const localLatestImage = await request({
+    path: '/images/logo.png',
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
   const explicitLatest = await request({
     path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'assets/app.js'),
+    headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
+  });
+  const explicitLatestImage = await request({
+    path: buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png'),
     headers: { Host: generatedPublishedHost(PROJECT_A_KEY) },
   });
   const oldBuild = await request({
@@ -841,10 +866,50 @@ test('generated published host serves only the exact latest published build', as
   assert.doesNotMatch(jsAsset.body, /previewToken=/);
   assert.equal(nestedImageAlias.statusCode, 200);
   assert.equal(nestedImageAlias.headers['content-type'], 'image/png');
+  assert.equal(localLatestImage.statusCode, 200);
+  assert.equal(localLatestImage.headers['content-type'], 'image/png');
   assert.equal(explicitLatest.statusCode, 200);
+  assert.equal(explicitLatestImage.statusCode, 200);
+  assert.equal(explicitLatestImage.headers['content-type'], 'image/png');
   assert.equal(oldBuild.statusCode, 404);
   assert.equal(unpublishedProject.statusCode, 404);
   assert.equal(controlRoute.statusCode, 404);
+});
+
+test('published slug page resolves runtime relative local assets to latest build without preview capability', async () => {
+  const page = await request({
+    path: '/p/project-a',
+    headers: { Host: 'preview.askfluid.now' },
+  });
+
+  assert.equal(page.statusCode, 200);
+  assert.match(page.body, new RegExp(`<base href="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/">`));
+  assert.match(page.body, new RegExp(`src="\\/builds\\/${PROJECT_A_ID}\\/${BUILD_A_ID}\\/assets\\/app\\.js"`));
+  assert.equal(page.headers['set-cookie'], undefined);
+  assert.match(page.headers['content-security-policy'], /base-uri 'self'/);
+  assert.doesNotMatch(page.headers['content-security-policy'], /base-uri 'none'/);
+
+  const baseHref = page.body.match(/<base href="([^"]+)"/)[1];
+  const resolvedRuntimeImagePath = new URL(
+    './images/logo.png',
+    `https://preview.askfluid.now${baseHref}`
+  ).pathname;
+  const image = await request({
+    path: resolvedRuntimeImagePath,
+    headers: { Host: 'preview.askfluid.now' },
+  });
+  const missingImage = await request({
+    path: new URL(
+      './images/missing.png',
+      `https://preview.askfluid.now${baseHref}`
+    ).pathname,
+    headers: { Host: 'preview.askfluid.now' },
+  });
+
+  assert.equal(resolvedRuntimeImagePath, buildPath(PROJECT_A_ID, BUILD_A_ID, 'images/logo.png'));
+  assert.equal(image.statusCode, 200);
+  assert.equal(image.headers['content-type'], 'image/png');
+  assert.equal(missingImage.statusCode, 404);
 });
 
 test('unknown and malformed generated hosts return uniform 404 responses', async () => {
