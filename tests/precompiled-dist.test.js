@@ -14,6 +14,7 @@ process.env.BUILD_WORKER_ENABLED = 'false';
 process.env.PREVIEW_BASE_URL = 'https://preview.askfluid.now';
 
 const adminRoutes = require('../routes/adminRoutes');
+const AdminAuditLog = require('../models/AdminAuditLog');
 const BuildJob = require('../models/BuildJob');
 const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
@@ -87,16 +88,23 @@ function close(server) {
 
 function request(server, options) {
   return new Promise((resolve, reject) => {
+    const body = options.body || null;
+    const headers = {
+      Host: 'preview.askfluid.now',
+      ...(options.headers || {}),
+    };
+
+    if (body && !headers['Content-Length'] && !headers['content-length']) {
+      headers['Content-Length'] = String(Buffer.byteLength(body));
+    }
+
     const req = http.request(
       {
         hostname: '127.0.0.1',
         port: server.address().port,
         method: 'GET',
         ...options,
-        headers: {
-          Host: 'preview.askfluid.now',
-          ...(options.headers || {}),
-        },
+        headers,
       },
       (res) => {
         const chunks = [];
@@ -113,8 +121,45 @@ function request(server, options) {
       }
     );
     req.on('error', reject);
-    req.end();
+    req.end(body || undefined);
   });
+}
+
+function multipartZipBody(fieldName, fileName, fileContent) {
+  const boundary = `fluid-precompiled-${crypto.randomBytes(8).toString('hex')}`;
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\n` +
+      'Content-Type: application/zip\r\n\r\n'
+    ),
+    fileContent,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+
+  return {
+    body,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
+function selectableValue(value) {
+  return {
+    select() {
+      return this;
+    },
+    sort() {
+      return this;
+    },
+    lean() {
+      return Promise.resolve(value && typeof value.toObject === 'function'
+        ? value.toObject({ getters: true, virtuals: true })
+        : value);
+    },
+    then(resolve, reject) {
+      return Promise.resolve(value).then(resolve, reject);
+    },
+  };
 }
 
 async function patchZipEntryName(zipPath, fromName, toName) {
@@ -152,6 +197,11 @@ function createResponse() {
   return {
     statusCode: 200,
     body: null,
+    headers: {},
+    set(name, value) {
+      this.headers[name.toLowerCase()] = value;
+      return this;
+    },
     status(statusCode) {
       this.statusCode = statusCode;
       return this;
@@ -173,6 +223,13 @@ function getFinalRouteHandler(routePath) {
 function getFinalGetRouteHandler(routePath) {
   const layer = adminRoutes.stack.find((item) => (
     item.route?.path === routePath && item.route?.methods?.get
+  ));
+  return layer.route.stack[layer.route.stack.length - 1].handle;
+}
+
+function getFinalAllRouteHandler(routePath) {
+  const layer = adminRoutes.stack.find((item) => (
+    item.route?.path === routePath && item.route?.methods?._all
   ));
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
@@ -774,4 +831,240 @@ test('Admin API exposes the workerless dist flow and keeps source ZIP worker-gat
   assert.equal(res.body.code, 'BUILD_WORKER_REQUIRED');
   assert.match(res.body.message, /dist pré-compilado/);
   assert.equal(fsSync.existsSync(uploadDir), false);
+});
+
+test('precompiled dist route returns JSON for unsupported methods', async () => {
+  const req = {
+    params: { id: String(new mongoose.Types.ObjectId()) },
+  };
+  const res = createResponse();
+
+  await getFinalAllRouteHandler('/projects/:id/react-vite/dist')(req, res);
+
+  assert.equal(res.statusCode, 405);
+  assert.equal(res.headers.allow, 'POST');
+  assert.equal(res.body.success, false);
+  assert.equal(res.body.code, 'METHOD_NOT_ALLOWED');
+  assert.match(res.body.message, /POST/);
+});
+
+test('precompiled dist upload persists normalized browser-resolved asset aliases', async () => {
+  const root = await makeTempDir('fluid-precompiled-route-alias');
+  const projectId = new mongoose.Types.ObjectId();
+  const oldBuildId = new mongoose.Types.ObjectId();
+  const draftBuildId = new mongoose.Types.ObjectId();
+  const foreignProjectId = new mongoose.Types.ObjectId();
+  const foreignBuildId = new mongoose.Types.ObjectId();
+  const zipPath = path.join(root, 'dist.zip');
+  const heroPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lP5VhQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+  const originalEnv = {
+    ADMIN_TOKEN: process.env.ADMIN_TOKEN,
+    ADMIN_TOKEN_LEGACY_ENABLED: process.env.ADMIN_TOKEN_LEGACY_ENABLED,
+    ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED: process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED,
+    BUILD_PREVIEW_SECRET: process.env.BUILD_PREVIEW_SECRET,
+  };
+  const originalAuditFindOne = AdminAuditLog.findOne;
+  const originalAuditCreate = AdminAuditLog.create;
+  const originalBuildFind = ProjectBuild.find;
+  const originalBuildFindById = ProjectBuild.findById;
+  const originalBuildFindOne = ProjectBuild.findOne;
+  const originalBuildSave = ProjectBuild.prototype.save;
+  const originalProjectFindById = Project.findById;
+  const originalProjectFindByIdAndUpdate = Project.findByIdAndUpdate;
+  const originalBuildDeleteOne = ProjectBuild.deleteOne;
+  const builds = new Map();
+  const projects = new Map();
+  let savedBuild = null;
+  let server = null;
+
+  const buildIndexUrl = (buildId) => `https://preview.askfluid.now/builds/${projectId}/${buildId}/index.html`;
+  const makeStoredBuild = ({ _id, projectId: ownerProjectId = projectId, status = 'done' }) => ({
+    _id,
+    projectId: ownerProjectId,
+    type: 'react_vite',
+    status,
+    previewUrl: `https://preview.askfluid.now/builds/${ownerProjectId}/${_id}/index.html`,
+    distUrl: `https://preview.askfluid.now/builds/${ownerProjectId}/${_id}/index.html`,
+    buildUrl: `https://preview.askfluid.now/builds/${ownerProjectId}/${_id}/index.html`,
+    deployUrl: `https://preview.askfluid.now/builds/${ownerProjectId}/${_id}/index.html`,
+    artifactFiles: [
+      {
+        relativePath: 'index.html',
+        path: 'index.html',
+        mimeType: 'text/html; charset=utf-8',
+        contentType: 'text/html; charset=utf-8',
+        encoding: 'base64',
+        content: Buffer.from('<!doctype html><div>stored</div>').toString('base64'),
+      },
+    ],
+  });
+  const normalizeBuild = (build) => (build && typeof build.toObject === 'function'
+    ? build.toObject({ getters: true, virtuals: true })
+    : build);
+  const buildMatchesQuery = (build, query = {}) => {
+    if (!build) return false;
+    if (query._id && String(build._id) !== String(query._id)) return false;
+    if (query.projectId && String(build.projectId) !== String(query.projectId)) return false;
+    if (!Array.isArray(query.$or)) return true;
+
+    return query.$or.some((condition) => Object.entries(condition).some(([field, expected]) => {
+      const value = build[field];
+      if (expected instanceof RegExp) return expected.test(String(value || ''));
+      return String(value || '') === String(expected);
+    }));
+  };
+  const findBuilds = (query = {}) => Array.from(builds.values())
+    .map(normalizeBuild)
+    .filter((build) => buildMatchesQuery(build, query));
+
+  try {
+    await writeZip(zipPath, [
+      { name: 'index.html', content: '<!doctype html><script type="module" src="./assets/index.js"></script><div id="root"></div>' },
+      { name: 'assets/index.js', content: 'const hero = "./images/hero.png"; document.body.dataset.hero = hero;' },
+      { name: 'images/hero.png', content: heroPng },
+    ]);
+
+    projects.set(String(projectId), {
+      _id: projectId,
+      userId: new mongoose.Types.ObjectId(),
+      isPublished: false,
+      latestPublishedBuildId: oldBuildId,
+      name: 'Alias Route Test',
+      slug: 'alias-route-test',
+      reactVite: true,
+    });
+    projects.set(String(foreignProjectId), {
+      _id: foreignProjectId,
+      userId: new mongoose.Types.ObjectId(),
+      isPublished: false,
+      latestPublishedBuildId: null,
+      name: 'Foreign',
+      slug: 'foreign',
+      reactVite: true,
+    });
+    builds.set(String(oldBuildId), makeStoredBuild({ _id: oldBuildId, status: 'done' }));
+    builds.set(String(draftBuildId), makeStoredBuild({ _id: draftBuildId, status: 'draft' }));
+    builds.set(
+      String(foreignBuildId),
+      makeStoredBuild({ _id: foreignBuildId, projectId: foreignProjectId, status: 'done' })
+    );
+
+    process.env.ADMIN_TOKEN = 'precompiled-route-alias-token';
+    process.env.ADMIN_TOKEN_LEGACY_ENABLED = 'true';
+    process.env.ADMIN_TOKEN_LEGACY_CRITICAL_ENABLED = 'true';
+    process.env.BUILD_PREVIEW_SECRET = 'precompiled-route-alias-preview-secret';
+
+    AdminAuditLog.findOne = () => selectableValue(null);
+    AdminAuditLog.create = async () => ({ _id: new mongoose.Types.ObjectId() });
+    Project.findById = (id) => selectableValue(projects.get(String(id)) || null);
+    Project.findByIdAndUpdate = async (id, update) => {
+      const project = projects.get(String(id));
+      Object.assign(project, update);
+      return project;
+    };
+    ProjectBuild.deleteOne = async ({ _id }) => {
+      builds.delete(String(_id));
+      return { deletedCount: 1 };
+    };
+    ProjectBuild.prototype.save = async function saveRouteBuild() {
+      savedBuild = this;
+      builds.set(String(this._id), this);
+      return this;
+    };
+    ProjectBuild.findById = (id) => selectableValue(normalizeBuild(builds.get(String(id))) || null);
+    ProjectBuild.findOne = (query = {}) => selectableValue(findBuilds(query)[0] || null);
+    ProjectBuild.find = (query = {}) => selectableValue(findBuilds(query));
+
+    server = await listen();
+    const uploadBody = multipartZipBody('file', 'dist.zip', await fs.readFile(zipPath));
+    const upload = await request(server, {
+      method: 'POST',
+      path: `/api/admin/projects/${projectId}/react-vite/dist`,
+      headers: {
+        Host: 'fluidbe.onrender.com',
+        Origin: 'https://askfluid.now',
+        'x-admin-token': process.env.ADMIN_TOKEN,
+        'Content-Type': uploadBody.contentType,
+      },
+      body: uploadBody.body,
+    });
+    const uploadJson = JSON.parse(upload.text);
+
+    assert.equal(upload.statusCode, 201);
+    assert.equal(uploadJson.flow, 'precompiled_dist');
+    assert.ok(savedBuild);
+    const newBuildId = String(savedBuild._id);
+    assert.notEqual(newBuildId, String(oldBuildId));
+
+    const savedPaths = savedBuild.artifactFiles.map((file) => file.relativePath).sort();
+    assert.ok(savedPaths.includes('images/hero.png'));
+    assert.ok(savedPaths.includes('assets/images/hero.png'));
+
+    const reloadedBuild = await ProjectBuild.findById(newBuildId).select('artifactFiles').lean();
+    const reloadedPaths = reloadedBuild.artifactFiles.map((file) => file.relativePath).sort();
+    assert.ok(reloadedPaths.includes('images/hero.png'));
+    assert.ok(reloadedPaths.includes('assets/images/hero.png'));
+
+    savedBuild.status = 'done';
+    const project = projects.get(String(projectId));
+    project.isPublished = true;
+    project.latestPublishedBuildId = savedBuild._id;
+    project.previewUrl = buildIndexUrl(newBuildId);
+    project.distUrl = buildIndexUrl(newBuildId);
+    project.buildUrl = buildIndexUrl(newBuildId);
+    project.deployUrl = buildIndexUrl(newBuildId);
+
+    const publicBuildDir = path.join(__dirname, '..', 'public', 'builds', String(projectId), newBuildId);
+    await fs.rm(publicBuildDir, { recursive: true, force: true });
+
+    for (const assetPath of ['images/hero.png', 'assets/images/hero.png']) {
+      const asset = await request(server, {
+        path: `/builds/${projectId}/${newBuildId}/${assetPath}`,
+        headers: { Host: 'preview.askfluid.now' },
+      });
+      assert.equal(asset.statusCode, 200);
+      assert.deepEqual(asset.body, heroPng);
+      assert.equal(asset.headers['content-type'], 'image/png');
+    }
+
+    const oldAsset = await request(server, {
+      path: `/builds/${projectId}/${oldBuildId}/index.html`,
+      headers: { Host: 'preview.askfluid.now' },
+    });
+    const draftAsset = await request(server, {
+      path: `/builds/${projectId}/${draftBuildId}/index.html`,
+      headers: { Host: 'preview.askfluid.now' },
+    });
+    const foreignAsset = await request(server, {
+      path: `/builds/${foreignProjectId}/${foreignBuildId}/index.html`,
+      headers: { Host: 'preview.askfluid.now' },
+    });
+
+    assert.equal(oldAsset.statusCode, 404);
+    assert.equal(draftAsset.statusCode, 404);
+    assert.equal(foreignAsset.statusCode, 404);
+  } finally {
+    if (server) {
+      await close(server).catch(() => {});
+    }
+    AdminAuditLog.findOne = originalAuditFindOne;
+    AdminAuditLog.create = originalAuditCreate;
+    ProjectBuild.find = originalBuildFind;
+    ProjectBuild.findById = originalBuildFindById;
+    ProjectBuild.findOne = originalBuildFindOne;
+    ProjectBuild.prototype.save = originalBuildSave;
+    ProjectBuild.deleteOne = originalBuildDeleteOne;
+    Project.findById = originalProjectFindById;
+    Project.findByIdAndUpdate = originalProjectFindByIdAndUpdate;
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(path.join(__dirname, '..', 'public', 'builds', String(projectId)), { recursive: true, force: true });
+    await fs.rm(path.join(__dirname, '..', 'storage', 'react-vite-builds', String(projectId)), { recursive: true, force: true });
+  }
 });

@@ -1459,7 +1459,9 @@ function runPrecompiledDistUpload(req, res, next) {
       await fs.rm(req.precompiledDistUploadDir, { recursive: true, force: true }).catch(() => {});
     }
 
-    return res.status(400).json({
+    const isFileSizeLimit = error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE';
+
+    return res.status(isFileSizeLimit ? 413 : 400).json({
       success: false,
       code: INVALID_PRECOMPILED_DIST_CODE,
       message: INVALID_PRECOMPILED_DIST_MESSAGE,
@@ -4096,6 +4098,15 @@ router.post(
     }
   }
 );
+
+router.all('/projects/:id/react-vite/dist', requireAdmin, validateProjectId, (req, res) => {
+  res.set('Allow', 'POST');
+  return res.status(405).json({
+    success: false,
+    code: 'METHOD_NOT_ALLOWED',
+    message: 'Use POST para enviar um dist React/Vite pré-compilado.',
+  });
+});
 
 router.post('/projects/:id/builds', requireAdmin, validateProjectId, async (req, res) => {
   try {

@@ -3511,8 +3511,8 @@ let adminSearchIndex = -1;
 
       async function readAdminAuthResponse(res) {
         try {
-          if (typeof res?.json === 'function') {
-            return await res.json();
+          if (typeof res?.text === 'function') {
+            return await readResponseSafely(res);
           }
         } catch (error) {
           return {};
@@ -3525,7 +3525,7 @@ let adminSearchIndex = -1;
       }
 
       function getAdminAuthErrorMessage(data, fallback) {
-        return data?.error || data?.message || fallback;
+        return getResponseErrorMessage(data, fallback);
       }
 
       function createAdminAuthError(message, status = 403, code = '') {
@@ -7018,7 +7018,8 @@ function clearAdminSearch() {
           message = 'Sessão admin expirada ou sem permissão. Faça login novamente no painel Admin.';
         }
 
-        const error = new Error(message || fallback);
+        const statusPrefix = status ? `HTTP ${status}: ` : '';
+        const error = new Error(`${statusPrefix}${message || fallback}`);
         if (status) error.status = status;
         if (code) error.code = code;
         return error;
@@ -7042,6 +7043,13 @@ function clearAdminSearch() {
         }
 
         return res;
+      }
+
+      function getRetainedReactVitePreviewLabel() {
+        const buildId = normalizeAdminIdValue(currentBuildId);
+        return buildId
+          ? `Preview atual mantido como antigo/stale (build #${buildId}).`
+          : 'Nenhum novo preview foi aplicado.';
       }
 
       function getReactViteBuildDetails(result = {}) {
@@ -7282,7 +7290,7 @@ function clearAdminSearch() {
         } catch (error) {
           const normalizedError = normalizeReactViteNetworkError(error);
           logAdminError('Admin action failed.', normalizedError);
-          setAdminStatus(`Erro: ${normalizedError.message}`);
+          setAdminStatus(`Erro: ${normalizedError.message} ${getRetainedReactVitePreviewLabel()}`);
         } finally {
           reactViteBuildBtn.disabled = !BUILD_WORKER_ENABLED;
         }
@@ -7336,7 +7344,7 @@ function clearAdminSearch() {
         } catch (error) {
           const normalizedError = normalizeReactViteNetworkError(error);
           logAdminError('Admin action failed.', normalizedError);
-          setAdminStatus(`Erro: ${normalizedError.message}`);
+          setAdminStatus(`Erro: ${normalizedError.message} ${getRetainedReactVitePreviewLabel()}`);
         } finally {
           reactViteDistImportBtn.disabled = false;
         }

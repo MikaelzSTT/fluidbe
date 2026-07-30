@@ -55,3 +55,22 @@ test('Admin preview identity is checked before publishing', () => {
   assert.match(html, /String\(previewIdentity\.buildId\) === String\(normalizedBuildId\)/);
   assert.match(html, /Preview ignorado porque pertence a outro projeto\/build\./);
 });
+
+test('Admin upload errors safely handle HTML responses and keep stale preview state', () => {
+  const html = readAdminHtml();
+
+  assert.match(
+    html,
+    /async function readAdminAuthResponse\(res\) \{[\s\S]*?return await readResponseSafely\(res\);/
+  );
+  assert.match(html, /return getResponseErrorMessage\(data, fallback\);/);
+  assert.match(html, /const statusPrefix = status \? `HTTP \$\{status\}: ` : '';/);
+  assert.match(html, /new Error\(`\$\{statusPrefix\}\$\{message \|\| fallback\}`\)/);
+  assert.match(html, /function getRetainedReactVitePreviewLabel\(\)/);
+  assert.match(html, /Preview atual mantido como antigo\/stale/);
+  assert.match(html, /Nenhum novo preview foi aplicado\./);
+  assert.match(
+    html,
+    /setAdminStatus\(`Erro: \$\{normalizedError\.message\} \$\{getRetainedReactVitePreviewLabel\(\)\}`\);/
+  );
+});
