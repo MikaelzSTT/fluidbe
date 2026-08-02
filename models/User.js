@@ -261,6 +261,15 @@ const userSchema = new mongoose.Schema(
       },
     },
 
+    operatorAlerts: {
+      accountCreatedAt: {
+        type: Date,
+      },
+      onboardingCompletedAt: {
+        type: Date,
+      },
+    },
+
     deletedAt: {
       type: Date,
       default: null,

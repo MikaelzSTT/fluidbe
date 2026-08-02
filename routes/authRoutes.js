@@ -37,6 +37,10 @@ const {
 } = require('../utils/twoFactor');
 const { createRateLimit } = require('../middleware/rateLimit');
 const { deleteProjectsData } = require('../utils/projectDeletion');
+const {
+  dispatchAccountCreatedAlert,
+  dispatchOnboardingCompletedAlert,
+} = require('../utils/operatorAlerts');
 
 const router = express.Router();
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
@@ -550,6 +554,13 @@ function normalizeRequiredString(value, maxLength) {
   }
 
   return trimmed;
+}
+
+function getPendingPromptFromRequest(req) {
+  const body = getObjectBody(req.body) || {};
+  const value = body.pendingPrompt || body.prompt || body.projectPrompt;
+
+  return typeof value === 'string' ? value : '';
 }
 
 const PROFILE_FIELDS = Object.freeze({
@@ -1929,16 +1940,26 @@ router.patch('/onboarding', authMiddleware, async (req, res) => {
       return undefined;
     }
 
+    const wasOnboardingComplete = Boolean(user.onboardingComplete);
+    const completedAt = new Date();
+
     user.preferences = {
       theme,
       displayName,
       role,
       goal,
-      completedAt: new Date(),
+      completedAt,
     };
     user.onboardingComplete = true;
 
     await user.save();
+
+    if (!wasOnboardingComplete) {
+      dispatchOnboardingCompletedAlert(user, {
+        completedAt,
+        pendingPrompt: getPendingPromptFromRequest(req),
+      });
+    }
 
     return res.json({ user: serializeUser(user) });
   } catch (error) {
@@ -2016,6 +2037,10 @@ router.get('/google/callback', async (req, res) => {
         avatar: profile.avatar,
         emailVerified: true,
         providers: ['google'],
+      });
+      dispatchAccountCreatedAlert(user, {
+        provider: 'google',
+        pendingPrompt: getPendingPromptFromRequest(req),
       });
     }
 
@@ -2118,6 +2143,10 @@ router.get('/github/callback', async (req, res) => {
         plan: 'free',
         profile: userProfile,
       });
+      dispatchAccountCreatedAlert(user, {
+        provider: 'github',
+        pendingPrompt: getPendingPromptFromRequest(req),
+      });
     }
 
     await createSessionAndSetCookie(user, req, res);
@@ -2182,6 +2211,11 @@ router.post('/register', async (req, res) => {
       email: normalizedEmail,
       password: hashedPassword,
       providers: ['local'],
+    });
+
+    dispatchAccountCreatedAlert(user, {
+      provider: 'email',
+      pendingPrompt: getPendingPromptFromRequest(req),
     });
 
     return res.status(201).json({
