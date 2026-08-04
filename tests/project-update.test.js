@@ -3,8 +3,11 @@ const test = require('node:test');
 const mongoose = require('mongoose');
 
 const Project = require('../models/Project');
+const FluidAvailability = require('../models/FluidAvailability');
 const RuntimeDocument = require('../models/RuntimeDocument');
 const projectRoutes = require('../routes/projectRoutes');
+
+FluidAvailability.findOne = () => ({ lean: async () => null });
 
 function getRouteLayer(pathname, method) {
   return projectRoutes.stack.find((item) => (

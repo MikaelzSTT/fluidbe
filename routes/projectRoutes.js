@@ -59,6 +59,7 @@ const {
   isExpired: isBriefingSessionExpired,
   sendBriefingSessionExpired,
 } = require('../utils/briefingSessions');
+const { ensureFluidOnlineForNewWork } = require('../utils/fluidAvailability');
 
 const router = express.Router();
 const connectorCredentialIpRateLimit = createRateLimit({
@@ -1500,6 +1501,8 @@ router.post('/', authMiddleware, async (req, res) => {
   let creationIdempotencyKey = '';
 
   try {
+    if (!(await ensureFluidOnlineForNewWork(res))) return;
+
     const {
       name,
       title,
@@ -2454,6 +2457,8 @@ router.put('/:id', authMiddleware, validateOwnedProjectId, async (req, res) => {
     }
 
     if (isBuildStartPayload(req.body)) {
+      if (!(await ensureFluidOnlineForNewWork(res))) return;
+
       const currentProject = await Project.findOne({
         _id: req.projectObjectId,
         userId: req.userId,

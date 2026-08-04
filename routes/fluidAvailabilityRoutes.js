@@ -1,26 +1,16 @@
 const express = require('express');
-const FluidAvailability = require('../models/FluidAvailability');
 const authMiddleware = require('../middleware/authMiddleware');
-
-const { FLUID_AVAILABILITY_KEY } = FluidAvailability;
+const {
+  getAvailabilityRecord,
+  readFluidAvailability,
+  serializeAvailability,
+} = require('../utils/fluidAvailability');
 
 const router = express.Router();
 
-function serializeAvailability(record) {
-  return {
-    ok: true,
-    isOnline: record?.isOnline !== false,
-  };
-}
-
-async function getAvailabilityRecord() {
-  return FluidAvailability.findOne({ key: FLUID_AVAILABILITY_KEY }).lean();
-}
-
 async function readAvailability(req, res) {
   try {
-    const record = await getAvailabilityRecord();
-    return res.json(serializeAvailability(record));
+    return res.json(await readFluidAvailability());
   } catch (error) {
     return res.status(500).json({
       ok: false,

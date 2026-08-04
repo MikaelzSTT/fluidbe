@@ -46,6 +46,7 @@ const {
   normalizeLanguageCode,
   resolveResponseLanguage,
 } = require('../utils/responseLanguage');
+const { ensureFluidOnlineForNewWork } = require('../utils/fluidAvailability');
 
 const router = express.Router();
 const chatUserRateLimit = createRateLimit({
@@ -1742,6 +1743,8 @@ router.get('/briefing', authMiddleware, async (req, res) => {
 
 router.post('/clarify', authMiddleware, chatUserRateLimit, async (req, res) => {
   try {
+    if (!(await ensureFluidOnlineForNewWork(res))) return;
+
     const { message, history, messages, projectId } = req.body;
 
     if (!message || typeof message !== 'string') {
@@ -1837,6 +1840,8 @@ router.post('/', authMiddleware, chatUserRateLimit, parseChatUpload, async (req,
   const aiQuotaContext = createAiQuotaContext(req, { route: 'chat' });
 
   try {
+    if (!(await ensureFluidOnlineForNewWork(res))) return;
+
     const { projectId } = req.body;
     const history = parseOptionalJson(req.body.history, req.body.history);
     const messages = parseOptionalJson(req.body.messages, req.body.messages);

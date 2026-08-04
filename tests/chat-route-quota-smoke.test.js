@@ -13,6 +13,7 @@ const Project = require('../models/Project');
 const ProjectBuild = require('../models/ProjectBuild');
 const ProjectChangeRequest = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
+const FluidAvailability = require('../models/FluidAvailability');
 const rateLimit = require('../middleware/rateLimit');
 
 const ORIGINAL_MODULE_LOAD = Module._load;
@@ -255,6 +256,7 @@ async function withChatRouteSmoke({
   const previousBriefingFindOne = BriefingSession.findOne;
   const previousBriefingFindOneAndUpdate = BriefingSession.findOneAndUpdate;
   const previousBriefingCreate = BriefingSession.create;
+  const previousAvailabilityFindOne = FluidAvailability.findOne;
   const previousFindOne = Session.findOne;
   const previousFindById = User.findById;
   const previousRedisProvider = rateLimit.getConnectedRedisClient;
@@ -339,6 +341,7 @@ async function withChatRouteSmoke({
     storedBriefingSessions.push(session);
     return session;
   };
+  FluidAvailability.findOne = () => ({ lean: async () => null });
   rateLimit.getConnectedRedisClient = async () => redis;
   console.info = () => {};
   console.warn = () => {};
@@ -380,6 +383,7 @@ async function withChatRouteSmoke({
     BriefingSession.findOne = previousBriefingFindOne;
     BriefingSession.findOneAndUpdate = previousBriefingFindOneAndUpdate;
     BriefingSession.create = previousBriefingCreate;
+    FluidAvailability.findOne = previousAvailabilityFindOne;
     Session.findOne = previousFindOne;
     User.findById = previousFindById;
     rateLimit.getConnectedRedisClient = previousRedisProvider;

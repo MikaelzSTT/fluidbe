@@ -20,6 +20,10 @@ const FluidAvailability = require('../models/FluidAvailability');
 const { requireAdmin } = require('../middleware/adminAuth');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
+const {
+  FLUID_AVAILABILITY_KEY,
+  readFluidAvailability,
+} = require('../utils/fluidAvailability');
 const { getConnectorByProvider } = require('./connectorRegistryRoutes');
 const {
   collectConnectorInjectionBuildFiles,
@@ -91,8 +95,6 @@ const REACT_VITE_DEV_PACKAGES = (
   .filter(Boolean);
 const SECURITY_SCAN_MAX_FINDINGS = 50;
 const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
-const { FLUID_AVAILABILITY_KEY } = FluidAvailability;
-
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
 const BUILD_FIELDS = [
@@ -3360,12 +3362,7 @@ router.get('/status', requireAdmin, async (req, res) => {
 
 router.get('/fluid-availability', requireAdmin, async (req, res) => {
   try {
-    const record = await FluidAvailability.findOne({ key: FLUID_AVAILABILITY_KEY }).lean();
-
-    return res.json({
-      ok: true,
-      isOnline: record?.isOnline !== false,
-    });
+    return res.json(await readFluidAvailability());
   } catch (error) {
     return res.status(500).json({
       ok: false,

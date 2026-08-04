@@ -5,9 +5,21 @@ const test = require('node:test');
 const adminRoutes = require('../routes/adminRoutes');
 const availabilityRoutes = require('../routes/fluidAvailabilityRoutes');
 const AdminAuditLog = require('../models/AdminAuditLog');
+const ChatMessage = require('../models/ChatMessage');
 const FluidAvailability = require('../models/FluidAvailability');
+const Project = require('../models/Project');
+const ProjectChangeRequest = require('../models/ProjectChangeRequest');
+const ProjectMessage = require('../models/ProjectMessage');
 const Session = require('../models/Session');
 const User = require('../models/User');
+const chatRoutes = require('../routes/chatRoutes');
+const projectRoutes = require('../routes/projectRoutes');
+
+const FLUID_OFFLINE_RESPONSE = {
+  ok: false,
+  code: 'FLUID_OFFLINE',
+  message: 'Fluid is temporarily unavailable. Please check back soon.',
+};
 
 const USER_ID = '64f000000000000000000001';
 
@@ -109,6 +121,30 @@ function adminAvailabilityHandler(method) {
   const route = getRouteLayer(adminRoutes, '/fluid-availability', method);
   assert.equal(route.stack[0].handle.name, 'requireAdmin');
   return route.stack[route.stack.length - 1].handle;
+}
+
+function routeHandler(router, pathname, method) {
+  const route = getRouteLayer(router, pathname, method);
+  return route.stack[route.stack.length - 1].handle;
+}
+
+function createProjectQuery(document) {
+  return {
+    select() { return this; },
+    lean: async () => document,
+    then(resolve, reject) {
+      return Promise.resolve(document).then(resolve, reject);
+    },
+  };
+}
+
+function createMessagesQuery(documents) {
+  return {
+    sort() { return this; },
+    select() { return this; },
+    limit() { return this; },
+    lean: async () => documents,
+  };
 }
 
 test('Fluid availability defaults online when no record exists', async () => {
@@ -312,4 +348,211 @@ test('Fluid availability responses do not expose Admin metadata', async () => {
     assert.equal(JSON.stringify(publicRes.body).includes('64f'), false);
     assert.equal(JSON.stringify(adminReadRes.body).includes('64f'), false);
   });
+});
+
+test('offline rejects new project creation before partial project writes', async () => {
+  const originalCreate = Project.create;
+  let createCalled = false;
+  Project.create = async () => {
+    createCalled = true;
+  };
+
+  try {
+    await withAvailabilityStore({ isOnline: false }, async () => {
+      const res = await callHandler(routeHandler(projectRoutes, '/', 'post'), {
+        method: 'POST',
+        originalUrl: '/api/projects',
+        userId: USER_ID,
+        body: {
+          name: 'Blocked',
+          prompt: 'Build a landing page for handmade candles.',
+        },
+      });
+
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.body, FLUID_OFFLINE_RESPONSE);
+      assert.equal(createCalled, false);
+    });
+  } finally {
+    Project.create = originalCreate;
+  }
+});
+
+test('offline rejects first build/chat generation without consuming messages', async () => {
+  const originalChatCreate = ChatMessage.create;
+  const originalProjectMessageCreate = ProjectMessage.create;
+  const originalChangeCreate = ProjectChangeRequest.create;
+  const writes = [];
+
+  ChatMessage.create = async (payload) => {
+    writes.push(['chat', payload]);
+  };
+  ProjectMessage.create = async (payload) => {
+    writes.push(['projectMessage', payload]);
+  };
+  ProjectChangeRequest.create = async (payload) => {
+    writes.push(['changeRequest', payload]);
+  };
+
+  try {
+    await withAvailabilityStore({ isOnline: false }, async () => {
+      const res = await callHandler(routeHandler(chatRoutes, '/', 'post'), {
+        method: 'POST',
+        originalUrl: '/api/chat',
+        userId: USER_ID,
+        body: {
+          projectFlow: 'new_project',
+          message: 'Build a landing page for handmade candles.',
+          mode: 'build',
+        },
+      });
+
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.body, FLUID_OFFLINE_RESPONSE);
+      assert.deepEqual(writes, []);
+    });
+  } finally {
+    ChatMessage.create = originalChatCreate;
+    ProjectMessage.create = originalProjectMessageCreate;
+    ProjectChangeRequest.create = originalChangeCreate;
+  }
+});
+
+test('offline rejects final briefing build before briefing completion mutation', async () => {
+  const originalChatCreate = ChatMessage.create;
+  let messageWrites = 0;
+  ChatMessage.create = async () => {
+    messageWrites += 1;
+  };
+
+  try {
+    await withAvailabilityStore({ isOnline: false }, async () => {
+      const res = await callHandler(routeHandler(chatRoutes, '/', 'post'), {
+        method: 'POST',
+        originalUrl: '/api/chat',
+        userId: USER_ID,
+        session: { _id: 'session-id' },
+        body: {
+          projectFlow: 'new_project',
+          briefingSessionId: '64f0000000000000000000b1',
+          message: 'Construir projeto',
+          mode: 'build',
+        },
+      });
+
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.body, FLUID_OFFLINE_RESPONSE);
+      assert.equal(messageWrites, 0);
+    });
+  } finally {
+    ChatMessage.create = originalChatCreate;
+  }
+});
+
+test('offline leaves existing project message reads available', async () => {
+  const originalProjectFindOne = Project.findOne;
+  const originalProjectMessageFind = ProjectMessage.find;
+  const projectId = '64f000000000000000000201';
+
+  Project.findOne = () => ({
+    select: async () => ({ _id: projectId }),
+  });
+  ProjectMessage.find = () => createMessagesQuery([
+    { _id: '64f000000000000000000301', role: 'user', content: 'Existing prompt', createdAt: new Date() },
+  ]);
+
+  try {
+    await withAvailabilityStore({ isOnline: false }, async () => {
+      const res = await callHandler(routeHandler(projectRoutes, '/:id/messages', 'get'), {
+        method: 'GET',
+        originalUrl: `/api/projects/${projectId}/messages`,
+        params: { id: projectId },
+        query: {},
+        userId: USER_ID,
+      });
+
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body.success, true);
+      assert.equal(res.body.messages[0].content, 'Existing prompt');
+    });
+  } finally {
+    Project.findOne = originalProjectFindOne;
+    ProjectMessage.find = originalProjectMessageFind;
+  }
+});
+
+test('offline leaves existing active build previews available', async () => {
+  const originalProjectFindOne = Project.findOne;
+  const projectId = '64f000000000000000000202';
+
+  Project.findOne = () => createProjectQuery({
+    _id: projectId,
+    userId: USER_ID,
+    name: 'Existing build',
+    status: 'in_progress',
+    generationStatus: 'in_progress',
+    generation_status: 'in_progress',
+  });
+
+  try {
+    await withAvailabilityStore({ isOnline: false }, async () => {
+      const res = await callHandler(routeHandler(projectRoutes, '/:id/build', 'get'), {
+        method: 'GET',
+        protocol: 'https',
+        get: () => 'fluidbe.test',
+        originalUrl: `/api/projects/${projectId}/build`,
+        params: { id: projectId },
+        query: {},
+        userId: USER_ID,
+      });
+
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body.status, 'in_progress');
+    });
+  } finally {
+    Project.findOne = originalProjectFindOne;
+  }
+});
+
+test('admin can toggle online again while offline', async () => {
+  await withAvailabilityStore({ isOnline: false }, async () => {
+    const res = await callHandler(adminAvailabilityHandler('patch'), {
+      method: 'PATCH',
+      originalUrl: '/api/admin/fluid-availability',
+      body: { isOnline: true },
+      adminAuth: { adminUserId: '64f000000000000000000011' },
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body, { ok: true, isOnline: true });
+  });
+});
+
+test('availability lookup failure fails closed only for new work with sanitized JSON', async () => {
+  const originalFindOne = FluidAvailability.findOne;
+  const originalCreate = Project.create;
+  let createCalled = false;
+  FluidAvailability.findOne = () => {
+    throw new Error('mongo unavailable with internal details');
+  };
+  Project.create = async () => {
+    createCalled = true;
+  };
+
+  try {
+    const res = await callHandler(routeHandler(projectRoutes, '/', 'post'), {
+      method: 'POST',
+      originalUrl: '/api/projects',
+      userId: USER_ID,
+      body: { name: 'Blocked', prompt: 'Build a dashboard.' },
+    });
+
+    assert.equal(res.statusCode, 503);
+    assert.deepEqual(res.body, FLUID_OFFLINE_RESPONSE);
+    assert.equal(JSON.stringify(res.body).includes('mongo unavailable'), false);
+    assert.equal(createCalled, false);
+  } finally {
+    FluidAvailability.findOne = originalFindOne;
+    Project.create = originalCreate;
+  }
 });

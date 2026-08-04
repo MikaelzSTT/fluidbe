@@ -3,11 +3,14 @@ const test = require('node:test');
 
 const Project = require('../models/Project');
 const BriefingSession = require('../models/BriefingSession');
+const FluidAvailability = require('../models/FluidAvailability');
 const projectRoutes = require('../routes/projectRoutes');
 const {
   buildBriefingQuestions,
   evaluateProjectBriefing,
 } = require('../utils/projectBriefing');
+
+FluidAvailability.findOne = () => ({ lean: async () => null });
 
 function getCreateProjectHandler() {
   const layer = projectRoutes.stack.find((item) => (
