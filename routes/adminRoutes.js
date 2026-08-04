@@ -16,6 +16,7 @@ const { CHANGE_REQUEST_STATUSES } = require('../models/ProjectChangeRequest');
 const ProjectMessage = require('../models/ProjectMessage');
 const ConnectorSecret = require('../models/ConnectorSecret');
 const User = require('../models/User');
+const FluidAvailability = require('../models/FluidAvailability');
 const { requireAdmin } = require('../middleware/adminAuth');
 const { createRateLimit, getAdminTokenKey, getClientIp } = require('../middleware/rateLimit');
 const { addBuildPreviewToken } = require('../utils/buildPreviewAccess');
@@ -90,6 +91,7 @@ const REACT_VITE_DEV_PACKAGES = (
   .filter(Boolean);
 const SECURITY_SCAN_MAX_FINDINGS = 50;
 const SECURITY_SCAN_MAX_TEXT_CHARS = 2 * 1024 * 1024;
+const { FLUID_AVAILABILITY_KEY } = FluidAvailability;
 
 const WIZARD_STATUSES = ['pending', 'in_progress', 'done'];
 const BUILD_MODES = ['manual', 'assisted', 'automatic'];
@@ -3352,6 +3354,68 @@ router.get('/status', requireAdmin, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: 'Erro interno do servidor.',
+    });
+  }
+});
+
+router.get('/fluid-availability', requireAdmin, async (req, res) => {
+  try {
+    const record = await FluidAvailability.findOne({ key: FLUID_AVAILABILITY_KEY }).lean();
+
+    return res.json({
+      ok: true,
+      isOnline: record?.isOnline !== false,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      code: 'FLUID_AVAILABILITY_READ_FAILED',
+      message: 'Não foi possível carregar a disponibilidade do Fluid.',
+    });
+  }
+});
+
+router.patch('/fluid-availability', requireAdmin, async (req, res) => {
+  try {
+    if (!req.body || typeof req.body.isOnline !== 'boolean') {
+      return res.status(400).json({
+        ok: false,
+        code: 'FLUID_AVAILABILITY_INVALID_VALUE',
+        message: 'isOnline deve ser booleano.',
+      });
+    }
+
+    const update = {
+      isOnline: req.body.isOnline,
+      updatedAt: new Date(),
+    };
+
+    if (req.adminAuth?.adminUserId) {
+      update.updatedBy = req.adminAuth.adminUserId;
+    }
+
+    const record = await FluidAvailability.findOneAndUpdate(
+      { key: FLUID_AVAILABILITY_KEY },
+      {
+        $set: update,
+        $setOnInsert: { key: FLUID_AVAILABILITY_KEY },
+      },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    ).lean();
+
+    return res.json({
+      ok: true,
+      isOnline: record?.isOnline !== false,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      code: 'FLUID_AVAILABILITY_UPDATE_FAILED',
+      message: 'Não foi possível atualizar a disponibilidade do Fluid.',
     });
   }
 });

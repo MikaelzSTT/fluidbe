@@ -14,6 +14,7 @@ const adminAuthRoutes = require('./routes/adminAuthRoutes');
 const connectorRegistryRoutes = require('./routes/connectorRegistryRoutes');
 const billingRoutes = require('./routes/billingRoutes');
 const runtimeRoutes = require('./routes/runtimeRoutes');
+const fluidAvailabilityRoutes = require('./routes/fluidAvailabilityRoutes');
 const Project = require('./models/Project');
 const ProjectBuild = require('./models/ProjectBuild');
 const Session = require('./models/Session');
@@ -478,6 +479,7 @@ function isPublicAuthApiRoute(pathname) {
 function isPublicFrontendApiRoute(pathname) {
   return (
     isPublicAuthApiRoute(pathname)
+    || pathname === '/api/fluid/availability'
     || pathname === '/api/projects'
     || pathname.startsWith('/api/projects/')
     || pathname === '/api/chat'
@@ -1649,6 +1651,7 @@ app.get('/p/:slug', async (req, res) => {
 app.use('/api/auth/login', loginRateLimit);
 app.use('/api/auth/register', registerRateLimit);
 app.use('/api/auth', authRoutes);
+app.use('/api/fluid', fluidAvailabilityRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/chat', chatIpRateLimit, chatRoutes);
 app.use('/api/admin-auth', adminRateLimit, adminAuthRoutes);
